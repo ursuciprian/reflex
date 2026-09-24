@@ -28,15 +28,56 @@ hook (see the table in the README). Each adapter turns the agent's event into th
 2. **Rules** (`rules.json`) — regular expressions over the command plus its context
    (`cwd=`, `aws_profile=`, `kube_context=`, `tf_workspace=`, `git_branch=`). A rule fires when all
    of its patterns match. Rules are **enforced in every mode**, because they are code, not a model.
-   Shipped rules: `rm-root`, `prod-destroy`, `force-push-main` (deny); `tamper`, `destroy` (ask). Any mutating command that touches the Reflex checkout, its setup files or its logs is also an `ask`, wherever the repo was cloned.
+   Shipped rules: `rm-root`, `prod-destroy`, `force-push-main`, `push-mirror` (deny); `secret-read`, `tamper`, `destroy`, and for scripts `secret-exfil` (ask). Any mutating command that touches the Reflex checkout, its setup files or its logs is also an `ask`, wherever the repo was cloned.
+   **Local scripts.** `bash deploy.sh` says nothing about what it does, so Reflex reads the local
+   file a command runs. It recognises:
+   - `bash`, `sh` and `zsh x.sh` (quoted paths, `< x.sh` and options included);
+   - `source x.sh`, `./x` and `scripts/x`;
+   - `python3`, `node`, `tsx`, `npx tsx`, `bun`, `ruby`, `perl` and `php` with a script, including
+     one run through a path such as `.venv/bin/python`;
+   - `make <target>`: that target's recipe, its direct prerequisites' recipes, and `$(MAKE)` calls;
+   - `npm`, `pnpm` and `yarn` scripts (`run x`, `yarn x`, `test`, and install lifecycle scripts),
+     with their `pre`/`post` hooks.
+
+   It finds these behind subshells, `$(…)`, `if`/`then`, `env`, `sudo`, `nice`, `cd` and line
+   continuations. What a shell script, recipe or package script runs in turn is followed one more
+   level.
+
+   Rules with `"applies_to"` including `"script"` read up to 256 KB of each file. Those rules are
+   `rm-root`, `prod-destroy`, `force-push-main`, `push-mirror`, `destroy` and `tamper`, plus a
+   check for the Reflex checkout and logs. The file is read line by line, with the script's own
+   `VAR=value` assignments expanded and whole-line `#` and `//` comments dropped, so a word on
+   one line cannot combine with a verb on another. The script-only `secret-exfil` rule
+   (`whole_script`) asks when a script copies `~/.ssh`, `~/.aws`, `~/.kube`, `~/.gnupg` or a
+   `.env` file and also talks to the network. Using a key with `-i` does not count.
+
+   A hit names the script: `reflex (rule): recursive delete of / or home (in /repo/scripts/reset.sh)`.
+   This runs before the fast lane, so `npm test` is only as safe as the test script. `sh -c`
+   (inline code, already in the command) and `bash -n` are not reads, and a compiled binary is
+   judged by its command.
+
+   Some code is marked unseen, so the command is never allowed:
+   - a named script that cannot be read (missing, or an unknown npm script);
+   - a workspace or filter script (`npm -w`, `pnpm --filter`, `yarn workspace`);
+   - code piped into a shell (`curl … | bash`);
+   - a file an earlier step of the same command wrote (`curl -o x.sh … && bash x.sh`);
+   - a third level of nesting;
+   - anything past 8 scripts.
+
+   Lines over 2,000 characters (minified bundles) are left out of the rules, and the script
+   then counts as partly seen. If the scan takes more than 1.5 s, the command gets an `ask`
+   instead of risking the hook's timeout.
 3. **Fast lane** (`rules.json` → `pass`) — known-safe steps: builds, tests, `mkdir`, `git add/commit`,
    pushing a non-main branch. A command passes when every segment is read-only or matches a fast-lane
    pattern. → **pass**, logged.
 4. **Jev** — the command (secrets redacted), its working directory, the environment context and
    the text the agent wrote right before this command and its last five commands (from the session
    transcript; if the command is not in the transcript yet, no intent is sent rather than an older one) are sent to
-   TypeSafe with the six questions in `questions.json`. Answers are cached for 24 h per
-   (command, cwd, environment, question-set version, model).
+   TypeSafe with the six questions in `questions.json`. When the command runs a local script, its
+   redacted excerpt goes along as `call.script = {path, excerpt}` and the question context tells Jev
+   to judge the script, not its name (`node clean.mjs` that deletes `$HOME` is an ask, not a pass).
+   Answers are cached for 24 h per (command, cwd, environment, question-set version, model, script
+   content), so an edited script is judged again.
 5. **Policy** (`policy.json`) — ordered gates over the answers; the first that fires wins,
    otherwise `default_outcome` (`pass`). If Jev fails or times out, the policy's `fallback` (`ask`)
    applies. The last gate, `allow`, marks clearly safe commands; what that means depends on
@@ -107,7 +148,10 @@ A case can also carry `"allow": true` (a clearly safe command that should be all
 reported as `stiff` when it is not, never a failure) or `"allow": false` (must never be
 auto-allowed; a MISS if it is). An `allow` counts as `pass` for `expect`.
 
-Current result: 54 cases, 0 misses, 0 over; 3 of 4 `allow: true` cases allow-eligible. Results are saved to `~/.local/state/reflex/eval-*.json`.
+Cases with `"cwd": "$FIXTURES"` run in a temporary copy of `setup/tool-gate/fixtures/`, the
+scripts, Makefile and `package.json` those commands run (each guarded so it exits if run by hand).
+
+Current result: 62 cases, 0 misses, 0 over; 5 of 6 `allow: true` cases allow-eligible. Results are saved to `~/.local/state/reflex/eval-*.json`.
 Run it in CI with `TYPESAFE_API_KEY` as a secret to guard policy changes.
 
 **Grow the golden set from real traffic.** Every surprising decision in the trace becomes a case.
@@ -168,13 +212,11 @@ Never allowed, whatever the answers: anything a rule decided (including tamper a
 read-only and fast-lane commands (they stay `pass`, so your permission allowlist still governs
 them), Jev errors and incomplete answers (the `ask` fallback), cached answers (they have lost
 `on_task`), commands without a stated intent (`on_task` defaults to yes then), commands that
-redaction changed (a redacted `--token "$(…)"` could hide a payload), commands that run code by
-name, which Jev never sees (a local script or executable, `python -m`, `node -r`, `source`, a make
-or task target, a package script or install, `npx` / `dlx` / `uvx`, `go generate` / `go run`),
-commands run from the home directory or `/` (where "inside the working directory" means everything),
-and a policy whose `default_outcome` is allow (only the allow gate allows). In Claude Code, a
-command retried outside the sandbox (`dangerouslyDisableSandbox`) and any command in plan mode
-keep their prompt. The trace logs why as `low risk (not allowed: …)`. `export REFLEX_ALLOW=…` in a command is a tamper `ask`. In Claude Code an allow skips
+redaction changed (a redacted `--token "$(…)"` could hide a payload), commands whose script Jev
+did not see in full (redacted, over 16 KB, unreadable, or a make target, whose variables are not
+expanded), and commands run from the home directory or `/` (where "inside the working directory"
+means everything). The trace logs
+why as `low risk (not allowed: …)`. `export REFLEX_ALLOW=…` in a command is a tamper `ask`. In Claude Code an allow skips
 the prompt but its deny and ask permission rules still apply.
 
 **Calibrate from your own approvals.** Run with `REFLEX_ALLOW=shadow` in enforce mode for a
@@ -249,7 +291,8 @@ and [confidence](https://docs.typesafe.ai/confidence).
 - **What leaves the machine:** for commands that reach Jev only — the command with secrets
   redacted, the working directory path, environment names (AWS profile, region, kube context,
   terraform workspace, git branch), and the agent's last message and last five commands, also
-  redacted and truncated. Read-only, rule and fast-lane commands never leave the machine.
+  redacted and truncated, and the first 16 KB of a local script the command runs (a make recipe,
+  an npm script), redacted. Read-only, rule and fast-lane commands never leave the machine.
 - **Redaction** covers AWS keys, GitHub / GitLab / Slack / OpenAI-style tokens, bearer and basic
   auth headers, `*SECRET*=`, `*TOKEN*=`, `*PASSWORD*=`, `--password x`, credentials in URLs,
   private key blocks and JWTs. It is a pattern list, not DLP: extend it when you see a new shape.
@@ -270,6 +313,12 @@ and [confidence](https://docs.typesafe.ai/confidence).
 - An internal error (bad setup file, unreadable cache) returns the policy fallback (`ask`) in
   enforce mode and `pass` in shadow mode. Incomplete Jev answers count as an error, never as "no".
   The pi/omp and opencode adapters block when the gate cannot run at all in enforce mode.
+- Script inspection recognises the launchers listed above, two levels deep, and reads 256 KB per
+  file for the rules. A script that `curl | sh`s another, a path held in a variable, a third level
+  of nesting, or a danger past 256 KB is judged only on what is visible. Variables are expanded
+  only from simple `VAR=value` lines in the same script. A prod marker on one line and a delete on
+  another no longer combine (see above), so `ENV=prod` set elsewhere and used as
+  `kubectl delete … -n "$ENV"` is caught only if the variable is assigned in that script.
 - Rules and the read-only list are pattern matching, not a shell parser. They are designed to
   fail towards "ask Jev", not towards "pass", and the self-checks pin the known bypasses — but
   treat them as a strong filter, not a sandbox. Keep IAM, network controls, and least-privilege
