@@ -153,31 +153,16 @@ export function readOnly(cmd, extra = [], depth = 0) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Secrets never leave the machine or land in the trace. ponytail: a pattern list, not a DLP engine;
-// add a pattern when a new credential shape shows up in the trace.
-const SECRET_PATTERNS = [
-  /\b(AKIA|ASIA)[A-Z0-9]{16}\b/g,
-  /\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g,
-  /\b(sk-[A-Za-z0-9_-]{16,}|xox[abpr]-[A-Za-z0-9-]{10,}|glpat-[A-Za-z0-9_-]{16,})\b/g,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z ]*PRIVATE KEY-----|$)/g,
-  /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
-  /\b[rs]k_(live|test)_[A-Za-z0-9]{10,}\b/g, /\bAIza[0-9A-Za-z_-]{35}\b/g, /\bnpm_[A-Za-z0-9]{36}\b/g,
-  /hooks\.slack\.com\/services\/\S+/g,
-  // a bare 40-char AWS-style secret: mixed case, so git SHAs (lowercase hex) are left alone
-  /(?<![A-Za-z0-9/+])(?=[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+]))(?=[A-Za-z0-9/+]*[A-Z])(?=[A-Za-z0-9/+]*[a-z])[A-Za-z0-9/+]{40}/g,
-];
+// Secrets never leave the machine or land in the trace. The patterns live in setup/redact.json,
+// shared with routing/reflex_router.py; both selfchecks run its corpus.
+const REDACT = JSON.parse(readFileSync(join(HERE, "setup/redact.json"), "utf8"));
+const SECRET_PATTERNS = REDACT.shapes.map(p => new RegExp(p, "g"));
+const SECRET_CONTEXT = REDACT.context.map(c => [new RegExp(c.pattern, c.flags + "g"), c.replace]);
 export function redact(s) {
   let out = String(s ?? "");
   for (const re of SECRET_PATTERNS) out = out.replace(re, "<redacted>");
-  return out
-    .replace(/(authorization:\s*(bearer|basic|token)\s+)\S+/gi, "$1<redacted>")
-    .replace(/((cookie|x-[\w-]*(auth|token|key)[\w-]*):\s*)[^'"\n]+/gi, "$1<redacted>")
-    .replace(/(\b[\w.-]*(secret|token|passw(or)?d|api[_-]?key|access[_-]?key|credential)[\w.-]*"?\s*[=:]\s*)("[^"]*"|'[^']*'|\S+)/gi, "$1<redacted>")
-    .replace(/(--?(password|passwd|token|secret|api-key)[= ]\s*)("[^"]*"|'[^']*'|\S+)/gi, "$1<redacted>")
-    .replace(/((\s-u|--user)\s+[^\s:]+:)\S+/g, "$1<redacted>")
-    .replace(/(\b(mysql|mariadb)\b[^|;&]*\s-p)(\S+)/g, "$1<redacted>")
-    .replace(/(\bsshpass\s+-p\s*)\S+/g, "$1<redacted>")
-    .replace(/(:\/\/[^\s:@/]+:)\S+@/g, "$1<redacted>@");
+  for (const [re, repl] of SECRET_CONTEXT) out = out.replace(re, repl);
+  return out;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -557,6 +542,7 @@ async function selfcheck() {
     `https://u:p/w@d@host`);
   for (const x of ["hunter3", "pw9", "S3cret", "pw7", "sk_live_a", "AIzab", "T0/B0", "sid=abc123", "wJalrXUtn", "p/w@d"]) ok(!r2.includes(x), `redact ${x}`);
   ok(redact("git show 3f5e8a9b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f").includes("3f5e8a9b"), "git SHA is not a secret");
+  for (const c of REDACT.corpus) ok(redact(c.in) === c.out, `redact corpus: ${c.in.slice(0, 40)}`);
 
   // deterministic rules
   const rules = load("rules.json");

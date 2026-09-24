@@ -2,3 +2,4 @@ node_modules/
 *.bak-*
 .env
 .claude/
+__pycache__/

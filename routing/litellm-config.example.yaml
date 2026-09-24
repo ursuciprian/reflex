@@ -1,0 +1,32 @@
+# Wiring the Reflex router into a LiteLLM proxy. An example, not a drop-in: merge the
+# `callbacks` line into your own config.yaml.
+#
+# LiteLLM loads `callbacks: <module>.<instance>` from a <module>.py next to config.yaml, so copy or
+# symlink routing/reflex_router.py there (in Docker: mount it next to /app/config.yaml), and point
+# it at its data files with REFLEX_ROUTING_POLICY / REFLEX_ROUTING_QUESTIONS.
+#
+#   REFLEX_ROUTING_MODE=shadow                      # default; enforce rewrites the model
+#   REFLEX_ROUTING_POLICY=/path/to/reflex/routing/policy.json
+#   REFLEX_ROUTING_QUESTIONS=/path/to/reflex/routing/questions.json
+#   REFLEX_REDACT=/path/to/reflex/setup/redact.json  # secret patterns shared with the gate
+#   REFLEX_DATA_DIR=/path/to/state                  # routing.jsonl lands here
+#   TYPESAFE_API_KEY=...                            # or REFLEX_KEYCHAIN_SERVICE on macOS (not in Docker)
+#
+# Every model_name the policy can choose must exist in model_list: the hook only changes
+# data["model"] before LiteLLM's router picks a deployment for it.
+model_list:
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+  - model_name: claude-sonnet-5
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+  - model_name: claude-opus-5
+    litellm_params:
+      model: anthropic/claude-opus-5
+  - model_name: "claude-*"
+    litellm_params:
+      model: anthropic/claude-*
+
+litellm_settings:
+  callbacks: ["reflex_router.proxy_handler_instance"]

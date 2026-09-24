@@ -1,0 +1,31 @@
+{
+  "version": "routing-q3",
+  "context_key": "operator",
+  "context": "Requests from coding agents (Claude Code, Codex, Hermes) passing through an LLM gateway on an engineer's workstation, before they reach a model. The engineer works on cloud infrastructure (AWS, Terraform, Kubernetes), CI/CD, security tooling and AI applications. Each request is summarised as the latest user message, the start of the system prompt, the names of the tools offered, and the file paths mentioned anywhere in the conversation: paths inside the repository relative to it, other paths reduced to their file name with flags such as [outside repo, sensitive].",
+  "item_key": "request",
+  "questions": {
+    "sensitivity": {
+      "type": "choice",
+      "instructions": "How sensitive is the content of the conversation described in `request`: the message in `request.message`, the files in `request.paths` and the task it implies? Judge by what the model would see, not by what the agent will do.",
+      "criteria": {
+        "public": "Public or generic content: open-source code, documentation, general questions, examples that reveal nothing about the organisation.",
+        "application": "Ordinary private application code and project files: business logic, tests, build files, and the repository's own docs and notes, without credentials. Any edit to a file in the organisation's repository is at least this.",
+        "restricted": "Secrets and what protects them: credentials, API keys, tokens, .env files, private keys, IAM and access policies, infrastructure and deployment configuration, production data or customer records.",
+        "proprietary": "Proprietary research or strategy: unreleased models, evaluation results, datasets, security findings, pricing or plans the organisation keeps confidential."
+      }
+    },
+    "difficulty": {
+      "type": "score",
+      "instructions": "What size of model does the task in `request.message` need to be done well, given the files in `request.paths` and the tools in `request.tools`? Judge the work the task implies, not the length of the message: a short request can stand for a multi-step change.",
+      "criteria": [
+        "Small: one step with an obvious answer and little harm if it is slightly off: a factual or how-to question about a tool or language, a rename, a typo or one-line fix, reading back or listing a value from a file, a title, a short summary of a message already in the conversation.",
+        "Medium: a typical engineering task of a few steps: implement or fix a function, write tests or a script, explain or review code, a focused change across a few files, summarise or write up a document for other people. Any change to credentials, secrets, IAM or access policies, network policies, production infrastructure or deployment configuration is at least medium, however short the request.",
+        "Large: hard reasoning across many parts or with little evidence: architecture or system design, a migration plan, a subtle concurrency or security bug, root-causing an incident from logs and events, a strategy or pricing decision weighing several sources; work where a wrong answer is costly and hard to spot."
+      ]
+    },
+    "needs_tools": {
+      "type": "noul",
+      "instructions": "Will answering `request.message` well require calling one of the tools in `request.tools` (running commands, reading or editing files, searching), rather than answering from the text alone? If `request.tools` is empty, answer no."
+    }
+  }
+}

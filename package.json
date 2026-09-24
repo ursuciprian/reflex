@@ -6,10 +6,11 @@
   "type": "module",
   "engines": {"node": ">=18"},
   "scripts": {
-    "test": "node policy.mjs && node gate.mjs --selfcheck && node instructions.mjs --selfcheck && node router/server.mjs --selfcheck",
+    "test": "node policy.mjs && node gate.mjs --selfcheck && node instructions.mjs --selfcheck && node router/server.mjs --selfcheck && python3 routing/reflex_router.py --selfcheck",
     "eval": "node eval.mjs",
     "eval-instructions": "node eval-instructions.mjs",
     "eval-router": "node router/server.mjs --eval",
+    "eval-routing": "python3 routing/reflex_router.py --eval",
     "report": "node report.mjs",
     "install-hook": "node install.mjs"
   }

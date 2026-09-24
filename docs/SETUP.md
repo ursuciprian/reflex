@@ -156,6 +156,49 @@ config into `router/config.json` (`mcpServers`, `.mcp.json` shape; stdio only).
 
 Selections are logged to `router.jsonl` in `REFLEX_DATA_DIR`.
 
+## Optional: model routing in a LiteLLM proxy
+
+`routing/reflex_router.py` runs inside the LiteLLM proxy process (tested against LiteLLM
+1.100.1). It uses only the Python standard library, plus `certifi` when present (LiteLLM ships it)
+for TLS on Python builds without a CA bundle.
+
+1. Check it offline, then against the live API:
+
+   ```sh
+   python3 routing/reflex_router.py --selfcheck
+   npm run eval-routing                            # 27 labelled prompts, ~1k input tokens each
+   ```
+
+2. Edit `routing/policy.json` for your gateway: one family per set of interchangeable model groups
+   (their `model_name`s in LiteLLM's `model_list`), each model's `tier`, `price_in` (USD per
+   million input tokens) and tags (`first_party`, `frontier`, `tools`).
+3. Put the module next to the proxy's `config.yaml` (copy, symlink, or a Docker bind mount of the
+   file next to `/app/config.yaml`) and add the callback — see `routing/litellm-config.example.yaml`.
+   A copy or a mount also needs `policy.json`, `questions.json` and `setup/redact.json` mounted and
+   named by the variables below; a symlink into this repo finds them itself:
+
+   ```yaml
+   litellm_settings:
+     callbacks: ["reflex_router.proxy_handler_instance"]
+   ```
+
+   If `callbacks` already lists something (e.g. `"prometheus"`), add it to that list.
+4. Give the proxy the environment below and restart it. Start in `shadow`; after a week, read
+   `routing.jsonl` (`chosen` vs `applied`, `violation`, `action: block`, `source: fallback`) before
+   `enforce`. For stickiness across several workers, share LiteLLM's key cache through Redis
+   (`litellm_settings.enable_redis_auth_cache: true`); the router then keeps each conversation's
+   model there too.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `REFLEX_ROUTING_MODE` | `shadow` | `off` · `shadow` (log only, no added latency) · `enforce` (rewrite the model) |
+| `REFLEX_ROUTING_POLICY` | `routing/policy.json` next to the module | Families, pools, tiers, stickiness, latency budget, cache TTL, fallback |
+| `REFLEX_ROUTING_QUESTIONS` | `routing/questions.json` next to the module | The three Jev questions |
+| `REFLEX_REDACT` | `setup/redact.json` beside the module's directory | Secret patterns shared with the gate; without it routing is skipped (requests keep their model) |
+| `REFLEX_DATA_DIR` | `~/.local/state/reflex` | Where `routing.jsonl` is written (inside Docker, mount a volume) |
+| `TYPESAFE_API_KEY` / `REFLEX_KEYCHAIN_SERVICE` | — / `typesafe-api-key` | Same key lookup as the gate; the Keychain is not reachable from a container, so use the variable there |
+| `REFLEX_MODEL`, `REFLEX_API_URL` | as the gate | Jev model and endpoint |
+
 ## Optional: Grafana
 
 Push a snapshot of the metrics to a Prometheus Pushgateway, e.g. every five minutes from cron:

@@ -1,0 +1,33 @@
+{
+ "version": "routing-golden-1",
+ "note": "Labelled prompts for `npm run eval-routing` (python3 routing/reflex_router.py --eval). Each case runs as a first-turn request with the tools Bash, Read, Edit, Grep offered. sensitivity: public / application / restricted / proprietary. tier: small / medium / large, the smallest model that does the task well. Failing: a tier two levels too low, or restricted / proprietary content classified as public / application. `why` says what makes a case tricky.",
+ "cases": [
+  {"prompt": "What does the -p flag of mkdir do?", "model": "claude-opus-5", "sensitivity": "public", "tier": "small"},
+  {"prompt": "Give this conversation a five word title", "model": "claude-sonnet-5", "sensitivity": "public", "tier": "small"},
+  {"prompt": "Explain how Python's asyncio.gather handles exceptions", "model": "gpt-5.6-sol", "sensitivity": "public", "tier": "small"},
+  {"prompt": "What is the difference between a Kubernetes Secret and a ConfigMap?", "model": "claude-opus-5", "sensitivity": "public", "tier": "small", "why": "security vocabulary, generic question"},
+  {"prompt": "Write a haiku about rotating secrets", "model": "claude-opus-5", "sensitivity": "public", "tier": "small", "why": "security vocabulary, trivial task"},
+  {"prompt": "Write a Python function that parses ISO 8601 durations like P1DT2H30M into seconds, with unit tests", "model": "claude-opus-5", "sensitivity": "public", "tier": "medium"},
+  {"prompt": "Write a bash script that retries a command with exponential backoff and jitter, with a usage message and tests using bats", "model": "gpt-5.6-sol", "sensitivity": "public", "tier": "medium"},
+  {"prompt": "Design a lock-free multi-producer multi-consumer queue in Rust and argue why it is linearizable and free of ABA problems", "model": "claude-haiku-4-5", "sensitivity": "public", "tier": "large"},
+  {"prompt": "Rename the variable usr to user in src/models/user.py", "model": "claude-opus-5", "sensitivity": "application", "tier": "small"},
+  {"prompt": "Fix the typo 'recieve' in docs/onboarding.md", "model": "claude-opus-5", "sensitivity": "application", "tier": "small"},
+  {"prompt": "List the exported functions in internal/config/loader.go", "model": "gpt-5.6-sol", "sensitivity": "application", "tier": "small"},
+  {"prompt": "Write unit tests for the pagination helper in api/pagination.go", "model": "claude-opus-5", "sensitivity": "application", "tier": "medium"},
+  {"prompt": "Add a --dry-run flag to cmd/deploy/main.go that prints the planned steps instead of executing them", "model": "claude-haiku-4-5", "sensitivity": "application", "tier": "medium", "why": "'deploy' in an ordinary CLI change"},
+  {"prompt": "Refactor the three handlers in services/orders/ to use the repository in services/orders/repo.go instead of raw SQL", "model": "claude-haiku-4-5", "sensitivity": "application", "tier": "medium"},
+  {"prompt": "Find the race condition that makes the Go worker pool in internal/pool/pool.go deadlock under load", "model": "gpt-5.6-luna", "sensitivity": "application", "tier": "large"},
+  {"prompt": "The dashboard in src/components re-renders on every websocket message; profile it and redesign the state management across src/store and src/components", "model": "claude-haiku-4-5", "sensitivity": "application", "tier": "large"},
+  {"prompt": "Here are my AWS keys AKIAABCDEFGHIJKLMNOP, why does aws sts get-caller-identity fail?", "model": "claude-haiku-4-5", "sensitivity": "restricted", "tier": "small", "why": "secret in the message; a quick diagnosis"},
+  {"prompt": "What port does the database in terraform/envs/prod/rds.tf listen on?", "model": "claude-haiku-4-5", "sensitivity": "restricted", "tier": "small", "why": "a lookup in production configuration"},
+  {"prompt": "Rotate the prod RDS master password in terraform/envs/prod/rds.tf and put the new value in .env", "model": "claude-haiku-4-5", "sensitivity": "restricted", "tier": "medium", "why": "short prompt, multi-step production credential change"},
+  {"prompt": "Tighten the IAM policy in iam/ci-deployer.json so the CI role can only push to the two ECR repositories it uses", "model": "claude-haiku-4-5", "sensitivity": "restricted", "tier": "medium"},
+  {"prompt": "Add a Kubernetes NetworkPolicy in k8s/payments/ so only pods in the api namespace can reach the payments database", "model": "gpt-5.6-luna", "sensitivity": "restricted", "tier": "medium"},
+  {"prompt": "Design the migration of our three EKS clusters to a single multi-tenant cluster with zero downtime, including IAM, network policy and rollback plan", "model": "claude-haiku-4-5", "sensitivity": "restricted", "tier": "large"},
+  {"prompt": "Our prod Aurora cluster failed over twice last night; go through the RDS events and CloudWatch logs and find the root cause", "model": "claude-haiku-4-5", "sensitivity": "restricted", "tier": "large", "why": "incident debugging with little evidence"},
+  {"prompt": "Give research/evals/jev2-results.md a one-line title", "model": "claude-opus-5", "sensitivity": "proprietary", "tier": "small", "why": "confidential content, trivial task"},
+  {"prompt": "Summarise our unreleased jev-2 eval results in research/evals/jev2-results.md for the board", "model": "claude-haiku-4-5", "sensitivity": "proprietary", "tier": "medium", "why": "short prompt, confidential multi-page summary"},
+  {"prompt": "Turn the findings from last week's internal pentest of the billing API in security/pentest-2026-09.md into a remediation plan with owners", "model": "claude-haiku-4-5", "sensitivity": "proprietary", "tier": "medium", "why": "security findings"},
+  {"prompt": "Design the pricing for our unreleased enterprise tier from the cost data in finance/model-costs.csv and the competitor notes in strategy/competitors.md", "model": "gpt-5.6-luna", "sensitivity": "proprietary", "tier": "large"}
+ ]
+}

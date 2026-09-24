@@ -23,6 +23,12 @@ and probabilities in well under a second — instead of a large LLM.
 
 All of them call the same decision core with the same rules, questions, policy and logs.
 
+**Model routing** (`routing/`): the same engine as a LiteLLM pre-call hook. One Jev call per request
+judges how sensitive the conversation is and how hard the task is; `routing/policy.json` keeps
+restricted content (secrets, env and infra config, credentials, proprietary research) on first-party
+frontier models, sends easy public work to the cheapest model, and keeps a conversation on its model
+when switching would cost more than it saves. Shadow by default. See [docs/GUIDE.md](docs/GUIDE.md#model-routing).
+
 ```
 agent wants to run a command
    │
@@ -109,8 +115,9 @@ week, `node report.mjs` shows the decisions, and `node install.mjs --mode enforc
 | `router/golden.json` | Labelled intents for `npm run eval-router` (tool and arguments chosen by real Jev; nothing runs) |
 | `router/test/` | Fake downstream MCP server and stubbed Jev for `npm test` |
 | `dashboards/reflex.json` | Grafana dashboard for the pushed metrics |
+| `routing/` | LiteLLM pre-call hook for security- and cost-aware model routing (`reflex_router.py`, `questions.json`, `policy.json`, an example LiteLLM config) |
 
-Node 18+, no dependencies.
+Node 18+, no dependencies. The router needs Python 3.9+ (stdlib) inside a LiteLLM proxy.
 
 ## Cost and latency
 
