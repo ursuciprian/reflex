@@ -131,8 +131,9 @@ How it works: [GUIDE → Tool router](GUIDE.md#tool-router).
 ```sh
 node router/server.mjs --selfcheck                              # offline, also part of npm test
 node router/server.mjs --check "show the last 5 commits" --run  # one live Jev round trip
+npm run eval-router                                             # router/golden.json through live Jev; nothing runs
 node install.mjs --router                                       # prints the registration for every agent
-node install.mjs --router --agent codex --mode enforce          # one agent; --mode is the gate's mode for shell tools
+node install.mjs --router --agent codex --mode enforce          # one agent; --mode is the gate's mode for the router's calls
 ```
 
 `--router` only prints: registering an MCP server writes the agent's global config (`~/.claude.json`,

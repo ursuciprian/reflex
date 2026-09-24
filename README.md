@@ -37,8 +37,8 @@ agent wants to run a command
 `find_tools`, `describe_tool`, `run` — in front of a whole catalog: built-in read-only shell tools
 (ripgrep, git log/diff/blame, kubectl get, aws describe …) and every tool of the MCP servers you
 list in `router/config.json`. Jev picks the tool and fills its arguments from the agent's intent,
-and hands back candidates instead of guessing when it is unsure. Every shell tool it runs still goes
-through the gate. See [GUIDE → Tool router](docs/GUIDE.md#tool-router).
+and hands back candidates instead of guessing when it is unsure. Every call it makes, shell or
+downstream MCP, goes through the gate first (unless you mark a server `"trusted"`). See [GUIDE → Tool router](docs/GUIDE.md#tool-router).
 
 **The gate can only tighten.** It emits `ask` or `deny`, never `allow`, so your existing
 permission rules stay authoritative and a model can never authorize anything on its own.
@@ -65,7 +65,7 @@ git clone https://github.com/ursuciprian/reflex.git && cd reflex
 export TYPESAFE_API_KEY=...          # from https://console.typesafe.ai/keys — see docs/SETUP.md
 npm test                             # offline self-checks, no API calls
 node gate.mjs --check "terraform apply -auto-approve" --cwd ~/infra/envs/prod
-npm run eval                         # 44 labelled commands through the real gate (~33k tokens)
+npm run eval                         # 63 labelled commands through the real gate (~31k tokens)
 node install.mjs --agent all         # hook into every supported agent found here, shadow mode
 ```
 
@@ -94,6 +94,7 @@ week, `node report.mjs` shows the decisions, and `node install.mjs --mode enforc
 | `router/mcp.mjs` | Newline-delimited JSON-RPC over stdio, server and client side (no SDK) |
 | `router/commands.json` | Built-in command tools: name, description, argument schema, argv template |
 | `router/config.json` | Downstream stdio MCP servers whose tools join the catalog (`mcpServers`, same shape as `.mcp.json`) |
+| `router/golden.json` | Labelled intents for `npm run eval-router` (tool and arguments chosen by real Jev; nothing runs) |
 | `router/test/` | Fake downstream MCP server and stubbed Jev for `npm test` |
 | `dashboards/reflex.json` | Grafana dashboard for the pushed metrics |
 

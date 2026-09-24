@@ -56,18 +56,21 @@ export async function connect({command, args = [], env = {}, cwd}, {timeoutMs = 
     pending.set(id, {resolve: v => { clearTimeout(timer); resolve(v); }, reject: e => { clearTimeout(timer); reject(e); }});
     send({jsonrpc: "2.0", id, method, ...(params ? {params} : {})});
   });
-  const init = await request("initialize", {protocolVersion: VERSIONS[0], capabilities: {},
-                                            clientInfo: {name: "reflex-router", version: "0.1.0"}});
-  if (!VERSIONS.includes(init?.protocolVersion)) { child.kill(); throw new Error(`${name}: unsupported protocol version ${init?.protocolVersion}`); }
-  send({jsonrpc: "2.0", method: "notifications/initialized"});
+  let init;
   const tools = [], seen = new Set();
-  let cursor;
-  do {   // tools/list is paginated; a server repeating a cursor would loop forever
-    const page = await request("tools/list", cursor ? {cursor} : undefined);
-    tools.push(...(page?.tools ?? []));
-    cursor = page?.nextCursor;
-    if (seen.has(cursor)) break;
-    seen.add(cursor);
-  } while (cursor);
+  try {   // a server that hangs or fails during setup is not left running
+    init = await request("initialize", {protocolVersion: VERSIONS[0], capabilities: {},
+                                        clientInfo: {name: "reflex-router", version: "0.1.0"}});
+    if (!VERSIONS.includes(init?.protocolVersion)) throw new Error(`${name}: unsupported protocol version ${init?.protocolVersion}`);
+    send({jsonrpc: "2.0", method: "notifications/initialized"});
+    let cursor;
+    do {   // tools/list is paginated; a server repeating a cursor would loop forever
+      const page = await request("tools/list", cursor ? {cursor} : undefined);
+      tools.push(...(page?.tools ?? []));
+      cursor = page?.nextCursor;
+      if (seen.has(cursor)) break;
+      seen.add(cursor);
+    } while (cursor);
+  } catch (e) { child.kill(); throw e; }
   return {init, tools, request, close: () => { child.stdin.end(); setTimeout(() => child.kill(), 2000).unref(); }};
 }

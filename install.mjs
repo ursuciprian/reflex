@@ -138,7 +138,8 @@ if (argv.includes("--router")) {
   const args = [server, "--mode", MODE];
   const json = extra => JSON.stringify({mcpServers: {[name]: {...extra, command: NODE, args, ...(Object.keys(env).length ? {env} : {})}}}, null, 2);
   const out = {
-    claude: `claude mcp add --scope user --transport stdio ${envFlags("--env")}${name} -- ${q(NODE)} ${args.map(q).join(" ")}\n` +
+    // --env takes several KEY=value pairs: an option must sit between it and the name, or the name is read as a pair
+    claude: `claude mcp add --scope user ${envFlags("--env")}--transport stdio ${name} -- ${q(NODE)} ${args.map(q).join(" ")}\n` +
             `# or commit it for a repo: .mcp.json\n${json({type: "stdio"})}`,
     codex: `codex mcp add ${name} ${envFlags("--env")}-- ${q(NODE)} ${args.map(q).join(" ")}\n# or ~/.codex/config.toml:\n` +
            `[mcp_servers.${name}]\ncommand = ${q(NODE)}\nargs = [${args.map(q).join(", ")}]\n` +

@@ -61,8 +61,8 @@ async function downstreamTools() {
       clients.push(c);
       return c.tools.map(t => ({name: `${server}.${t.name}`, category: server, description: t.description ?? t.title ?? "",
                                 inputSchema: t.inputSchema ?? {type: "object"}, kind: "mcp", server, tool: t.name, client: c,
-                                // Runs without asking only when the server says it only reads, or the config trusts it.
-                                unattended: spec.trusted === true || (t.annotations?.readOnlyHint === true && t.annotations?.destructiveHint !== true)}));
+                                trusted: spec.trusted === true,   // opts the server out of the gate: its calls run unjudged
+                                readOnly: t.annotations?.readOnlyHint === true && t.annotations?.destructiveHint !== true}));
     } catch (e) {
       console.error(`reflex-router: ${server} unavailable: ${e.message}`);   // one broken server must not take the router down
       return [];
@@ -122,12 +122,15 @@ export async function select(intent, cat) {
   return {ranked: r, confidence: r[0]?.p ?? 0, jev_confidence: a?.confidence ?? null, categories};
 }
 
+const OPEN = {")": "(", "]": "[", "}": "{", ">": "<"};
 /** Words, key=value values and quoted strings of the intent: the only values Jev may choose from. */
 export function candidates(text) {
   const out = [];
   for (const m of text.matchAll(/(["'`])([^"'`\n]{1,200})\1/g)) out.push(m[2]);
   for (let w of text.split(/\s+/)) {
-    w = w.replace(/^[("'`[{<]+/, "").replace(/[)"'`\]}>,;:!?]+$/, "");
+    w = w.replace(/^[("'`[{<]+/, "");
+    // trailing punctuation goes, but a closing bracket stays when it closes one: console.log($A)
+    while (/[)"'`\]}>,;:!?]$/.test(w) && !(OPEN[w.at(-1)] && w.split(OPEN[w.at(-1)]).length >= w.split(w.at(-1)).length)) w = w.slice(0, -1);
     if (w.length > 1 && w.endsWith(".") && !w.endsWith("..")) w = w.slice(0, -1);
     const kv = w.match(/^[\w-]+=(.+)$/);
     if (kv) out.push(kv[1]);
@@ -171,6 +174,11 @@ export async function fillArgs(intent, tool) {
     if (a.choice === NONE) { if (required.has(k)) missing.push(k); continue; }
     args[k] = s.enum ? s.enum.find(v => String(v) === a.choice) : [].concat(s.type)[0] === "string" ? a.choice : Number(a.choice);
   }
+  // One word of the intent answers one question: an optional argument given the same value as a
+  // required or earlier-declared one is dropped ("in gate.mjs" is the path, not also --include gate.mjs).
+  const keys = Object.keys(props);
+  for (const k of keys) if (!required.has(k) && typeof args[k] === "string" &&
+      keys.some(j => j !== k && args[j] === args[k] && (required.has(j) || keys.indexOf(j) < keys.indexOf(k)))) delete args[k];
   return {args, confidence, weakest, missing};
 }
 
@@ -255,6 +263,28 @@ async function runShell(tool, args, intent) {
   return {status: "ran", tool: tool.name, command, ...r};
 }
 
+// How the gate sees a downstream call: server, tool and the exact arguments. The gate redacts it
+// for Jev and the trace; its rules see it raw, as they see shell commands.
+export const mcpCommand = (t, args) => `mcp ${t.name} ${JSON.stringify(args)}`;
+
+export async function runMcp(t, args, intent) {
+  const command = mcpCommand(t, args);
+  if (!t.trusted) {
+    const d = await decideSafe({agent: "reflex-router", command, cwd: process.cwd(), intent});
+    if (d.effective === "deny") return {status: "denied", tool: t.name, args, reason: d.reason};
+    if (d.effective !== "pass") return {status: "needs_approval", tool: t.name, args, reason: d.reason,
+      message: "Not run: this needs human approval. Ask the user to confirm, then call it through a server registered directly in the agent."};
+    // The agent's per-tool MCP permissions only see `run`, so a tool that may write must not hide
+    // behind it, whatever the gate says (in shadow mode Jev's opinion is only logged).
+    if (!t.readOnly) return {status: "needs_approval", tool: t.name, args,
+      message: `Not run: ${t.tool} is not marked read-only by its server. A human decides: call it through a server ` +
+               `registered directly in the agent, or mark "${t.server}" as "trusted": true in the router config (no gate at all).`};
+  }
+  try {
+    return {status: "ran", tool: t.name, args, mcp: await t.client.request("tools/call", {name: t.tool, arguments: args})};
+  } catch (e) { return {status: "error", tool: t.name, error: e.message}; }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The three tools.
 function log(entry) {
@@ -310,17 +340,7 @@ export async function run(cat, {intent, tool, args}) {
            message: "Not sure about the arguments. Call run again with this tool and explicit `args`."};
   else if (errors.length) out = {status: "invalid_args", tool: t.name, args: filled.args, errors};
   else if (t.kind === "shell") out = await runShell(t, filled.args, intent);
-  else if (!t.unattended)
-    // The agent's per-tool MCP permissions only see `run`, so a tool that may write must not hide behind it.
-    out = {status: "needs_approval", tool: t.name, args: filled.args,
-           message: `Not run: ${t.tool} is not marked read-only by its server. A human decides: call it through a server ` +
-                    `registered directly in the agent, or mark "${t.server}" as "trusted": true in the router config.`};
-  else {
-    try {
-      const res = await t.client.request("tools/call", {name: t.tool, arguments: filled.args});
-      out = {status: "ran", tool: t.name, args: filled.args, mcp: res};
-    } catch (e) { out = {status: "error", tool: t.name, error: e.message}; }
-  }
+  else out = await runMcp(t, filled.args, intent);
   log({...entry, status: out.status, exit_code: out.exit_code ?? undefined, mcp_error: out.mcp?.isError || undefined});
   return {...out, confidence};
 }
@@ -410,7 +430,9 @@ async function selfcheck() {
   if (!ENV.REFLEX_ROUTER_SELFCHECK_CHILD) {
     const tmp = mkdtempSync(join(tmpdir(), "reflex-router-"));
     const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), "--selfcheck"], {cwd: tmp, stdio: "inherit",
+      // Jev is unreachable and the key a placeholder: a background shadow judgement cannot call the API
       env: {...ENV, REFLEX_ROUTER_SELFCHECK_CHILD: "1", REFLEX_DATA_DIR: join(tmp, "data"), REFLEX_MODE: "shadow",
+            REFLEX_API_URL: "http://127.0.0.1:9/", TYPESAFE_API_KEY: "selfcheck-not-a-key",
             REFLEX_ROUTER_CONFIG: join(tmp, "none.json"), REFLEX_ROUTER_MIN_CONFIDENCE: "0.5"}});
     rmSync(tmp, {recursive: true, force: true});
     process.exitCode = r.status ?? 1;
@@ -445,6 +467,7 @@ async function selfcheck() {
   ok(shellQuote("a b'c") === `'a b'\\''c'` && shellQuote("src/x.go") === "src/x.go", "quoting");
   ok(JSON.stringify(candidates(`search for 'TODO: fix' in src/main.go. author=bob`)) ===
      JSON.stringify(["TODO: fix", "search", "for", "TODO", "fix", "in", "src/main.go", "bob", "author=bob"]), "candidates");
+  ok(JSON.stringify(candidates("match console.log($A), f(x)) (in src)")) === JSON.stringify(["match", "console.log($A)", "f(x)", "in", "src"]), "candidates keep balanced brackets");
 
   // tool selection and argument filling, stubbed Jev
   const cat = [...commandTools(true),
@@ -458,6 +481,11 @@ async function selfcheck() {
   ok(f.args.path === "src" && f.args.max_count === 7 && f.args.author === "ann" && !("since" in f.args) && f.missing.length === 0, "args chosen from intent candidates");
   ok(!("pattern" in stub.calls.at(-1).questions) && stub.calls.at(-1).questions["arg.max_count"].criteria["7"] === null &&
      !("src" in stub.calls.at(-1).questions["arg.max_count"].criteria), "integer args choose among numbers only");
+  const gr = commandTools(true).find(t => t.name === "grep_search");
+  const d1 = await fillArgs("grep pattern=decideSafe path=gate.mjs glob=gate.mjs", gr);
+  ok(d1.args.path === "gate.mjs" && !("glob" in d1.args), "a value filled twice keeps the earlier argument (no --include gate.mjs -- gate.mjs)");
+  const d2 = await fillArgs("grep pattern=TODO path=TODO", gr);
+  ok(d2.args.pattern === "TODO" && !("path" in d2.args), "a required argument keeps its value over an optional one");
   const r0 = await run(cat, {intent: "rg_search please"});
   ok(r0.status === "needs_args" && r0.missing.includes("pattern") && r0.tool === "rg_search", "required arg not in intent: needs_args");
   const r1 = await run(cat, {intent: "something ambiguous"});
@@ -501,7 +529,26 @@ async function selfcheck() {
   ok(g5.status === "invalid_args" && /needs an enum/.test(g5.errors[0]), "word splitting only for enums");
   const g4 = await run(cat, {intent: "log", tool: "git_log", args: {max_count: "5"}});
   ok(g4.status === "invalid_args", "schema checked before running");
+
+  // downstream MCP calls are judged by the gate too; only "trusted" opts a server out
+  let calls = 0;
+  const ds = extra => ({name: "srv.read", kind: "mcp", server: "srv", tool: "read", readOnly: true, inputSchema: {type: "object"},
+                        client: {request: async () => { calls++; return {content: [{type: "text", text: "ok"}]}; }}, ...extra});
+  ok(mcpCommand(ds(), {path: "a b"}) === `mcp srv.read {"path":"a b"}`, "mcp call as the gate sees it");
+  const m1 = await run([ds()], {intent: "read my key", tool: "srv.read", args: {path: "/Users/a/.ssh/id_ed25519"}});
+  ok(m1.status === "needs_approval" && /private key/.test(m1.reason) && calls === 0, "read-only MCP tool: secret-file rule asks, not called");
+  const m2 = await run([ds()], {intent: "wipe", tool: "srv.read", args: {cmd: "rm -rf ~"}});
+  ok(m2.status === "denied" && calls === 0, "MCP deny rule: not called");
+  const m3 = await run([ds({trusted: true})], {intent: "read my key", tool: "srv.read", args: {path: "/Users/a/.ssh/id_ed25519"}});
+  ok(m3.status === "ran" && calls === 1, "trusted server: opted out of the gate");
+  const m4 = await run([ds({readOnly: false})], {intent: "x", tool: "srv.read", args: {path: "README.md"}});
+  ok(m4.status === "needs_approval" && /not marked read-only/.test(m4.message) && calls === 1, "not read-only, gate passes (shadow): still not run");
+  Object.assign(CONFIG, {mode: "enforce"});
+  const m5 = await run([ds()], {intent: "x", tool: "srv.read", args: {path: "README.md"}});
+  Object.assign(CONFIG, {mode: "shadow"});
+  ok(m5.status === "needs_approval" && /jev unavailable/.test(m5.reason) && calls === 1, "enforce + Jev down: MCP call held back");
   const trace = readFileSync(join(CONFIG.data, "trace.jsonl"), "utf8");
+  ok(trace.includes("mcp srv.read") && trace.includes("recursive delete"), "MCP gate decisions are traced");
   ok(trace.includes("force push or delete of main") && trace.includes('"agent":"reflex-router"'), "gate decisions are traced");
   const rlog = readFileSync(R.log, "utf8").trim().split("\n").map(l => JSON.parse(l));
   ok(rlog.some(e => e.status === "choose_tool" && e.alternatives.length) && rlog.some(e => e.tool === "grep_search" && e.status === "ran"), "router.jsonl");
@@ -511,7 +558,7 @@ async function selfcheck() {
   writeFileSync(cfg, JSON.stringify({mcpServers: {fake, trusted: {...fake, trusted: true},
                                                   gone: {command: join(tmp, "does-not-exist")}, remote: {url: "https://x"}}}));
   const routerEnv = {REFLEX_ROUTER_STUB: join(HERE, "test/stub-jev.mjs"), REFLEX_ROUTER_CONFIG: cfg, REFLEX_DATA_DIR: CONFIG.data,
-                     REFLEX_MODE: "shadow", TYPESAFE_API_KEY: "selfcheck-not-a-key"};
+                     REFLEX_MODE: "shadow", TYPESAFE_API_KEY: "selfcheck-not-a-key", REFLEX_API_URL: "http://127.0.0.1:9/"};
   const c = await connect({command: process.execPath, args: [fileURLToPath(import.meta.url)], env: routerEnv}, {name: "router"});
   ok(c.init.protocolVersion === VERSIONS[0] && c.init.capabilities.tools && c.tools.map(t => t.name).join() === "find_tools,describe_tool,run", "initialize + tools/list");
   ok(JSON.stringify(await c.request("ping")) === "{}", "ping");
@@ -549,9 +596,31 @@ async function selfcheck() {
   console.log(process.exitCode ? "router selfcheck FAILED" : "router selfcheck OK");
 }
 
+// Live: route every golden intent with real Jev over all command tools (on PATH or not) and score
+// the tool and the filled arguments. Nothing runs. Exit 1 on any failure.
+async function evalRouter(file) {
+  const golden = JSON.parse(readFileSync(file, "utf8")), cat = commandTools(true);
+  const results = await Promise.all(golden.cases.map(async c => {
+    const s = await select(c.intent, cat), best = s.ranked[0];
+    const tool = best && best.name !== NONE && best.p >= R.minConfidence ? best.name : null;
+    const toolOk = [].concat(c.tool).includes(tool);
+    const f = toolOk && tool ? await fillArgs(c.intent, cat.find(t => t.name === tool)) : null;
+    const argsOk = !f || (Object.entries(c.args ?? {}).every(([k, v]) => f.args[k] === v) && (c.absent ?? []).every(k => !(k in f.args)));
+    const runs = !f ? tool === null : !f.missing.length && Math.min(s.confidence, f.confidence) >= R.minConfidence;
+    return {intent: c.intent, want: c.tool, tool, p: best?.p, args: f?.args, missing: f?.missing, confidence: f?.confidence, toolOk, argsOk, runs};
+  }));
+  for (const r of results) console.log(`${r.toolOk && r.argsOk && r.runs ? "ok  " : "FAIL"} ${r.intent.slice(0, 60).padEnd(60)} ` +
+    `${String(r.tool)} p=${r.p} ${JSON.stringify(r.args ?? {})}${r.missing?.length ? ` missing=${r.missing}` : ""}${r.confidence != null ? ` argp=${r.confidence}` : ""}`);
+  const n = k => results.filter(r => r[k]).length, all = results.filter(r => r.toolOk && r.argsOk && r.runs).length;
+  console.log(`\n${results.length} intents · tool ${n("toolOk")}/${results.length} · args ${results.filter(r => r.toolOk && r.argsOk).length}/${results.length} · ` +
+              `would run as expected ${n("runs")}/${results.length} · all ok ${all}/${results.length} · model ${CONFIG.model}`);
+  if (all < results.length) process.exitCode = 1;
+}
+
 const main = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 const optIdx = process.argv.indexOf("--check");
 if (main && process.argv.includes("--selfcheck")) await selfcheck();
+else if (main && process.argv.includes("--eval")) await evalRouter(process.argv[process.argv.indexOf("--eval") + 1] ?? join(HERE, "golden.json"));
 else if (main && optIdx > -1) {
   // Try one intent against real Jev without an agent: node router/server.mjs --check "<intent>" [--run]
   const intent = process.argv[optIdx + 1], cat = await catalog();

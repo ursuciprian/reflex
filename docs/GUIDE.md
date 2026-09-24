@@ -30,7 +30,7 @@ hook (see the table in the README). Each adapter turns the agent's event into th
    of its patterns match. Rules are **enforced in every mode**, because they are code, not a model.
    Shipped rules: `rm-root`, `prod-destroy`, `force-push-main`, `push-mirror` (deny); `tamper`, `destroy`,
    and — checked even before read-only detection — `secret-read` (the API key, secret stores) and
-   `secret-file-read` (`~/.ssh/id_*`, `~/.aws/credentials`, `.env` files, `kubectl get secret`) (ask). Any mutating command that touches the Reflex checkout, its setup files or its logs is also an `ask`, wherever the repo was cloned.
+   `secret-file-read` (`~/.ssh/id_*` but not `.pub`, `~/.aws/credentials`, `.netrc`, `.pgpass`, `.env` / `.env.*` files but not `.env.example` and other templates, `kubectl get secret(s)`) (ask). It matches the text, so a commit message or `echo` that names `.env` also asks. Any mutating command that touches the Reflex checkout, its setup files or its logs is also an `ask`, wherever the repo was cloned.
 3. **Fast lane** (`rules.json` → `pass`) — known-safe steps: builds, tests, `mkdir`, `git add/commit`,
    pushing a non-main branch. A command passes when every segment is read-only or matches a fast-lane
    pattern. → **pass**, logged.
@@ -217,7 +217,8 @@ and [confidence](https://docs.typesafe.ai/confidence).
   `failed` from `PostToolUse` / `PostToolUseFailure`.
 - Only shell tools are gated (`Bash`, pi/omp `bash`, opencode `bash`, Hermes `terminal`). File-edit
   tools, MCP tools, omp's `eval` and Hermes' `execute_code` go through each agent's own permissions.
-  The tool router's command tools are the exception: the router runs them through the gate itself.
+  The tool router is the exception: it runs its command tools and its downstream MCP calls through
+  the gate itself.
 - Codex and opencode hooks cannot open a prompt, so an `ask` blocks with a reason telling the agent
   to get your confirmation. Codex passes the session directory as `cwd`, not a per-command
   `workdir`. Codex hooks must be trusted in `/hooks` before they run.
@@ -271,7 +272,9 @@ free text. Each argument the agent did not pass becomes one question, all in one
 - a boolean → a `noul` ("does the request ask for this?");
 - a string or number → a `choice` over the words, `key=value` values and quoted strings of the
   (redacted) intent, filtered by the argument's type and `pattern`. Optional arguments get a
-  `none_of_these` option, and choosing it leaves the tool's default in place;
+  `none_of_these` option, and choosing it leaves the tool's default in place. One value answers
+  one question: when Jev gives an optional argument the value of a required or earlier-declared one
+  (`in gate.mjs` as both the path and the file filter), the later one is dropped;
 - objects and arrays are not filled: the agent passes them.
 
 A call is only as sure as its least certain judgement. When the tool's probability or any
@@ -283,12 +286,20 @@ checked against the tool's JSON schema (`type`, `enum`, `const`, `required`, `pr
 `additionalProperties`, `items`, lengths, bounds, `pattern`) before anything runs. Quote exact values
 in the intent: `search for 'retry budget' in src`.
 
-**Running.** A downstream tool is proxied as `tools/call` and its result (content and
-`structuredContent`) returned unchanged, after one line naming the tool — but only when its server
-annotates it `readOnlyHint: true` (and not `destructiveHint`), or the server's entry in the router
-config says `"trusted": true`. Anything else returns `needs_approval` and does not run: the agent's
-per-tool MCP permissions only see `run`, so a tool that may write must not hide behind it. Keep such
-servers registered directly in the agent, or trust them explicitly. Downstream servers start with a
+**Running.** A downstream tool call is first judged by the gate like a shell command, as one line
+naming the server, the tool and the exact arguments: `mcp github.list_issues {"owner":"acme","repo":"api"}`
+(`decideSafe`, agent `reflex-router`, the intent as the stated task). The rules see it raw, so
+`secret-file-read`, `prod-destroy`'s SQL verbs, `rm-root` and the tamper checks apply; Jev and the
+policy judge it the same way (in shadow mode Jev's verdict is only logged, as for shell commands).
+`deny` returns `denied`, `ask` returns `needs_approval`, and nothing is sent. Past the gate, the call is
+proxied as `tools/call` and its result (content and `structuredContent`) returned unchanged, after
+one line naming the tool — but only when its server annotates it `readOnlyHint: true` (and not
+`destructiveHint`). A tool that is not annotated read-only returns `needs_approval` whatever the
+gate said: the agent's per-tool MCP permissions only see `run`, so a tool that may write must not
+hide behind it. Keep such servers registered directly in the agent.
+`"trusted": true` on a server's entry is the explicit opt-out: its calls skip the gate and the
+annotation check entirely and run as the agent asks. Use it only for servers you would allow
+wholesale. Downstream servers start with a
 minimal environment (`HOME`, `PATH`, `USER`, `SHELL`, `TERM`, `LOGNAME`, `TMPDIR`, `LANG`) plus their
 own `env`; shell tools get the router's environment without `TYPESAFE_API_KEY`. A command tool is expanded
 from its argv template and run with `execFile` — never through a shell — **after the Reflex gate
@@ -317,16 +328,18 @@ agent run unasked; the gate still judges each call.
 
 **Logs.** Every `find_tools` and `run` appends to `router.jsonl` in the data directory: the intent
 (redacted), the chosen tool, its probability, the next four alternatives, the weakest argument and the
-outcome. Argument values are not logged. Shell runs are also in `trace.jsonl`, like any gated
-command.
+outcome. Argument values are not logged in `router.jsonl`. Every gated call, shell or MCP, is
+also in `trace.jsonl` (redacted), like any gated command.
 
 **Trying it.** `node router/server.mjs --check "who last changed router/mcp.mjs"` prints the
-ranking; add `--run` to run it. Registering it in an agent: `node install.mjs --router` prints the
+ranking; add `--run` to run it. `npm run eval-router` routes the intents in
+`router/golden.json` through live Jev and scores the chosen tool and the filled arguments; nothing
+runs. Registering it in an agent: `node install.mjs --router` prints the
 command or config snippet for every agent, and changes nothing:
 
 | Agent | Where the MCP server goes |
 |---|---|
-| Claude Code | `claude mcp add --scope user --transport stdio reflex-router -- <node> <repo>/router/server.mjs --mode shadow`, or `mcpServers` in a repo's `.mcp.json` |
+| Claude Code | `claude mcp add --scope user [--env K=V] --transport stdio reflex-router -- <node> <repo>/router/server.mjs --mode shadow`, or `mcpServers` in a repo's `.mcp.json` |
 | Codex CLI | `codex mcp add reflex-router -- <node> …`, or `[mcp_servers.reflex-router]` (`command`, `args`, `[…env]`) in `~/.codex/config.toml` |
 | pi | no built-in MCP: the `pi-mcp-adapter` extension, then `mcpServers` in `~/.pi/agent/mcp.json` or `.mcp.json` |
 | oh-my-pi | `mcpServers` in `~/.omp/agent/mcp.json` or `.omp/mcp.json` (omp also imports Claude Code and Codex configs: register once) |
@@ -335,9 +348,12 @@ command or config snippet for every agent, and changes nothing:
 
 **Limits.**
 
-- Downstream MCP tools do not go through the gate's rules or Jev (they are not shell commands); the
-  read-only annotation or `"trusted"` is the whole check, and annotations are the server's own claim.
-  Trust only servers you would allow wholesale.
+- The gate judges a downstream call by its name and arguments only; it does not know what the tool
+  does beyond that, and the read-only annotation is the server's own claim. `"trusted"` turns both
+  checks off for a server.
+- A downstream server that crashes stays unavailable until the router restarts. Downstream servers
+  must speak a handshake revision (2025-11-25 or earlier); a modern-only (2026-07-28) server fails
+  to connect and is skipped.
 - Only stdio downstream servers; no resources, prompts, sampling or `listChanged` from them.
 - The server speaks the `initialize`-handshake MCP revisions (2024-11-05 … 2025-11-25). A client of
   the handshake-free 2026-07-28 revision probes with `server/discover`, gets "method not found",

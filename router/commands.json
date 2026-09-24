@@ -8,7 +8,7 @@
       "args": ["-n", "--no-heading", "--color", "never", ["-i", "{ignore_case}"], ["-g", "{glob}"], "-e", "{pattern}", "--", "{path}"],
       "inputSchema": {"type": "object", "additionalProperties": false, "required": ["pattern"], "properties": {
         "pattern": {"type": "string", "minLength": 1, "x-allow-dash": true, "description": "The text or regular expression to look for inside files"},
-        "path": {"type": "string", "minLength": 1, "default": ".", "description": "The directory or file to search in"},
+        "path": {"type": "string", "minLength": 1, "pattern": "^[^*?]+$", "default": ".", "description": "The directory or file to search in (a real path: a wildcard such as *.go is a file-name filter, not a path)"},
         "glob": {"type": "string", "description": "A file-name filter such as *.go or *.tf, limiting which files are searched"},
         "ignore_case": {"type": "boolean", "description": "Match regardless of upper or lower case"}
       }}
@@ -19,7 +19,7 @@
       "args": ["-rnI", ["-i", "{ignore_case}"], ["--include", "{glob}"], "-e", "{pattern}", "--", "{path}"],
       "inputSchema": {"type": "object", "additionalProperties": false, "required": ["pattern"], "properties": {
         "pattern": {"type": "string", "minLength": 1, "x-allow-dash": true, "description": "The text or regular expression to look for inside files"},
-        "path": {"type": "string", "minLength": 1, "default": ".", "description": "The directory or file to search in"},
+        "path": {"type": "string", "minLength": 1, "pattern": "^[^*?]+$", "default": ".", "description": "The directory or file to search in (a real path: a wildcard such as *.go is a file-name filter, not a path)"},
         "glob": {"type": "string", "description": "A file-name filter such as *.py, limiting which files are searched"},
         "ignore_case": {"type": "boolean", "description": "Match regardless of upper or lower case"}
       }}
@@ -31,7 +31,7 @@
       "inputSchema": {"type": "object", "additionalProperties": false, "required": ["pattern"], "properties": {
         "pattern": {"type": "string", "minLength": 1, "description": "The code pattern to match, written as code with $VARS as wildcards"},
         "lang": {"type": "string", "enum": ["bash", "c", "cpp", "csharp", "css", "go", "html", "java", "javascript", "json", "kotlin", "lua", "python", "ruby", "rust", "scala", "swift", "tsx", "typescript", "yaml"], "description": "The programming language of the code being searched"},
-        "path": {"type": "string", "minLength": 1, "default": ".", "description": "The directory or file to search in"}
+        "path": {"type": "string", "minLength": 1, "pattern": "^[^*?]+$", "default": ".", "description": "The directory or file to search in (a real path: a wildcard such as *.go is a file-name filter, not a path)"}
       }}
     },
     {

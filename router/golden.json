@@ -1,0 +1,21 @@
+{
+  "version": "router-golden-v1",
+  "note": "Intents for `npm run eval-router` (node router/server.mjs --eval): tool selection and argument filling against real Jev over the built-in command tools; nothing is executed. `tool` is the acceptable tool (or a list; null means no tool should be chosen with confidence), `args` the values the filled arguments must have, `absent` arguments that must not be filled.",
+  "cases": [
+    {"intent": "show the last 5 commits", "tool": "git_log", "args": {"max_count": 5}},
+    {"intent": "who last changed router/mcp.mjs", "tool": "git_blame", "args": {"path": "router/mcp.mjs"}},
+    {"intent": "search for decideSafe in gate.mjs", "tool": ["grep_search", "rg_search"], "args": {"pattern": "decideSafe", "path": "gate.mjs"}, "absent": ["glob"]},
+    {"intent": "find TODO comments in *.go files", "tool": ["grep_search", "rg_search"], "args": {"pattern": "TODO", "glob": "*.go"}},
+    {"intent": "case-insensitive search for 'retry budget' in src", "tool": ["grep_search", "rg_search"], "args": {"pattern": "retry budget", "path": "src", "ignore_case": true}},
+    {"intent": "what changed compared to HEAD~3", "tool": "git_diff", "args": {"ref": "HEAD~3"}},
+    {"intent": "summarize my uncommitted changes, just the changed files and line counts", "tool": "git_diff", "args": {"stat": true}},
+    {"intent": "commits by alice that touched src/api", "tool": "git_log", "args": {"author": "alice", "path": "src/api"}},
+    {"intent": "blame lines 10,40 of gate.mjs", "tool": "git_blame", "args": {"path": "gate.mjs", "lines": "10,40"}},
+    {"intent": "list the pods in namespace payments", "tool": "kubectl_get", "args": {"resource": "pods", "namespace": "payments"}},
+    {"intent": "why is pod api-7d9f crashing in namespace web", "tool": "kubectl_describe", "args": {"resource": "pod", "name": "api-7d9f", "namespace": "web"}},
+    {"intent": "list the VPCs in eu-west-1", "tool": "aws_describe", "args": {"operation": "ec2 describe-vpcs", "region": "eu-west-1"}},
+    {"intent": "which AWS account and role am I using right now", "tool": "aws_describe", "args": {"operation": "sts get-caller-identity"}},
+    {"intent": "find code matching console.log($A) in the typescript sources", "tool": "ast_grep", "args": {"pattern": "console.log($A)", "lang": "typescript"}},
+    {"intent": "book a flight to Paris next Tuesday", "tool": null}
+  ]
+}
