@@ -8,6 +8,7 @@
 #   REFLEX_ROUTING_MODE=shadow                      # default; enforce rewrites the model
 #   REFLEX_ROUTING_POLICY=/path/to/reflex/routing/policy.json
 #   REFLEX_ROUTING_QUESTIONS=/path/to/reflex/routing/questions.json
+#   REFLEX_REDACT=/path/to/reflex/setup/redact.json  # secret patterns shared with the gate
 #   REFLEX_DATA_DIR=/path/to/state                  # routing.jsonl lands here
 #   TYPESAFE_API_KEY=...                            # or REFLEX_KEYCHAIN_SERVICE on macOS (not in Docker)
 #

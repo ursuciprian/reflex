@@ -8,13 +8,14 @@ content is and how hard it is, with one Jev call.
   python3 routing/reflex_router.py --smoke              live Jev over a small labelled prompt set
 
 Order: family of the requested model -> secret shapes / sensitive paths (a floor) -> cache -> Jev
--> policy (sensitivity pool, difficulty tier, cheapest) -> stickiness (large contexts stay put).
+-> policy (sensitivity pool, models the caller's key may use, difficulty tier, cheapest; none
+eligible: policy no_eligible) -> stickiness (large contexts stay put).
 REFLEX_ROUTING_MODE: off | shadow (default: decide in the background, log, keep the requested model)
 | enforce (wait up to the latency budget, rewrite data["model"]). Stdlib only; litellm is imported
-only to subclass its CustomLogger.
+to subclass its CustomLogger and, inside the proxy, for its key-access check.
 """
 import asyncio
-import fnmatch
+import functools
 import hashlib
 import json
 import os
@@ -40,6 +41,7 @@ CONFIG = {
     "mode": ENV.get("REFLEX_ROUTING_MODE", "shadow"),
     "policy": ENV.get("REFLEX_ROUTING_POLICY", str(HERE / "policy.json")),
     "questions": ENV.get("REFLEX_ROUTING_QUESTIONS", str(HERE / "questions.json")),
+    "redact": ENV.get("REFLEX_REDACT", str(HERE.parent / "setup" / "redact.json")),
     "data": ENV.get("REFLEX_DATA_DIR", str(Path(ENV.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "reflex")),
     "keychain": ENV.get("REFLEX_KEYCHAIN_SERVICE", "typesafe-api-key"),
 }
@@ -65,43 +67,30 @@ def sha(v):
 
 
 # ---------------------------------------------------------------------------------------------
-# Redaction: a port of redact() in gate.mjs. Keep the two lists in sync.
-# ponytail: a pattern list, not a DLP engine; add a pattern when a new credential shape shows up.
-SECRET_SHAPES = [re.compile(p) for p in [
-    r"\b(AKIA|ASIA)[A-Z0-9]{16}\b",
-    r"\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b",
-    r"\b(sk-[A-Za-z0-9_-]{16,}|xox[abpr]-[A-Za-z0-9-]{10,}|glpat-[A-Za-z0-9_-]{16,})\b",
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z ]*PRIVATE KEY-----|$)",
-    r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
-    r"\b[rs]k_(live|test)_[A-Za-z0-9]{10,}\b", r"\bAIza[0-9A-Za-z_-]{35}\b", r"\bnpm_[A-Za-z0-9]{36}\b",
-    r"hooks\.slack\.com/services/\S+",
-    # a bare 40-char AWS-style secret: mixed case, so git SHAs (lowercase hex) are left alone
-    r"(?<![A-Za-z0-9/+])(?=[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+]))(?=[A-Za-z0-9/+]*[A-Z])(?=[A-Za-z0-9/+]*[a-z])[A-Za-z0-9/+]{40}",
-]]
-SECRET_CONTEXT = [(re.compile(p, f), r) for p, f, r in [
-    (r"(authorization:\s*(bearer|basic|token)\s+)\S+", re.I, r"\1<redacted>"),
-    (r"((cookie|x-[\w-]*(auth|token|key)[\w-]*):\s*)[^'\"\n]+", re.I, r"\1<redacted>"),
-    (r"(\b[\w.-]*(secret|token|passw(or)?d|api[_-]?key|access[_-]?key|credential)[\w.-]*\"?\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|\S+)", re.I, r"\1<redacted>"),
-    (r"(--?(password|passwd|token|secret|api-key)[= ]\s*)(\"[^\"]*\"|'[^']*'|\S+)", re.I, r"\1<redacted>"),
-    (r"((\s-u|--user)\s+[^\s:]+:)\S+", 0, r"\1<redacted>"),
-    (r"(\b(mysql|mariadb)\b[^|;&]*\s-p)(\S+)", 0, r"\1<redacted>"),
-    (r"(\bsshpass\s+-p\s*)\S+", 0, r"\1<redacted>"),
-    (r"(://[^\s:@/]+:)\S+@", 0, r"\1<redacted>@"),
-]]
+# Redaction: the patterns in setup/redact.json, shared with gate.mjs; both selfchecks run its corpus.
+# re.ASCII makes \w, \b and case folding match JavaScript's. Loaded on first use, so a missing file
+# fails routing (the request keeps its model), never the proxy's start.
+@functools.cache
+def redaction():
+    spec = load(CONFIG["redact"])
+    return ([re.compile(p, re.ASCII) for p in spec["shapes"]],
+            [(re.compile(c["pattern"], re.ASCII | (re.I if "i" in c["flags"] else 0)), re.sub(r"\$(\d+)", r"\\g<\1>", c["replace"]))
+             for c in spec["context"]], spec["corpus"])
 
 
 def redact(s):
+    shapes, context, _ = redaction()
     out = str(s or "")
-    for rx in SECRET_SHAPES:
+    for rx in shapes:
         out = rx.sub("<redacted>", out)
-    for rx, repl in SECRET_CONTEXT:
+    for rx, repl in context:
         out = rx.sub(repl, out)
     return out
 
 
 def has_secret(s):
     # Shapes only: the keyword patterns also match prose like "max_tokens: 100".
-    return any(rx.search(s) for rx in SECRET_SHAPES)
+    return any(rx.search(s) for rx in redaction()[0])
 
 
 # ---------------------------------------------------------------------------------------------
@@ -111,6 +100,9 @@ SKIP_KEYS = {"type", "role", "id", "tool_use_id", "call_id", "data", "image_url"
              "cache_control", "file_data", "image"}
 REMINDER = re.compile(r"<system-reminder>[\s\S]*?</system-reminder>")
 PATH_RE = re.compile(r"(?<![\w:/.])[~.\w-]*(?:/[\w.@-]+)+/?|(?<![\w/.])\.env(?:\.[\w-]+)?\b|\b[\w-]+\.(?:pem|key|tfvars|tfstate|p12)\b")
+# The agent's working directory, as Claude Code ("Primary working directory: /x") and Codex
+# ("<cwd>/x</cwd>") state it. Paths under it are the repo; everything else is outside.
+CWD_RE = re.compile(r"(?:working directory:\s*|<cwd>\s*)(/[^\s<]+)", re.I)
 
 
 def text_of(x):
@@ -149,11 +141,14 @@ def features(data):
     whole = (system + "\n" + convo)[-MAX_CHARS:]
     paths = sorted({p for p in PATH_RE.findall(whole) if len(p) > 3})
     first = user_text(users[0].get("content")) if users else last
+    cwd = CWD_RE.search(whole)
     return {
         "last": last, "system": system, "tools": [t for t in tools if t], "paths": paths,
+        "cwd": cwd.group(1).rstrip("/") if cwd else None,
         "turn": len(users), "secret": has_secret(whole),
-        # ponytail: chars / 4 as tokens; a tokenizer per model family if the switch maths needs it
-        "ctx_tokens": (len(system) + len(convo) + len(json.dumps(data.get("tools") or []))) // 4,
+        # An estimate, labelled _est wherever it appears. ponytail: chars / 4; a tokenizer per model
+        # family if the switch maths ever needs better than that.
+        "ctx_tokens_est": (len(system) + len(convo) + len(json.dumps(data.get("tools") or []))) // 4,
         # LiteLLM sets litellm_session_id from x-*-session-id headers and Anthropic metadata.user_id;
         # otherwise the first user message and system prompt identify the conversation.
         "conv": str(data.get("litellm_session_id") or sha([system[:2000], first[:2000]])),
@@ -161,10 +156,27 @@ def features(data):
     }
 
 
-def jev_state(f, spec):
+def path_view(p, f, policy):
+    """What Jev sees of a path. policy paths_to_jev: full | shape | shape_outside_repo (default).
+    A shape is the file name plus flags, so the directory layout outside the repo stays local."""
+    mode = policy.get("paths_to_jev", "shape_outside_repo")
+    if mode == "full":
+        return p
+    cwd = f.get("cwd")
+    rel = "." if p.rstrip("/") == cwd else p[len(cwd) + 1:] if cwd and p.startswith(cwd + "/") else p
+    inside = not rel.startswith(("/", "~")) and ".." not in rel.split("/")
+    if inside and mode == "shape_outside_repo":
+        return rel
+    flags = ([] if inside else ["outside repo"]) + \
+        (["sensitive"] if any(re.search(rx, p, re.I) for rx in policy["sensitivity"]["restricted_paths"]) else [])
+    return ".../" + p.rstrip("/").rsplit("/", 1)[-1] + (f" [{', '.join(flags)}]" if flags else "")
+
+
+def jev_state(f, spec, policy):
+    paths = list(dict.fromkeys(redact(path_view(p, f, policy)) for p in f["paths"][:200]))
     return {spec["item_key"]: {"message": redact(f["last"])[-2000:], "system_summary": redact(f["system"][:400]),
                                "system_chars": len(f["system"]), "tools": f["tools"][:60],
-                               "paths": [redact(p) for p in f["paths"][:40]], "turn": f["turn"]},
+                               "paths": paths[:40], "turn": f["turn"]},
             spec["context_key"]: spec["context"]}
 
 
@@ -197,14 +209,18 @@ def ask(state, questions, timeout_s):
             if e.code in (429, 529) and attempt == 0 and time.monotonic() - t0 < timeout_s / 2:
                 time.sleep(0.25)
                 continue
-            raise RuntimeError(f"HTTP {e.code}: {e.read()[:200].decode(errors='replace')}") from None
+            # The status only: an error body may quote the request, and this text reaches the log.
+            raise RuntimeError(f"HTTP {e.code}") from None
 
 
 # ---------------------------------------------------------------------------------------------
 # Policy: pure functions over answers, request features and policy.json.
 def family_of(model, policy):
+    """The family whose models (or aliases, such as a gateway's own auto router) include `model`.
+    A model the policy does not list is never routed, so a newer model is not quietly swapped for a
+    listed one."""
     return next((name for name, fam in policy["families"].items()
-                 if any(fnmatch.fnmatchcase(model, g) for g in fam["match"])), None)
+                 if resolve(model, fam) or model in fam.get("aliases", [])), None)
 
 
 def resolve(model, fam):
@@ -233,9 +249,12 @@ def classify(answers, f, policy):
     return sens, tier, tools, why
 
 
-def eligible(fam, sens, tools, policy):
+def eligible(fam, sens, tools, policy, ctx_est=0):
+    """Models whose tags the sensitivity requires, with tools when needed, and a context window
+    (max_context, optional) that fits the estimated context."""
     need = policy["sensitivity"]["pools"][sens]["require"]
-    return [m for m, i in fam["models"].items() if all(i.get(k) for k in need) and (not tools or i.get("tools", True))]
+    return [m for m, i in fam["models"].items() if all(i.get(k) for k in need) and (not tools or i.get("tools", True))
+            and ctx_est <= i.get("max_context", float("inf"))]
 
 
 def pick(fam, pool, tier, policy):
@@ -259,22 +278,53 @@ def stay_or_switch(prev, new, pool, f, fam, policy):
         return new, "harder turn: moving up a tier"
     if f["pinned"]:
         return prev, "sticky: server-side context (previous_response_id)"
-    st, ctx = policy["stickiness"], f["ctx_tokens"]
+    st, ctx = policy["stickiness"], f["ctx_tokens_est"]
     old_in, new_in = fam["models"][p]["price_in"] / 1e6, fam["models"][new]["price_in"] / 1e6
     saving = (ctx * st["cache_read_factor"] + st["turn_tokens"]) * (old_in - new_in) * st["remaining_turns"]
     rebuild = ctx * new_in
     if saving > rebuild:
         return new, f"switch: saves ${saving:.4f} over {st['remaining_turns']} turns, rebuild ${rebuild:.4f}"
-    return prev, f"sticky: rebuild ${rebuild:.4f} >= saving ${saving:.4f} ({ctx} context tokens)"
+    return prev, f"sticky: rebuild ${rebuild:.4f} >= saving ${saving:.4f} ({ctx} context tokens, est.)"
 
 
 # ---------------------------------------------------------------------------------------------
+STICKY_TTL_S = 24 * 3600
+
+
+def key_lists(model, key):
+    """The key's own model list: the check outside a proxy."""
+    allowed = list(getattr(key, "models", None) or [])
+    return not allowed or model in allowed or "all-proxy-models" in allowed
+
+
+async def may_call(model, key):
+    """Whether the caller's key may use `model`. LiteLLM authorises the requested model before the
+    pre-call hooks and never re-checks after them, so a rewrite gets LiteLLM's own check here: the
+    one it runs for a key's model-group alias (key and team models, wildcards, access groups, team
+    members, projects)."""
+    if key is None:
+        return True
+    try:
+        from litellm.proxy.auth.auth_checks import can_key_call_resolved_model
+        from litellm.proxy.proxy_server import llm_router
+    except ImportError:     # outside a proxy (CLI, selfcheck)
+        return key_lists(model, key)
+    try:
+        await can_key_call_resolved_model(model=model, llm_model_list=llm_router.model_list if llm_router else None,
+                                          valid_token=key, llm_router=llm_router)
+        return True
+    except Exception:
+        return False
+
+
 class ReflexRouter(CustomLogger):
-    def __init__(self, ask_fn=ask, mode=None):
+    def __init__(self, ask_fn=ask, mode=None, may_call_fn=may_call):
         if CustomLogger is not object:
             super().__init__()
-        self.ask, self.mode = ask_fn, mode
-        # ponytail: in-process dicts; LiteLLM with several workers needs the passed DualCache (Redis) instead
+        self.ask, self.mode, self.may_call = ask_fn, mode, may_call_fn
+        # ponytail: per-process dicts. The Jev cache stays per process (a miss costs one Jev call). The
+        # model each conversation is on also goes to LiteLLM's Redis when the proxy shares one (see
+        # prev_model), so stickiness survives a request landing on another worker.
         self.cache, self.convs, self.tasks = {}, {}, set()
 
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
@@ -283,24 +333,26 @@ class ReflexRouter(CustomLogger):
             return data
         try:
             f, requested = features(data), data["model"]
-            allowed = list(getattr(user_api_key_dict, "models", None) or [])
         except Exception as e:     # a routing bug never breaks a request
-            print(f"reflex routing: {e}", file=sys.stderr)
+            print(f"reflex routing: {type(e).__name__}: {e}", file=sys.stderr)
             return data
+        redis = getattr(cache, "redis_cache", None)
         if mode != "enforce":
             # Shadow: nobody waits. The decision runs after the request is on its way.
-            task = asyncio.get_running_loop().create_task(self.decide(f, requested, allowed, apply=False))
+            task = asyncio.get_running_loop().create_task(self.decide(f, requested, user_api_key_dict, redis))
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
             return data
-        d = await self.decide(f, requested, allowed, apply=True)
+        d = await self.decide(f, requested, user_api_key_dict, redis, apply=True)
+        if d.get("block"):
+            return d["block"]       # a string: LiteLLM rejects the request with it (HTTP 400)
         data["model"] = d["applied"]
         return data
 
-    async def decide(self, f, requested, allowed=(), apply=False):
+    async def decide(self, f, requested, key=None, redis=None, apply=False):
         t0 = time.monotonic()
         rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "mode": "enforce" if apply else "shadow",
-               "conv": sha(f["conv"]), "turn": f["turn"], "ctx_tokens": f["ctx_tokens"], "requested": requested,
+               "conv": sha(f["conv"]), "turn": f["turn"], "ctx_tokens_est": f["ctx_tokens_est"], "requested": requested,
                "chosen": requested, "applied": requested, "source": None, "reason": None, "error": None}
         try:
             policy, spec = load(CONFIG["policy"]), load(CONFIG["questions"])
@@ -312,21 +364,35 @@ class ReflexRouter(CustomLogger):
             fam = policy["families"][fam_name]
             answers, rec["source"] = await self.answers(f, spec, policy, rec)
             sens, tier, tools, why = classify(answers, f, policy)
-            pool = eligible(fam, sens, tools, policy)
+            req = resolve(requested, fam)
+            # Eligible for the content, and callable with this key (the requested model already passed).
+            pool = [m for m in eligible(fam, sens, tools, policy, f["ctx_tokens_est"])
+                    if m == requested or await self.may_call(m, key)]
             chosen = pick(fam, pool, tier, policy)
             rec.update(family=fam_name, sensitivity=sens, tier=tier, needs_tools=tools, floors=why or None,
-                       answers={k: a.get("choice", a.get("score", a.get("noul"))) for k, a in answers.items()})
+                       answers={k: a.get("choice", a.get("score", a.get("noul"))) for k, a in answers.items()},
+                       violation=(req is not None and req not in pool) or None)
             if chosen is None:
-                rec.update(reason=f"no model in {fam_name} is eligible for {sens}; kept", violation=True)
-                return rec
-            prev = self.convs.get(f["conv"])
-            chosen, sticky = stay_or_switch(prev, chosen, pool, f, fam, policy)
-            if allowed and chosen not in allowed and "all-proxy-models" not in allowed:
-                rec.update(reason=f"{chosen} not allowed for this key; kept")
-                return rec
-            req = resolve(requested, fam)
-            rec.update(chosen=chosen, violation=req not in pool or None,
-                       reason=sticky or f"{sens}/{tier}: cheapest eligible")
+                ne = policy.get("no_eligible", {})
+                fb, action = ne.get("model"), ne.get("action", "block")
+                if action == "keep":
+                    rec.update(action="keep", reason=f"no model in {fam_name} is eligible for {sens}; kept")
+                    return rec
+                if action == "fallback_model" and fb and await self.may_call(fb, key):
+                    chosen, reason = fb, f"no model in {fam_name} is eligible for {sens}: fallback_model"
+                else:
+                    rec.update(action="block", reason=f"no model in {fam_name} this key may use is eligible for {sens}")
+                    if apply:
+                        rec.update(applied=None, block=f"Reflex routing blocked this request: no model this key may use in "
+                                   f"'{fam_name}' is cleared for {sens} content (policy {policy['version']}).")
+                    return rec
+            else:
+                prev = await self.prev_model(f["conv"], redis)
+                chosen, sticky = stay_or_switch(prev, chosen, pool, f, fam, policy)
+                reason = sticky or f"{sens}/{tier}: cheapest eligible"
+            if req is not None and resolve(chosen, fam) == req:
+                chosen = requested      # same model: keep the requested name (claude-opus-5[1m], a dated id)
+            rec.update(chosen=chosen, reason=reason)
             if apply:
                 rec["applied"] = chosen
             return rec
@@ -334,14 +400,31 @@ class ReflexRouter(CustomLogger):
             rec.update(source="error", error=f"{type(e).__name__}: {e}"[:200], reason="internal error; kept")
             return rec
         finally:
-            self.convs[f["conv"]] = rec["applied"]
-            while len(self.convs) > 5000:
-                self.convs.pop(next(iter(self.convs)))
             rec["latency_s"] = round(time.monotonic() - t0, 3)
+            await self.remember(f["conv"], rec["applied"], redis)
             log(rec)
 
+    async def prev_model(self, conv, redis):
+        if redis is not None:
+            try:
+                if v := await redis.async_get_cache(f"reflex:model:{sha(conv)}"):
+                    return v
+            except Exception:
+                pass
+        return self.convs.get(conv)
+
+    async def remember(self, conv, model, redis):
+        self.convs[conv] = model
+        while len(self.convs) > 5000:
+            self.convs.pop(next(iter(self.convs)))
+        if redis is not None and model:
+            try:
+                await redis.async_set_cache(f"reflex:model:{sha(conv)}", model, ttl=STICKY_TTL_S)
+            except Exception:
+                pass
+
     async def answers(self, f, spec, policy, rec):
-        state = jev_state(f, spec)
+        state = jev_state(f, spec, policy)
         key = sha([state, spec["version"], CONFIG["model"]])
         rec["state_sha"] = key
         hit = self.cache.get(key)
@@ -387,6 +470,10 @@ proxy_handler_instance = ReflexRouter()
 def selfcheck():
     import tempfile
     from types import SimpleNamespace
+
+    async def listed(model, key):
+        return key_lists(model, key)
+    Router = functools.partial(ReflexRouter, may_call_fn=listed)    # same result with or without litellm
     fails = []
 
     def ok(c, m):
@@ -394,12 +481,9 @@ def selfcheck():
             fails.append(m)
             print("FAIL", m, file=sys.stderr)
 
-    # redaction: same cases as gate.mjs
-    r = redact("curl -H 'Authorization: Bearer abc.def' https://u:hunter2@x.io AWS_SECRET_ACCESS_KEY=wJalr/K7 "
-               "--password s3cr3t AKIAABCDEFGHIJKLMNOP ghp_" + "a" * 36)
-    for s in ["abc.def", "hunter2", "wJalr", "s3cr3t", "AKIAABCDEFGHIJKLMNOP", "ghp_aaaa"]:
-        ok(s not in r, f"redact {s}")
-    ok(redact("git show 3f5e8a9b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f").endswith("3f5e8a9b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f"), "git SHA kept")
+    # redaction: setup/redact.json's corpus, the exact outputs gate.mjs's selfcheck also asserts
+    for c in redaction()[2]:
+        ok(redact(c["in"]) == c["out"], f"redact corpus: {c['in'][:40]!r} -> {redact(c['in'])!r}")
     ok(has_secret("key AKIAABCDEFGHIJKLMNOP") and not has_secret("max_tokens: 100, password field"), "secret shapes only")
 
     # the three request shapes
@@ -427,13 +511,28 @@ def selfcheck():
     ok(features(chat)["conv"] == features({**chat, "messages": chat["messages"][:2]})["conv"], "conversation id stable across turns")
     ok(features({**chat, "litellm_session_id": "s1"})["conv"] == "s1", "session id from LiteLLM wins")
 
-    # policy
+    # what Jev sees of paths
     policy = load(CONFIG["policy"])
+    cc = {"model": "claude-opus-5", "system": "You are Claude Code.\nPrimary working directory: /Users/me/src/app\n",
+          "messages": [{"role": "user", "content": "compare /Users/me/src/app/lib/db.py, src/x.go, "
+                        "/Users/me/infra/envs/prod/rds.tf, ~/.aws/credentials and ../other/secret.txt from /Users/me/src/app"}]}
+    f = features(cc)
+    seen = jev_state(f, {"item_key": "r", "context_key": "c", "context": ""}, policy)["r"]["paths"]
+    ok(f["cwd"] == "/Users/me/src/app", f"cwd from the system prompt ({f['cwd']})")
+    ok("lib/db.py" in seen and "src/x.go" in seen and "." in seen, f"repo paths kept, relative ({seen})")
+    ok(".../rds.tf [outside repo, sensitive]" in seen and ".../credentials [outside repo, sensitive]" in seen
+       and ".../secret.txt [outside repo, sensitive]" in seen, f"outside paths as shapes ({seen})")
+    ok(not any("/Users/me" in p or "infra" in p for p in seen), "no layout outside the repo reaches Jev")
+    ok(features({"model": "gpt-5.6-sol", "input": [{"role": "user", "content": "<cwd>/w/r</cwd> hi"}]})["cwd"] == "/w/r", "codex cwd")
+    ok(path_view("/Users/me/infra/main.tf", f, {**policy, "paths_to_jev": "full"}) == "/Users/me/infra/main.tf", "full paths option")
+    ok(path_view("src/x.go", f, {**policy, "paths_to_jev": "shape"}) == ".../x.go", "shape option")
+
+    # policy
     fam = policy["families"]["claude"]
     fam["models"]["cheap-3p"] = {"tier": "small", "price_in": 0.1, "first_party": False, "frontier": False, "tools": False}
     A = lambda s, d, t=0.9, probs=None: {"sensitivity": {"choice": s, "probabilities": probs or {}},
                                          "difficulty": {"score": d}, "needs_tools": {"noul": t}}
-    F = lambda **kw: {"secret": False, "paths": [], "tools": ["Bash"], "ctx_tokens": 1000, "pinned": False, **kw}
+    F = lambda **kw: {"secret": False, "paths": [], "tools": ["Bash"], "ctx_tokens_est": 1000, "pinned": False, **kw}
 
     def route(ans, feats=None):
         sens, tier, tools, _ = classify(ans, feats or F(), policy)
@@ -449,17 +548,22 @@ def selfcheck():
     ok(route(A("public", 0.1, 0.1), F(paths=["infra/envs/prod/main.tf"])) == "claude-sonnet-5", "sensitive path floors")
     ok(route(A("public", 0.1, 0.1), F(tools=[])) == "cheap-3p", "no tools offered: needs_tools ignored")
     ok(family_of("claude-haiku-4-5-20251001", policy) == "claude" and family_of("spark-vllm", policy) is None, "families")
+    ok(family_of("gpt-6-astra", policy) is None and family_of("claude-fable-6", policy) is None, "unlisted models are not routed")
+    ok(family_of("auto", policy) == "chatgpt" and family_of("claude-auto", policy) == "claude", "aliases")
+    ok(route(A("public", 0.1, 0.1), F(ctx_tokens_est=300_000, tools=[])) == "cheap-3p", "max_context absent: no limit")
+    big = lambda: pick(fam, eligible(fam, "application", True, policy, 300_000), "small", policy)
+    ok(big() == "claude-sonnet-5", "a context over max_context skips the model")
     ok(resolve("claude-opus-5[1m]", fam) == "claude-opus-5" and resolve("claude-haiku-4-5-20251001", fam) == "claude-haiku-4-5", "resolve")
 
     # stickiness
     pool = eligible(fam, "application", True, policy)
     sw = lambda prev, new, **kw: stay_or_switch(prev, new, pool, F(**kw), fam, policy)[0]
-    ok(sw("claude-opus-5", "claude-haiku-4-5", ctx_tokens=150_000) == "claude-opus-5", "large context stays")
-    ok(sw("claude-opus-5", "claude-haiku-4-5", ctx_tokens=2_000) == "claude-haiku-4-5", "small context switches down")
-    ok(sw("claude-haiku-4-5", "claude-opus-5", ctx_tokens=150_000) == "claude-opus-5", "harder turn moves up")
-    ok(stay_or_switch("claude-haiku-4-5", "claude-sonnet-5", eligible(fam, "restricted", True, policy), F(ctx_tokens=150_000), fam, policy)[0]
+    ok(sw("claude-opus-5", "claude-haiku-4-5", ctx_tokens_est=150_000) == "claude-opus-5", "large context stays")
+    ok(sw("claude-opus-5", "claude-haiku-4-5", ctx_tokens_est=2_000) == "claude-haiku-4-5", "small context switches down")
+    ok(sw("claude-haiku-4-5", "claude-opus-5", ctx_tokens_est=150_000) == "claude-opus-5", "harder turn moves up")
+    ok(stay_or_switch("claude-haiku-4-5", "claude-sonnet-5", eligible(fam, "restricted", True, policy), F(ctx_tokens_est=150_000), fam, policy)[0]
        == "claude-sonnet-5", "sensitivity forces a switch at any size")
-    ok(sw("claude-opus-5", "claude-haiku-4-5", ctx_tokens=100, pinned=True) == "claude-opus-5", "previous_response_id pins")
+    ok(sw("claude-opus-5", "claude-haiku-4-5", ctx_tokens_est=100, pinned=True) == "claude-opus-5", "previous_response_id pins")
 
     # the hook, Jev stubbed
     with tempfile.TemporaryDirectory() as tmp:
@@ -476,7 +580,7 @@ def selfcheck():
         key = SimpleNamespace(models=[])
 
         async def run():
-            h = ReflexRouter(stub(A("public", 0.1, 0.9)), mode="enforce")
+            h = Router(stub(A("public", 0.1, 0.9)), mode="enforce")
             d = await h.async_pre_call_hook(key, None, {**chat, "messages": chat["messages"][:2]}, "acompletion")
             ok(d["model"] == "claude-haiku-4-5", f"enforce rewrites the model ({d['model']})")
             await h.async_pre_call_hook(key, None, {**chat, "messages": chat["messages"][:2]}, "acompletion")
@@ -488,11 +592,11 @@ def selfcheck():
             d = await h.async_pre_call_hook(SimpleNamespace(models=["claude-opus-5"]), None, dict(chat, litellm_session_id="k"), "acompletion")
             ok(d["model"] == "claude-opus-5", "a model the key may not use is never chosen")
 
-            h = ReflexRouter(stub(None), mode="enforce")
+            h = Router(stub(None), mode="enforce")
             d = await h.async_pre_call_hook(key, None, dict(chat), "acompletion")
             ok(d["model"] == "claude-sonnet-5", "Jev error: fallback restricted + medium")
 
-            h = ReflexRouter(stub(A("public", 0.1, 0.9)), mode="shadow")
+            h = Router(stub(A("public", 0.1, 0.9)), mode="shadow")
             d = await h.async_pre_call_hook(key, None, dict(chat, litellm_session_id="shadow-1"), "acompletion")
             ok(d["model"] == "claude-opus-5", "shadow keeps the requested model")
             await asyncio.gather(*h.tasks)
@@ -504,6 +608,62 @@ def selfcheck():
         ok(lines[-2]["source"] == "fallback" and "stub" in lines[-2]["error"], "fallback logged with its error")
         raw = (Path(tmp) / "routing.jsonl").read_text()
         ok("flaky" not in raw and "test_api.py" not in raw and "AKIA" not in raw, "log carries no content or paths")
+
+        class Redis:        # the part of LiteLLM's RedisCache the router uses
+            def __init__(self):
+                self.kv = {}
+
+            async def async_get_cache(self, k):
+                return self.kv.get(k)
+
+            async def async_set_cache(self, k, v, ttl=None):
+                self.kv[k] = v
+        shared = SimpleNamespace(redis_cache=Redis())
+
+        async def run2():
+            haiku_only = SimpleNamespace(models=["claude-haiku-4-5"])
+            secret = {"model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "why does AKIAABCDEFGHIJKLMNOP fail"}]}
+            pol, orig = load(CONFIG["policy"]), CONFIG["policy"]
+
+            def use_policy(name, **no_eligible):
+                pf = Path(tmp) / f"policy-{name}.json"
+                pf.write_text(json.dumps({**pol, "no_eligible": no_eligible}))
+                CONFIG["policy"] = str(pf)
+
+            async def enforce(k, data, answers=A("public", 0.1, 0.1)):
+                return await Router(stub(answers), mode="enforce").async_pre_call_hook(k, None, dict(data), "anthropic_messages")
+            use_policy("block", action="block")
+            d = await enforce(haiku_only, secret)
+            ok(isinstance(d, str) and "blocked" in d, f"no eligible model: block ({d})")
+            h = Router(stub(A("public", 0.1, 0.1)), mode="shadow")
+            d = await h.async_pre_call_hook(haiku_only, None, dict(secret), "anthropic_messages")
+            await asyncio.gather(*h.tasks)
+            ok(d["model"] == "claude-haiku-4-5", "shadow never blocks")
+            use_policy("keep", action="keep")
+            ok((await enforce(haiku_only, secret))["model"] == "claude-haiku-4-5", "no eligible model: keep")
+            use_policy("fb", action="fallback_model", model="spark-vllm")
+            ok((await enforce(SimpleNamespace(models=["claude-haiku-4-5", "spark-vllm"]), secret))["model"] == "spark-vllm",
+               "no eligible model: fallback_model")
+            ok(isinstance(await enforce(haiku_only, secret), str), "fallback_model the key may not call: blocked")
+            CONFIG["policy"] = orig
+
+            d = await enforce(key, dict(chat, model="claude-opus-5[1m]"), A("public", 1.8, 0.9))
+            ok(d["model"] == "claude-opus-5[1m]", f"same model keeps the requested name ({d['model']})")
+
+            # stickiness through a shared Redis: a second worker sees the model the first one chose
+            conv = dict(chat, litellm_session_id="w", messages=chat["messages"] + [{"role": "assistant", "content": "x" * 600_000}])
+
+            async def worker(answers, cache):
+                h = Router(stub(answers), mode="enforce")
+                return (await h.async_pre_call_hook(key, cache, dict(conv), "acompletion"))["model"]
+            ok(await worker(A("public", 1.8, 0.9), shared) == "claude-opus-5", "worker 1: large task")
+            ok(await worker(A("public", 0.1, 0.9), shared) == "claude-opus-5", "worker 2 keeps it (shared Redis)")
+            ok(await worker(A("public", 0.1, 0.9), None) == "claude-haiku-4-5", "without Redis, per process")
+        asyncio.run(run2())
+        recs = [json.loads(x) for x in (Path(tmp) / "routing.jsonl").read_text().splitlines()]
+        ok(any(r.get("action") == "block" and r["mode"] == "shadow" and r["applied"] == "claude-haiku-4-5" for r in recs),
+           "shadow logs the block it would make")
+        ok(all("ctx_tokens" not in r for r in recs), "token counts are labelled as estimates")
     print("routing selfcheck FAILED" if fails else "routing selfcheck OK")
     return not fails
 

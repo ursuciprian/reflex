@@ -139,7 +139,9 @@ for TLS on Python builds without a CA bundle.
    (their `model_name`s in LiteLLM's `model_list`), each model's `tier`, `price_in` (USD per
    million input tokens) and tags (`first_party`, `frontier`, `tools`).
 3. Put the module next to the proxy's `config.yaml` (copy, symlink, or a Docker bind mount of the
-   file next to `/app/config.yaml`) and add the callback — see `routing/litellm-config.example.yaml`:
+   file next to `/app/config.yaml`) and add the callback — see `routing/litellm-config.example.yaml`.
+   A copy or a mount also needs `policy.json`, `questions.json` and `setup/redact.json` mounted and
+   named by the variables below; a symlink into this repo finds them itself:
 
    ```yaml
    litellm_settings:
@@ -148,13 +150,17 @@ for TLS on Python builds without a CA bundle.
 
    If `callbacks` already lists something (e.g. `"prometheus"`), add it to that list.
 4. Give the proxy the environment below and restart it. Start in `shadow`; after a week, read
-   `routing.jsonl` (`chosen` vs `applied`, `violation`, `source: fallback`) before `enforce`.
+   `routing.jsonl` (`chosen` vs `applied`, `violation`, `action: block`, `source: fallback`) before
+   `enforce`. For stickiness across several workers, share LiteLLM's key cache through Redis
+   (`litellm_settings.enable_redis_auth_cache: true`); the router then keeps each conversation's
+   model there too.
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `REFLEX_ROUTING_MODE` | `shadow` | `off` · `shadow` (log only, no added latency) · `enforce` (rewrite the model) |
 | `REFLEX_ROUTING_POLICY` | `routing/policy.json` next to the module | Families, pools, tiers, stickiness, latency budget, cache TTL, fallback |
 | `REFLEX_ROUTING_QUESTIONS` | `routing/questions.json` next to the module | The three Jev questions |
+| `REFLEX_REDACT` | `setup/redact.json` beside the module's directory | Secret patterns shared with the gate; without it routing is skipped (requests keep their model) |
 | `REFLEX_DATA_DIR` | `~/.local/state/reflex` | Where `routing.jsonl` is written (inside Docker, mount a volume) |
 | `TYPESAFE_API_KEY` / `REFLEX_KEYCHAIN_SERVICE` | — / `typesafe-api-key` | Same key lookup as the gate; the Keychain is not reachable from a container, so use the variable there |
 | `REFLEX_MODEL`, `REFLEX_API_URL` | as the gate | Jev model and endpoint |

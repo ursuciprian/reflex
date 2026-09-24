@@ -1,9 +1,16 @@
 {
   "name": "Model routing",
-  "version": "routing-v1",
+  "version": "routing-v2",
   "subject": "Which model serves a request, by how sensitive its content is and how hard it is. Routing stays inside one family: the clients' credentials are not interchangeable across providers.",
   "latency_budget_ms": 1500,
   "cache_ttl_s": 3600,
+  "no_eligible": {
+    "action": "block",
+    "model": null,
+    "note": "enforce, when no model in the family is both eligible for the content and allowed for the caller's key: block (reject the request with an error), keep (send it to the requested model; the log marks the violation) or fallback_model (send it to `model`, which the key must be allowed to call; otherwise block). Shadow only logs the action."
+  },
+  "paths_to_jev": "shape_outside_repo",
+  "paths_to_jev_note": "full: every path as written. shape_outside_repo: paths inside the agent's working directory as repo-relative paths, others as their file name plus [outside repo, sensitive] flags. shape: every path as file name plus flags. restricted_paths are always matched on the full path, locally.",
   "fallback": {
     "sensitivity": "restricted",
     "difficulty": 1,
@@ -44,16 +51,16 @@
   },
   "families": {
     "claude": {
-      "match": ["claude-*"],
-      "note": "Claude Code via the forwarded subscription login. Prices are list USD per million input tokens; edit to your contract.",
+      "aliases": ["claude-auto"],
+      "note": "Claude Code via the forwarded subscription login. A request is routed when its model is one of these (a dated or suffixed id such as claude-haiku-4-5-20251001 counts) or an alias; any other model is left alone. Prices are list USD per million input tokens; edit to your contract. max_context (optional, tokens): the model is skipped when the estimated context is larger.",
       "models": {
-        "claude-haiku-4-5": {"tier": "small", "price_in": 1.0, "first_party": true, "frontier": false},
+        "claude-haiku-4-5": {"tier": "small", "price_in": 1.0, "first_party": true, "frontier": false, "max_context": 200000},
         "claude-sonnet-5": {"tier": "medium", "price_in": 3.0, "first_party": true, "frontier": true},
         "claude-opus-5": {"tier": "large", "price_in": 5.0, "first_party": true, "frontier": true}
       }
     },
     "chatgpt": {
-      "match": ["gpt-*", "auto"],
+      "aliases": ["auto"],
       "note": "Codex via the ChatGPT subscription. Prices are placeholders for relative cost; edit to your contract.",
       "models": {
         "gpt-5.6-luna": {"tier": "small", "price_in": 0.25, "first_party": true, "frontier": false},

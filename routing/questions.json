@@ -1,7 +1,7 @@
 {
-  "version": "routing-q1",
+  "version": "routing-q2",
   "context_key": "operator",
-  "context": "Requests from coding agents (Claude Code, Codex, Hermes) passing through an LLM gateway on an engineer's workstation, before they reach a model. The engineer works on cloud infrastructure (AWS, Terraform, Kubernetes), CI/CD, security tooling and AI applications. Each request is summarised as the latest user message, the start of the system prompt, the names of the tools offered, and the file paths mentioned anywhere in the conversation.",
+  "context": "Requests from coding agents (Claude Code, Codex, Hermes) passing through an LLM gateway on an engineer's workstation, before they reach a model. The engineer works on cloud infrastructure (AWS, Terraform, Kubernetes), CI/CD, security tooling and AI applications. Each request is summarised as the latest user message, the start of the system prompt, the names of the tools offered, and the file paths mentioned anywhere in the conversation: paths inside the repository relative to it, other paths reduced to their file name with flags such as [outside repo, sensitive].",
   "item_key": "request",
   "questions": {
     "sensitivity": {

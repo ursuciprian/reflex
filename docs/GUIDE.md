@@ -192,6 +192,8 @@ and [confidence](https://docs.typesafe.ai/confidence).
 - **Redaction** covers AWS keys, GitHub / GitLab / Slack / OpenAI-style tokens, bearer and basic
   auth headers, `*SECRET*=`, `*TOKEN*=`, `*PASSWORD*=`, `--password x`, credentials in URLs,
   private key blocks and JWTs. It is a pattern list, not DLP: extend it when you see a new shape.
+  The patterns live in `setup/redact.json`, shared by the gate and the model router; its `corpus`
+  lists inputs with their exact redacted outputs, and both selfchecks assert them.
 - **TypeSafe** states it does not train on customer data; retention is covered by its
   [Data Processing Agreement](https://typesafe.ai/legal/data-processing), and zero data retention
   is available for enterprise customers ([legal](https://docs.typesafe.ai/legal)). Check this
@@ -234,16 +236,25 @@ Responses); embeddings, images and files pass untouched.
 
 Per request:
 
-1. **Family.** The requested model must match a family in `routing/policy.json` (`claude-*`,
-   `gpt-*`, …). Routing never leaves the family: on a subscription gateway the clients' credentials
-   are not interchangeable across providers. Anything else is logged as `skip` and left alone.
-2. **Floors, no model.** A credential shape anywhere in the conversation (the same patterns as the
-   gate's redaction, tool results included) or a path matching `restricted_paths` (`.env`, `*.pem`,
-   `*.tfvars`, `envs/prod`, `secret` …) makes the request at least `restricted`, whatever Jev says.
+1. **Family.** The requested model must be one of a family's `models` in `routing/policy.json`
+   (a dated or suffixed id such as `claude-haiku-4-5-20251001` or `claude-opus-5[1m]` counts) or
+   one of its `aliases` (a gateway's own router, e.g. `claude-auto`, `auto`). Any other model,
+   including a newer one the policy does not list yet, is logged as `skip` and left alone. Routing
+   never leaves the family: on a subscription gateway the clients' credentials are not
+   interchangeable across providers.
+2. **Floors, no model.** A credential shape anywhere in the conversation (the `shapes` of
+   `setup/redact.json`, shared with the gate; tool results included) or a path matching
+   `restricted_paths` (`.env`, `*.pem`, `*.tfvars`, `envs/prod`, `secret` …) makes the request at
+   least `restricted`, whatever Jev says. Both checks run locally on the full text and full paths.
 3. **Jev**, one call, cached for an hour by a hash of the question state. The state is the last
    thing the user typed (tool results and `<system-reminder>` blocks removed), the first 400
    characters of the system prompt, the tool names, the file paths mentioned anywhere in the
-   conversation, and the turn number — all redacted. Questions (`routing/questions.json`):
+   conversation, and the turn number — all redacted. `paths_to_jev` decides how much of a path
+   Jev sees: `shape_outside_repo` (default) sends paths inside the agent's working directory
+   (read from Claude Code's "Primary working directory" or Codex's `<cwd>`) repo-relative, and any
+   other path only as its file name with flags, e.g. `.../rds.tf [outside repo, sensitive]`;
+   `shape` does that for every path, `full` sends paths as written. Questions
+   (`routing/questions.json`):
 
    | Question | Type | Meaning |
    |---|---|---|
@@ -255,9 +266,21 @@ Per request:
    hesitant answer errs towards the safer pool.
 4. **Pool and tier.** `sensitivity.pools` names the model tags a sensitivity requires: `public`
    any, `application` `first_party`, `restricted` and `proprietary` `first_party` + `frontier`.
-   The model is the cheapest eligible one at or above the difficulty tier; a model with
-   `"tools": false` is skipped when tools are needed.
-5. **Stickiness** (paper §II.A). Changing model mid-conversation makes the new model reprocess the
+   A model with `"tools": false` is skipped when tools are needed, and one with `max_context` is
+   skipped when the estimated context is larger. The model is the cheapest eligible one at or
+   above the difficulty tier. When it is the requested model under another name, the requested
+   name is kept (`claude-opus-5[1m]` stays `claude-opus-5[1m]`).
+5. **Key limits.** LiteLLM checks the requested model against the caller's key before pre-call
+   hooks and does not check again after them, so the router runs LiteLLM's own check
+   (`can_key_call_resolved_model`: key and team models, wildcards, access groups, team members,
+   projects) on every candidate. A model the caller may not use is never chosen.
+6. **No eligible model.** When nothing in the family is both eligible for the content and allowed
+   for the key, `no_eligible.action` decides: `block` (default; enforce rejects the request with
+   HTTP 400 and a message naming the family and sensitivity), `keep` (serve the requested model,
+   log the violation) or `fallback_model` (serve `no_eligible.model`, if the key may call it;
+   otherwise block). Shadow logs the action and never blocks. With the fallback answer below
+   (restricted), a Jev outage blocks requests whose key has no first-party frontier model.
+7. **Stickiness** (paper §II.A). Changing model mid-conversation makes the new model reprocess the
    whole context. Per conversation (LiteLLM's `litellm_session_id`, set from `x-*-session-id`
    headers and Claude Code's metadata; otherwise a hash of the system prompt and first message) the
    last model is kept, and a move to a cheaper model happens only when
@@ -266,22 +289,29 @@ Per request:
 
    With `remaining_turns: 1` the switch must pay for itself on the next turn: small conversations
    move down freely, large ones stay. Moving up a tier and moves forced by sensitivity always
-   happen; a Responses call with `previous_response_id` never moves for cost.
-6. **Key limits.** A model the caller's virtual key may not use is never chosen.
+   happen; a Responses call with `previous_response_id` never moves for cost. `context` is an
+   estimate (characters / 4), logged as `ctx_tokens_est`.
 
 | Mode (`REFLEX_ROUTING_MODE`) | Request | Decision |
 |---|---|---|
 | `off` | untouched | none |
-| `shadow` (default) | keeps the requested model, no added latency | made in a background task and logged |
-| `enforce` | model rewritten | made inline within `latency_budget_ms` (1.5 s) |
+| `shadow` (default) | keeps the requested model; no wait for Jev | made in a background task and logged |
+| `enforce` | model rewritten, or blocked by `no_eligible` | made inline within `latency_budget_ms` (1.5 s) |
+
+Reading the request (text, paths, secret shapes) runs inline in both modes: a few milliseconds,
+about 50 ms per MB of conversation.
 
 **Errors.** A Jev error, timeout or incomplete answer uses `fallback` (restricted, medium): safe,
-not cheap. An internal error keeps the requested model; routing never fails a request.
+not cheap. An internal error, including a missing `setup/redact.json`, keeps the requested model
+and prints `reflex routing: …` to the proxy's stderr; a routing bug never fails a request.
 
 **Log.** `routing.jsonl` in `REFLEX_DATA_DIR`: conversation hash, state hash, requested / chosen /
 applied model, sensitivity, tier, Jev's raw answers, which floors fired, the stickiness reason,
-tokens, latency, and `violation: true` when the requested model was not eligible for the content.
-No message text or paths are written. In shadow mode `chosen` is what enforce would have used.
+the estimated context size (`ctx_tokens_est`), Jev's token usage, latency, `action` when no model
+was eligible, and `violation: true` when the requested model was not eligible for the content. No
+message text or paths are written; a Jev HTTP error is logged by status only. In shadow mode
+`chosen` is what enforce would have used. The response's `model` field can still show the
+requested name; the log has the one that served it.
 
 **Test.**
 
@@ -291,11 +321,14 @@ python3 routing/reflex_router.py --check "Rotate the prod DB password in .env" -
 python3 routing/reflex_router.py --smoke               # 10 labelled prompts through live Jev
 ```
 
-**Limits.** State (cache, per-conversation model) is per process: with several LiteLLM workers
-each keeps its own, so stickiness can be missed on a worker switch. Tokens are estimated as
-characters / 4. Prices in `policy.json` are list prices you maintain. When no model in the family
-is eligible for the content, the request keeps its model and the log marks the violation; it is
-not blocked.
+**Limits.** The Jev answer cache is per process: another worker asks Jev again (one call). The
+model each conversation is on is per process too, unless the proxy shares a Redis with its
+key cache (`litellm_settings.enable_redis_auth_cache: true` plus the proxy's Redis settings): then
+it is also stored there (`reflex:model:<conversation hash>`, 24 h) and stickiness holds across
+workers and restarts. Token counts are estimates (characters / 4). Prices in `policy.json` are
+list prices you maintain. LiteLLM merges model-level guardrails for the requested model before
+any pre-call hook runs, so a guardrail attached only to the routed-to model does not run; per-model
+rate limits and budgets enforced by hooks that run before this one count the requested model.
 
 ## Where this goes next
 
