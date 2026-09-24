@@ -1,6 +1,6 @@
 {
   "name": "Agent tool gate",
-  "version": "tool-gate-v2",
+  "version": "tool-gate-v3",
   "subject": "Shell commands an agent wants to run, gated by risk. The gate can only tighten Claude Code's own permissions, never loosen them.",
   "fallback": "ask",
   "params": {
@@ -111,7 +111,7 @@
     {
       "id": "off-task",
       "label": "Off the stated task?",
-      "test": "mutates >= 0.5 and on_task < $onTaskFloor",
+      "test": "mutates >= 0.5 and blast >= 1 and on_task < $onTaskFloor",
       "outcome": "ask",
       "detail": "on_task {on_task}",
       "rule": "does not match what the agent said it was doing"
