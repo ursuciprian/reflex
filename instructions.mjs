@@ -21,11 +21,11 @@
 //   node instructions.mjs --select              JSON {prompt, cwd, recent_files?} on stdin -> {text, fragments}
 //   node instructions.mjs --check "<prompt>" [--cwd dir] [--files a,b]
 //   node instructions.mjs --selfcheck           offline, Jev stubbed
-import {cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync,
+import {cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync,
         writeFileSync} from "node:fs";
 import {spawnSync} from "node:child_process";
 import {homedir, tmpdir} from "node:os";
-import {dirname, join, relative} from "node:path";
+import {dirname, join, relative, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 import {CONFIG, append, ask, cacheGet, cachePut, readText, redact, sessionContext, sha, transcriptTail} from "./gate.mjs";
 
@@ -58,9 +58,10 @@ export function parseFragment(text, id) {
 }
 
 // <dir>/.reflex/instructions/*.md from cwd up to the repo root (the nearest directory holding
-// .git), then the user's own. Ancestors above the repo (/tmp, a shared home) are not the repo's and
-// can be writable by others, so they are never read; outside a repo only cwd itself is. The nearest
-// fragment with a given id wins, so a repo can override a personal one.
+// .git), plus the user's own. Ancestors above the repo (/tmp, a shared home) are not the repo's and
+// can be writable by others, so they are never read; outside a repo only cwd itself is. On an id
+// conflict the user's own fragment wins, so a cloned repo cannot suppress personal instructions by
+// reusing an id; among repo directories the one nearest cwd wins.
 export function discover(cwd, home = homedir()) {
   let dirs = [], root = false;
   for (let d = cwd; d && !root; d = dirname(d) === d ? null : dirname(d)) {
@@ -68,7 +69,7 @@ export function discover(cwd, home = homedir()) {
     root = existsSync(join(d, ".git"));
   }
   if (!root) dirs = dirs.slice(0, 1);
-  dirs.push(join(ENV.XDG_CONFIG_HOME || join(home, ".config"), "reflex/instructions"));
+  dirs.unshift(join(ENV.XDG_CONFIG_HOME || join(home, ".config"), "reflex/instructions"));
   const found = new Map();
   for (const dir of dirs) {
     let names = [];
@@ -136,11 +137,12 @@ export async function select({prompt, cwd, recent_files = [], recent_commands = 
   let res = {usage: {}};
   if (pending.length) {
     const questions = Object.fromEntries(pending.map((r, i) => [`f${i}`, question(r.f)]));
-    const key = sha(["instructions", redact(prompt), cwd, pending.map(r => r.f.when), CONFIG.model]);
+    const request = {prompt: redact(prompt).slice(0, 4000), cwd, recent_files: recent_files.slice(0, 10),
+      recent_commands: recent_commands.slice(-5).map(c => redact(c).slice(0, 200))};
+    // The whole state Jev sees is in the key, so new recent files or commands ask again.
+    const key = sha(["instructions", request, pending.map(r => r.f.when), CONFIG.model]);
     const cached = useCache && cacheGet(key);
-    res = cached ? {answers: cached, usage: {}, error: null} : await askFn({request: {
-      prompt: redact(prompt).slice(0, 4000), cwd, recent_files: recent_files.slice(0, 10),
-      recent_commands: recent_commands.slice(-5).map(c => redact(c).slice(0, 200))}}, questions);
+    res = cached ? {answers: cached, usage: {}, error: null} : await askFn({request}, questions);
     const missing = pending.filter((_, i) => typeof res.answers?.[`f${i}`]?.noul !== "number");
     if (!res.error && missing.length) res.error = `incomplete answer: missing ${missing.length} of ${pending.length}`;
     out.source = res.error ? "error" : cached ? "cache" : "jev";
@@ -212,19 +214,22 @@ async function selfcheck() {
   ok(pathsIn("fix web/src/App.tsx:12 and main.tf, see https://x.io/a.b.").join() === "web/src/App.tsx,main.tf", "paths in a prompt");
   ok(keywordHit("stripe", "Refund via Stripe.") && !keywordHit("tf", "the tfvars file"), "keywords are whole words");
 
-  // discovery on the fixture repo: nearest id wins, the user dir is included
+  // discovery on the fixture repo: the user's fragment wins an id conflict, the user dir is included
   const home = ENV.REFLEX_SELFCHECK_DATA, repo = join(home, "repo");
   cpSync(join(dirname(fileURLToPath(import.meta.url)), "examples/instructions/repo"), repo, {recursive: true});
   mkdirSync(join(repo, ".git"));
   mkdirSync(join(home, ".config/reflex/instructions"), {recursive: true});
   writeFileSync(join(home, ".config/reflex/instructions/personal.md"), "---\nkeywords: [changelog]\n---\nKeep CHANGELOG.md current.\n");
-  writeFileSync(join(home, ".config/reflex/instructions/billing.md"), "---\nwhen: never\n---\npersonal override loses\n");
+  const mineBilling = join(home, ".config/reflex/instructions/billing.md");
+  writeFileSync(mineBilling, "---\nwhen: never\n---\npersonal billing rules\n");
   const saved = ENV.XDG_CONFIG_HOME; delete ENV.XDG_CONFIG_HOME;
-  const frags = discover(join(repo, "web/src"), home);
-  if (saved !== undefined) ENV.XDG_CONFIG_HOME = saved;
+  let frags = discover(join(repo, "web/src"), home);
   const ids = frags.map(x => x.id).sort().join();
   ok(ids === "billing,frontend,personal,terraform", `discovery finds repo + user fragments (${ids})`);
-  ok(frags.find(x => x.id === "billing")?.when?.includes("billing"), "the repo's fragment beats the user's with the same id");
+  ok(frags.find(x => x.id === "billing")?.file === mineBilling, "a repo fragment cannot suppress the user's with the same id");
+  rmSync(mineBilling);
+  frags = discover(join(repo, "web/src"), home);
+  if (saved !== undefined) ENV.XDG_CONFIG_HOME = saved;
   // untrusted places: above the repo root, symlinks, oversized files, and no repo at all
   const planted = join(home, ".reflex/instructions"), mine = join(repo, ".reflex/instructions");
   mkdirSync(planted, {recursive: true});
@@ -282,6 +287,9 @@ async function selfcheck() {
   calls.length = 0;
   r = await run("deploy with AKIAABCDEFGHIJKLMNOP to the billing api");
   ok(calls.length === 0 && r.source === "cache" && r.fragments.find(x => x.id === "billing").included, "prompt cache");
+  r = await run("deploy with AKIAABCDEFGHIJKLMNOP to the billing api", {recent_files: ["/repo/docs/notes.txt"]});
+  const r2 = await run("deploy with AKIAABCDEFGHIJKLMNOP to the billing api", {recent_commands: ["npm test"]});
+  ok(calls.length === 2 && r.source === "jev" && r2.source === "jev", "new recent files or commands miss the cache");
   // failures: Jev error keeps deterministic matches only; incomplete answers are an error, not "no"
   r = await select({prompt: "edit web/a.tsx and the invoice job " + Math.random(), cwd: "/r"},
                    {fragments: frags, askFn: async () => ({answers: {}, usage: {}, error: "HTTP 529"})});
@@ -296,6 +304,13 @@ async function selfcheck() {
                {id: "b", when: null, paths: [], keywords: ["go"], body: "B".repeat(500)}];
   r = await select({prompt: "go", cwd: "/r"}, {fragments: big, askFn: async () => { throw new Error("no call expected"); }});
   ok(r.fragments.map(x => x.included).join() === "true,false" && r.text.length <= MAX_CHARS + 200, "size cap");
+  // --check resolves a relative --cwd before discovery and logging
+  mkdirSync(join(home, "kw/.reflex/instructions"), {recursive: true});
+  writeFileSync(join(home, "kw/.reflex/instructions/kw.md"), "---\nkeywords: [zebra]\n---\nStripes.\n");
+  const cli = spawnSync(process.execPath, [fileURLToPath(import.meta.url), "--check", "zebra", "--cwd", "kw"],
+    {cwd: home, encoding: "utf8", env: {...ENV, XDG_CONFIG_HOME: join(home, "no-config")}});
+  const last = JSON.parse(readText(join(home, "instructions.jsonl")).trim().split("\n").pop());
+  ok(last.cwd === join(realpathSync(home), "kw") && cli.stdout.includes("source: .reflex/instructions/kw.md"), `--check resolves --cwd (${last.cwd})`);
   console.log(process.exitCode ? "instructions selfcheck FAILED" : "instructions selfcheck OK");
 }
 
@@ -325,7 +340,7 @@ else if (flag("--codex")) await guarded(() => userPromptSubmit(readStdin(), "cod
 else if (flag("--hermes")) await guarded(() => hermes(readStdin()));
 else if (flag("--select")) await guarded(async () => process.stdout.write(JSON.stringify(await selectSafe(readStdin())) + "\n"));
 else if (flag("--check")) {
-  const cwd = opt("--cwd") ?? process.cwd();
+  const cwd = resolve(opt("--cwd") ?? ".");
   const r = await select({agent: "cli", prompt: opt("--check"), cwd, recent_files: opt("--files")?.split(",") ?? []});
   console.log(JSON.stringify({source: r.source, error: r.error ?? undefined, threshold: THRESHOLD, fragments: r.fragments}, null, 1));
   if (r.text) console.log(`\n${r.text}`);

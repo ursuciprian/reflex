@@ -249,12 +249,13 @@ id: billing                    # optional; defaults to the file name
 ```
 
 **Where fragments live:** `.reflex/instructions/*.md` in the working directory and in each parent
-directory up to the repo root (the nearest one holding `.git`), then
+directory up to the repo root (the nearest one holding `.git`), plus
 `~/.config/reflex/instructions/*.md` (or `$XDG_CONFIG_HOME/reflex/instructions`). Directories above
 the repo root are never read; outside a repo only the working directory is. Only regular files up
 to 64 KB are read, so a symlink to a file elsewhere is skipped.
-When two fragments share an id, the one nearest the working directory wins, so a repo can override a
-personal fragment. `examples/instructions/repo/` shows the layout with three fragments.
+When two fragments share an id, your personal fragment wins, so a cloned repo cannot suppress your
+instructions by reusing an id (and a personal fragment can replace a repo fragment you disagree with);
+between repo directories, the one nearest the working directory wins. `examples/instructions/repo/` shows the layout with three fragments.
 
 **Per prompt:**
 
@@ -267,8 +268,9 @@ personal fragment. `examples/instructions/repo/` shows the layout with three fra
 2. **Jev.** Every other fragment that has a `when` gets one `noul` question: *does this condition hold
    for this request and the current work?* All the questions go in **one** request. The state is the
    redacted prompt, the working directory, recent files and the last five commands. A fragment is
-   selected at `p >= REFLEX_INSTRUCTIONS_THRESHOLD` (0.5). Answers are cached for 24 h by prompt
-   hash, working directory and conditions.
+   selected at `p >= REFLEX_INSTRUCTIONS_THRESHOLD` (0.5). Answers are cached for 24 h by a hash
+   of that whole state (prompt, working directory, recent files and commands) and the conditions, so
+   a repeated prompt after new work is judged again.
 3. **Inject.** Deterministic matches come first, then Jev matches by probability. Whole fragments
    are added until `REFLEX_INSTRUCTIONS_MAX_CHARS` (6000) is reached; a fragment is never cut.
 
