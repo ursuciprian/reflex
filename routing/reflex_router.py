@@ -5,11 +5,12 @@ content is and how hard it is, with one Jev call.
   litellm_settings: {callbacks: ["reflex_router.proxy_handler_instance"]}   (this file next to config.yaml)
   python3 routing/reflex_router.py --selfcheck          offline tests, Jev stubbed
   python3 routing/reflex_router.py --check "<prompt>" [--model claude-opus-5]   one live decision
-  python3 routing/reflex_router.py --smoke              live Jev over a small labelled prompt set
+  python3 routing/reflex_router.py --eval [--golden f]   live Jev over routing/golden.json (npm run eval-routing)
 
 Order: family of the requested model -> secret shapes / sensitive paths (a floor) -> cache -> Jev
--> policy (sensitivity pool, models the caller's key may use, difficulty tier, cheapest; none
-eligible: policy no_eligible) -> stickiness (large contexts stay put).
+-> policy (sensitivity pool, models the caller's key may use under the requested model's guardrails
+and per-model limits, difficulty tier, cheapest; none eligible: policy no_eligible) -> stickiness
+(large contexts, signed thinking and 1M contexts stay put unless sensitivity forces a move).
 REFLEX_ROUTING_MODE: off | shadow (default: decide in the background, log, keep the requested model)
 | enforce (wait up to the latency budget, rewrite data["model"]). Stdlib only; litellm is imported
 to subclass its CustomLogger and, inside the proxy, for its key-access check.
@@ -153,7 +154,21 @@ def features(data):
         # otherwise the first user message and system prompt identify the conversation.
         "conv": str(data.get("litellm_session_id") or sha([system[:2000], first[:2000]])),
         "pinned": bool(data.get("previous_response_id")),   # server-side context lives with the old model
+        # Provider state tied to the model that produced it: signed thinking (Anthropic) or encrypted
+        # reasoning (Responses). Another model ignores or drops what it cannot read.
+        "thinking": any(isinstance(b, dict) and (b.get("type") in ("thinking", "redacted_thinking") and
+                                                 (b.get("signature") or b.get("data")) or
+                                                 b.get("type") == "reasoning" and b.get("encrypted_content"))
+                        for m in items for b in [m, *(m.get("content") if isinstance(m.get("content"), list) else [])]),
+        # A 1M-token context window: Claude Code's [1m] model suffix or the context-1m beta header.
+        "ctx_1m": str(data.get("model", "")).endswith("[1m]") or "context-1m" in beta_header(data),
     }
+
+
+def beta_header(data):
+    """anthropic-beta as the client sent it (LiteLLM keeps request headers in proxy_server_request)."""
+    h = (data.get("proxy_server_request") or {}).get("headers") or {}
+    return ",".join(str(v) for k, v in h.items() if str(k).lower() == "anthropic-beta")
 
 
 def path_view(p, f, policy):
@@ -243,10 +258,20 @@ def classify(answers, f, policy):
         ("restricted" for path in f["paths"] for rx in s["restricted_paths"] if re.search(rx, path, re.I)), None)
     if floor and order.index(sens) < order.index(floor):
         sens, why = floor, why + ["secret in conversation" if f["secret"] else "sensitive path"]
-    score = answers["difficulty"]["score"]
-    tier = max((name for name, at in t["from_score"].items() if score >= at), key=t["order"].index, default=t["order"][0])
+    tier = tier_of(answers["difficulty"], t)
     tools = bool(f["tools"]) and answers["needs_tools"]["noul"] >= policy["needs_tools_at"]
     return sens, tier, tools, why
+
+
+def tier_of(d, t):
+    """The highest tier whose probability mass P(level >= tier) reaches tiers.up_at[tier]: under-tiering
+    costs more than over-tiering, so a hesitant answer routes up. Without probabilities (the fallback
+    answer) or up_at, the expected score against from_score."""
+    order, p, up = t["order"], d.get("probabilities"), t.get("up_at")
+    if p and up:
+        mass = lambda i: sum(v for k, v in p.items() if int(k) >= i)
+        return max((name for i, name in enumerate(order) if i == 0 or mass(i) >= up[name]), key=order.index)
+    return max((name for name, at in t["from_score"].items() if d["score"] >= at), key=order.index, default=order[0])
 
 
 def eligible(fam, sens, tools, policy, ctx_est=0):
@@ -273,6 +298,12 @@ def stay_or_switch(prev, new, pool, f, fam, policy):
     p = resolve(prev, fam)
     if p is None or p not in pool:
         return new, "previous model not eligible for this content"
+    # Only a forced move leaves a conversation carrying model-bound state: another model cannot read
+    # the signed thinking (the reasoning is lost), and a 1M context may not fit or cache elsewhere.
+    if f.get("thinking"):
+        return prev, "sticky: signed thinking in the conversation"
+    if f.get("ctx_1m"):
+        return prev, "sticky: 1M-context conversation"
     rank = policy["tiers"]["order"].index
     if rank(fam["models"][new]["tier"]) > rank(fam["models"][p]["tier"]):
         return new, "harder turn: moving up a tier"
@@ -317,11 +348,37 @@ async def may_call(model, key):
         return False
 
 
+def controls(model, key):
+    """What LiteLLM enforces per model group before this hook runs, so only for the requested model:
+    model-level guardrails (litellm_params.guardrails, merged as the union over the group's
+    deployments before the pre-call hooks, the way _check_and_merge_model_level_guardrails does) and
+    the key's per-model rpm / tpm limits and budget (checked at auth and by pre-call limiters).
+    None outside a proxy: nothing to compare."""
+    try:
+        from litellm.proxy.proxy_server import llm_router
+        from litellm.proxy.auth.auth_utils import get_key_model_rpm_limit, get_key_model_tpm_limit
+    except ImportError:
+        return None
+    if llm_router is None:
+        return None
+    guards = set()
+    for dep in llm_router.get_model_list(model_name=model, team_id=getattr(key, "team_id", None)) or []:
+        g = (dep.get("litellm_params") or {}).get("guardrails")
+        guards.update(x if isinstance(x, str) else repr(x) for x in ([g] if isinstance(g, str) else g or []))
+    limits = None
+    if key is not None:
+        limits = tuple(json.dumps(v, sort_keys=True, default=str) for v in (
+            (get_key_model_rpm_limit(key, model_name=model) or {}).get(model),
+            (get_key_model_tpm_limit(key, model_name=model) or {}).get(model),
+            (getattr(key, "model_max_budget", None) or {}).get(model)))
+    return {"guardrails": sorted(guards), "limits": limits}
+
+
 class ReflexRouter(CustomLogger):
-    def __init__(self, ask_fn=ask, mode=None, may_call_fn=may_call):
+    def __init__(self, ask_fn=ask, mode=None, may_call_fn=may_call, controls_fn=controls):
         if CustomLogger is not object:
             super().__init__()
-        self.ask, self.mode, self.may_call = ask_fn, mode, may_call_fn
+        self.ask, self.mode, self.may_call, self.controls = ask_fn, mode, may_call_fn, controls_fn
         # ponytail: per-process dicts. The Jev cache stays per process (a miss costs one Jev call). The
         # model each conversation is on also goes to LiteLLM's Redis when the proxy shares one (see
         # prev_model), so stickiness survives a request landing on another worker.
@@ -365,12 +422,26 @@ class ReflexRouter(CustomLogger):
             answers, rec["source"] = await self.answers(f, spec, policy, rec)
             sens, tier, tools, why = classify(answers, f, policy)
             req = resolve(requested, fam)
-            # Eligible for the content, and callable with this key (the requested model already passed).
-            pool = [m for m in eligible(fam, sens, tools, policy, f["ctx_tokens_est"])
-                    if m == requested or await self.may_call(m, key)]
+            # Eligible for the content, callable with this key and under the same guardrails and per-model
+            # limits as the requested model: LiteLLM applied those for the requested model before this
+            # hook and does not apply them again for the one chosen here.
+            base, excluded = self.controls(requested, key), {}
+
+            async def allowed(m):
+                if not await self.may_call(m, key):
+                    return False
+                other = self.controls(m, key) if base else None
+                diff = [k for k in ("guardrails", "limits") if other and policy.get(f"require_same_{k}", True)
+                        and other[k] != base[k]]
+                if diff:
+                    excluded[m] = diff
+                return not diff
+            pool = [m for m in eligible(fam, sens, tools, policy, f["ctx_tokens_est"]) if m == req or await allowed(m)]
+            rec["excluded"] = excluded or None
             chosen = pick(fam, pool, tier, policy)
             rec.update(family=fam_name, sensitivity=sens, tier=tier, needs_tools=tools, floors=why or None,
                        answers={k: a.get("choice", a.get("score", a.get("noul"))) for k, a in answers.items()},
+                       difficulty_p=answers["difficulty"].get("probabilities"),
                        violation=(req is not None and req not in pool) or None)
             if chosen is None:
                 ne = policy.get("no_eligible", {})
@@ -378,17 +449,25 @@ class ReflexRouter(CustomLogger):
                 if action == "keep":
                     rec.update(action="keep", reason=f"no model in {fam_name} is eligible for {sens}; kept")
                     return rec
-                if action == "fallback_model" and fb and await self.may_call(fb, key):
+                if action == "fallback_model" and fb and await allowed(fb):
                     chosen, reason = fb, f"no model in {fam_name} is eligible for {sens}: fallback_model"
                 else:
-                    rec.update(action="block", reason=f"no model in {fam_name} this key may use is eligible for {sens}")
+                    same = " under the requested model's guardrails and limits" if excluded else ""
+                    rec.update(action="block", reason=f"no model in {fam_name} this key may use{same} is eligible for {sens}")
                     if apply:
                         rec.update(applied=None, block=f"Reflex routing blocked this request: no model this key may use in "
-                                   f"'{fam_name}' is cleared for {sens} content (policy {policy['version']}).")
+                                   f"'{fam_name}'{same} is cleared for {sens} content (policy {policy['version']}).")
                     return rec
             else:
-                prev = await self.prev_model(f["conv"], redis)
+                # Without a record (another worker, a restart), a conversation carrying model-bound state
+                # was on the model it asks for.
+                prev = await self.prev_model(f["conv"], redis) or \
+                    (requested if f["turn"] > 1 and (f["thinking"] or f["ctx_1m"]) else None)
                 chosen, sticky = stay_or_switch(prev, chosen, pool, f, fam, policy)
+                if f["thinking"] and resolve(chosen, fam) != resolve(prev or requested, fam):
+                    # docs.claude.com "Switching models mid-conversation": pass thinking blocks back unchanged;
+                    # the API ignores or drops those the new model cannot read. So nothing is stripped.
+                    rec["thinking_dropped_est"] = True
                 reason = sticky or f"{sens}/{tier}: cheapest eligible"
             if req is not None and resolve(chosen, fam) == req:
                 chosen = requested      # same model: keep the requested name (claude-opus-5[1m], a dated id)
@@ -473,7 +552,7 @@ def selfcheck():
 
     async def listed(model, key):
         return key_lists(model, key)
-    Router = functools.partial(ReflexRouter, may_call_fn=listed)    # same result with or without litellm
+    Router = functools.partial(ReflexRouter, may_call_fn=listed, controls_fn=lambda m, k: None)  # same with or without litellm
     fails = []
 
     def ok(c, m):
@@ -564,6 +643,30 @@ def selfcheck():
     ok(stay_or_switch("claude-haiku-4-5", "claude-sonnet-5", eligible(fam, "restricted", True, policy), F(ctx_tokens_est=150_000), fam, policy)[0]
        == "claude-sonnet-5", "sensitivity forces a switch at any size")
     ok(sw("claude-opus-5", "claude-haiku-4-5", ctx_tokens_est=100, pinned=True) == "claude-opus-5", "previous_response_id pins")
+    ok(sw("claude-opus-5", "claude-haiku-4-5", ctx_tokens_est=100, thinking=True) == "claude-opus-5", "signed thinking: no move down")
+    ok(sw("claude-haiku-4-5", "claude-opus-5", ctx_tokens_est=100, thinking=True) == "claude-haiku-4-5", "signed thinking: no move up for cost")
+    ok(sw("claude-opus-5", "claude-haiku-4-5", ctx_tokens_est=100, ctx_1m=True) == "claude-opus-5", "1M context: no move")
+    ok(stay_or_switch("claude-haiku-4-5", "claude-sonnet-5", eligible(fam, "restricted", True, policy), F(thinking=True), fam, policy)[0]
+       == "claude-sonnet-5", "signed thinking: sensitivity still forces the move")
+
+    # tier from probability mass: under-tiering is the costly error
+    t = policy["tiers"]
+    ok(tier_of({"score": 0.45, "probabilities": {"0": 0.55, "1": 0.45, "2": 0}}, t) == "medium", "P(>=medium) 0.45 routes up")
+    ok(tier_of({"score": 0.1, "probabilities": {"0": 0.9, "1": 0.1, "2": 0}}, t) == "small", "confident small stays small")
+    ok(tier_of({"score": 1.1, "probabilities": {"0": 0.1, "1": 0.3, "2": 0.6}}, t) == "large", "P(large) 0.6 is large")
+    ok(tier_of({"score": 0.45}, t) == "small" and tier_of({"score": 1.0}, t) == "medium", "no probabilities: from_score")
+    ok(tier_of({"score": 0.45, "probabilities": {"0": 0.55, "1": 0.45, "2": 0}}, {**t, "up_at": None}) == "small", "no up_at: from_score")
+
+    # model-bound state in the request
+    sig = {"model": "claude-opus-5", "messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [{"type": "thinking", "thinking": "", "signature": "EosnCk"}, {"type": "text", "text": "ok"}]},
+        {"role": "user", "content": "more"}]}
+    ok(features(sig)["thinking"] and not features(chat)["thinking"], "signed thinking detected")
+    ok(features({"model": "gpt-5.6-sol", "input": [{"type": "reasoning", "encrypted_content": "gAAA"}, {"role": "user", "content": "x"}]})["thinking"],
+       "encrypted reasoning detected")
+    ok(features({**chat, "model": "claude-opus-5[1m]"})["ctx_1m"] and not features(chat)["ctx_1m"], "[1m] suffix")
+    ok(features({**chat, "proxy_server_request": {"headers": {"Anthropic-Beta": "context-1m-2025-08-07,foo"}}})["ctx_1m"], "context-1m beta header")
 
     # the hook, Jev stubbed
     with tempfile.TemporaryDirectory() as tmp:
@@ -649,6 +752,48 @@ def selfcheck():
 
             d = await enforce(key, dict(chat, model="claude-opus-5[1m]"), A("public", 1.8, 0.9))
             ok(d["model"] == "claude-opus-5[1m]", f"same model keeps the requested name ({d['model']})")
+            dated = SimpleNamespace(models=["claude-haiku-4-5-20251001"])
+            d = await enforce(dated, {"model": "claude-haiku-4-5-20251001", "messages": [{"role": "user", "content": "hi"}]})
+            ok(d["model"] == "claude-haiku-4-5-20251001", f"a key listing only the dated id keeps it ({d})")
+
+            # signed thinking, no record of the previous model (new worker): stays on the requested model
+            d = await enforce(key, dict(sig, litellm_session_id="t1"), A("public", 0.1, 0.9))
+            ok(d["model"] == "claude-opus-5", f"signed thinking mid-conversation: no cost switch ({d['model']})")
+            # a forced move carries the conversation unchanged (the API drops what the new model cannot read)
+            fresh = json.loads(json.dumps(dict(sig, model="claude-haiku-4-5", litellm_session_id="t2")))
+            d = await enforce(key, fresh, A("restricted", 0.1, 0.9))
+            ok(d["model"] == "claude-sonnet-5" and d["messages"] == sig["messages"], "forced move keeps thinking blocks unchanged")
+            d = await enforce(key, dict(chat, model="claude-opus-5[1m]", litellm_session_id="m1"), A("public", 0.1, 0.9))
+            ok(d["model"] == "claude-opus-5[1m]", f"1M context mid-conversation: no cost switch ({d['model']})")
+
+            # guardrails and per-model limits: only between models LiteLLM treats the same
+            def ctl(table):
+                return lambda m, k: {"guardrails": table.get(m, []), "limits": ("null",) * 3}
+
+            async def guarded(table, answers=A("public", 0.1, 0.9), data=chat, pol_over=None):
+                if pol_over is not None:
+                    pf = Path(tmp) / "policy-ctl.json"
+                    pf.write_text(json.dumps({**pol, **pol_over}))
+                    CONFIG["policy"] = str(pf)
+                h = Router(stub(answers), mode="enforce", controls_fn=ctl(table))
+                d = await h.async_pre_call_hook(key, None, dict(data, litellm_session_id=sha(table) + str(pol_over)), "acompletion")
+                CONFIG["policy"] = orig
+                return d if isinstance(d, str) else d["model"]
+            ok(await guarded({"claude-opus-5": ["pii"], "claude-sonnet-5": ["pii"]}) == "claude-sonnet-5",
+               "guardrails differ on haiku: cheapest with the same guardrails")
+            ok(await guarded({"claude-opus-5": ["pii"]}) == "claude-opus-5", "no other model has the guardrail: keep requested")
+            ok(await guarded({"claude-opus-5": ["pii"]}, pol_over={"require_same_guardrails": False}) == "claude-haiku-4-5",
+               "require_same_guardrails false: guardrails ignored")
+            ok(await guarded({"claude-haiku-4-5": ["pii"]}) == "claude-sonnet-5", "an extra guardrail elsewhere also differs")
+            ok(isinstance(await guarded({"claude-sonnet-5": ["pii"], "claude-opus-5": ["pii"]}, A("restricted", 0.1, 0.9),
+                                        dict(chat, model="claude-haiku-4-5")), str),
+               "forced move with no model under the same guardrails: no_eligible (block)")
+
+            def lim(m, k):
+                return {"guardrails": [], "limits": ("5",) if m == "claude-haiku-4-5" else ("null",)}
+            h = Router(stub(A("public", 0.1, 0.9)), mode="enforce", controls_fn=lim)
+            d = await h.async_pre_call_hook(key, None, dict(chat, litellm_session_id="lim"), "acompletion")
+            ok(d["model"] == "claude-sonnet-5", f"per-model limit differs: skipped ({d['model']})")
 
             # stickiness through a shared Redis: a second worker sees the model the first one chose
             conv = dict(chat, litellm_session_id="w", messages=chat["messages"] + [{"role": "assistant", "content": "x" * 600_000}])
@@ -668,35 +813,54 @@ def selfcheck():
     return not fails
 
 
-# A labelled sample for --smoke: (prompt, requested model, expected sensitivity, expected tier).
-SAMPLES = [
-    ("What does the -p flag of mkdir do?", "claude-opus-5", "public", "small"),
-    ("Rename the variable usr to user in src/models/user.py", "claude-opus-5", "application", "small"),
-    ("Write unit tests for the pagination helper in api/pagination.go", "claude-opus-5", "application", "medium"),
-    ("Rotate the prod RDS master password in terraform/envs/prod/rds.tf and put the new value in .env", "claude-haiku-4-5", "restricted", "medium"),
-    ("Here are my AWS keys AKIAABCDEFGHIJKLMNOP, why does aws sts get-caller-identity fail?", "claude-haiku-4-5", "restricted", "small"),
-    ("Summarise our unreleased jev-2 eval results in research/evals/jev2-results.md for the board", "claude-haiku-4-5", "proprietary", "medium"),
-    ("Design the migration of our three EKS clusters to a single multi-tenant cluster with zero downtime, "
-     "including IAM, network policy and rollback plan", "claude-haiku-4-5", "restricted", "large"),
-    ("Give this conversation a five word title", "claude-sonnet-5", "public", "small"),
-    ("Explain how Python's asyncio.gather handles exceptions", "gpt-5.6-sol", "public", "small"),
-    ("Find the race condition that makes the Go worker pool in internal/pool/pool.go deadlock under load", "gpt-5.6-luna", "application", "large"),
-]
+async def evaluate(path=HERE / "golden.json"):
+    """Live Jev over routing/golden.json (never the cache). Exit 1 on a tier two levels too low or
+    restricted/proprietary content classified as public/application."""
+    golden, policy = load(path), load(CONFIG["policy"])
+    h, tools = ReflexRouter(mode="enforce"), [{"name": n} for n in ("Bash", "Read", "Edit", "Grep")]
+    so, to = policy["sensitivity"]["order"], policy["tiers"]["order"]
 
-
-async def smoke():
-    h = ReflexRouter(mode="enforce")
-    hits = {"sensitivity": 0, "tier": 0}
-    tools = [{"name": n} for n in ("Bash", "Read", "Edit", "Grep")]
-    print(f"{'requested':16} {'chosen':16} {'sens':12} {'want':12} {'tier':7} {'want':7} {'src':8} lat_s")
-    for prompt, model, want_s, want_t in SAMPLES:
-        d = await h.decide(features({"model": model, "tools": tools, "messages": [{"role": "user", "content": prompt}]}), model, apply=True)
-        hits["sensitivity"] += d.get("sensitivity") == want_s
-        hits["tier"] += d.get("tier") == want_t
-        print(f"{model:16} {d['chosen']:16} {d.get('sensitivity', '-'):12} {want_s:12} {d.get('tier', '-'):7} {want_t:7} "
-              f"{d['source']:8} {d['latency_s']}{'  ' + d['error'] if d['error'] else ''}")
-    n = len(SAMPLES)
-    print(f"sensitivity {hits['sensitivity']}/{n}, tier {hits['tier']}/{n}")
+    async def one(c):
+        f = features({"model": c["model"], "tools": tools, "messages": [{"role": "user", "content": c["prompt"]}]})
+        return c, await h.decide(f, c["model"], apply=True)
+    # ponytail: batches of 6, well inside the documented 1,200 requests/minute (same as eval.mjs).
+    res = []
+    for i in range(0, len(golden["cases"]), 6):
+        res += await asyncio.gather(*map(one, golden["cases"][i:i + 6]))
+    # A timeout within the latency budget scores the fallback, not Jev: retry those once, one at a time.
+    res = [(c, d) if d["source"] != "fallback" else await one(c) for c, d in res]
+    n, rows = len(res), []
+    for c, d in res:
+        got_s, got_t = d.get("sensitivity"), d.get("tier")
+        dt = to.index(c["tier"]) - to.index(got_t) if got_t else 9
+        leak = c["sensitivity"] in ("restricted", "proprietary") and got_s in ("public", "application")
+        rows.append({**c, "got_sensitivity": got_s, "got_tier": got_t, "under_tier": max(dt, 0), "leak": leak,
+                     "chosen": d["chosen"], "source": d["source"], "error": d["error"], "difficulty_p": d.get("difficulty_p"),
+                     "answers": d.get("answers")})
+    print(f"{'want':24} {'got':24} {'P(>=med,lg)':12} {'chosen':17} prompt")
+    for r in rows:
+        mark = "FAIL" if r["under_tier"] >= 2 or r["leak"] else "under" if r["under_tier"] else \
+            "" if (r["got_sensitivity"], r["got_tier"]) == (r["sensitivity"], r["tier"]) else "diff"
+        p = r["difficulty_p"] or {}
+        pm = f"{sum(v for k, v in p.items() if int(k) >= 1):.2f},{p.get('2', 0):.2f}" if p else "-"
+        print(f"{r['sensitivity'] + '/' + r['tier']:24} {str(r['got_sensitivity']) + '/' + str(r['got_tier']):24} {pm:12} "
+              f"{r['chosen']:17} {mark:5} {r['prompt'][:60]}{'  ' + r['error'] if r['error'] else ''}")
+    sens_ok = sum(r["got_sensitivity"] == r["sensitivity"] for r in rows)
+    tier_ok = sum(r["got_tier"] == r["tier"] for r in rows)
+    under = sum(r["under_tier"] > 0 for r in rows)
+    under2 = sum(r["under_tier"] >= 2 for r in rows)
+    over = sum(to.index(r["got_tier"]) > to.index(r["tier"]) for r in rows if r["got_tier"])
+    leaks = sum(r["leak"] for r in rows)
+    sens_under = sum(so.index(r["got_sensitivity"]) < so.index(r["sensitivity"]) for r in rows if r["got_sensitivity"])
+    print(f"\n{n} cases · sensitivity {sens_ok}/{n} (under {sens_under}, restricted leaks {leaks}) · tier {tier_ok}/{n} "
+          f"(under {under}, of which by 2 levels {under2}; over {over}) · fallback "
+          f"{sum(r['source'] == 'fallback' for r in rows)} · policy {policy['version']} · questions "
+          f"{load(CONFIG['questions'])['version']} · model {CONFIG['model']}")
+    Path(CONFIG["data"]).mkdir(parents=True, exist_ok=True)
+    out = Path(CONFIG["data"]) / f"routing-eval-{time.strftime('%Y%m%dT%H%M%S')}.json"
+    out.write_text(json.dumps({"golden": golden["version"], "policy": policy["version"], "results": rows}, indent=1))
+    print(f"details {out}")
+    return not (under2 or leaks)
 
 
 if __name__ == "__main__":
@@ -704,8 +868,8 @@ if __name__ == "__main__":
     opt = lambda n, d=None: args[args.index(n) + 1] if n in args else d
     if "--selfcheck" in args:
         sys.exit(0 if selfcheck() else 1)
-    elif "--smoke" in args:
-        asyncio.run(smoke())
+    elif "--eval" in args or "--smoke" in args:
+        sys.exit(0 if asyncio.run(evaluate(opt("--golden", HERE / "golden.json"))) else 1)
     elif "--check" in args:
         model = opt("--model", "claude-opus-5")
         f = features({"model": model, "messages": [{"role": "user", "content": opt("--check")}]})

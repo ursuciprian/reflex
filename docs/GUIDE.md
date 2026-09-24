@@ -263,7 +263,13 @@ Per request:
    | `needs_tools` | noul | does the answer need the offered tools |
 
    `restricted` is also taken when P(restricted) + P(proprietary) ≥ `restricted_at` (0.25), so a
-   hesitant answer errs towards the safer pool.
+   hesitant answer errs towards the safer pool. The tier errs upwards the same way: it is the
+   highest tier whose probability mass P(level ≥ tier) reaches `tiers.up_at` (medium 0.4, large
+   0.5), not the expected score, because a model that is too small costs quality and one that is
+   too large only money. The `difficulty` levels describe concrete situations, and any change to
+   credentials, IAM, network policy, production infrastructure or deployment configuration is at
+   least medium, however short the request. Without probabilities (the fallback answer) the
+   expected score is compared with `from_score`.
 4. **Pool and tier.** `sensitivity.pools` names the model tags a sensitivity requires: `public`
    any, `application` `first_party`, `restricted` and `proprietary` `first_party` + `frontier`.
    A model with `"tools": false` is skipped when tools are needed, and one with `max_context` is
@@ -274,6 +280,16 @@ Per request:
    hooks and does not check again after them, so the router runs LiteLLM's own check
    (`can_key_call_resolved_model`: key and team models, wildcards, access groups, team members,
    projects) on every candidate. A model the caller may not use is never chosen.
+   **Guardrails and per-model limits.** Before the pre-call hooks, LiteLLM merges the model-level
+   guardrails (`litellm_params.guardrails`, the union over the requested model group's
+   deployments), checks the key's per-model budget, and its limiters count per-model rpm / tpm,
+   all for the requested model; none of this runs again for the model the hook picks. So a
+   candidate is only taken when its guardrail set equals the requested model's
+   (`require_same_guardrails`, default true) and the key's rpm / tpm limit and `model_max_budget`
+   entries for it equal the requested model's (`require_same_limits`, default true). Both are read
+   per request from the proxy's live router and the caller's key, so models added through the UI
+   count. Excluded models are logged under `excluded`; when that leaves nothing eligible,
+   `no_eligible` applies.
 6. **No eligible model.** When nothing in the family is both eligible for the content and allowed
    for the key, `no_eligible.action` decides: `block` (default; enforce rejects the request with
    HTTP 400 and a message naming the family and sensitivity), `keep` (serve the requested model,
@@ -292,6 +308,18 @@ Per request:
    happen; a Responses call with `previous_response_id` never moves for cost. `context` is an
    estimate (characters / 4), logged as `ctx_tokens_est`.
 
+   A conversation that carries model-bound state never moves for cost or tier, only when its
+   sensitivity forces it: signed `thinking` / `redacted_thinking` blocks (Anthropic) or
+   `reasoning` items with `encrypted_content` (Responses), and a 1M-token context (the `[1m]`
+   model suffix or a `context-1m` `anthropic-beta` header). With no record of the previous model
+   (another worker, a restart) such a conversation stays on the model it asks for. A forced move
+   sends the conversation unchanged: per Anthropic's thinking docs ("Switching models
+   mid-conversation"), thinking blocks are passed back as they are, and the API ignores or drops
+   those the new model cannot read, so stripping them would only save tokens and risks breaking
+   the latest turn. The log marks such a move `thinking_dropped_est`. A model whose
+   `max_context` is below the estimated context is never a candidate; set it on models without a
+   1M window.
+
 | Mode (`REFLEX_ROUTING_MODE`) | Request | Decision |
 |---|---|---|
 | `off` | untouched | none |
@@ -307,8 +335,10 @@ and prints `reflex routing: …` to the proxy's stderr; a routing bug never fail
 
 **Log.** `routing.jsonl` in `REFLEX_DATA_DIR`: conversation hash, state hash, requested / chosen /
 applied model, sensitivity, tier, Jev's raw answers, which floors fired, the stickiness reason,
-the estimated context size (`ctx_tokens_est`), Jev's token usage, latency, `action` when no model
-was eligible, and `violation: true` when the requested model was not eligible for the content. No
+the estimated context size (`ctx_tokens_est`), Jev's token usage, latency, the difficulty
+probabilities (`difficulty_p`), models left out for other guardrails or limits (`excluded`),
+`action` when no model was eligible, and `violation: true` when the requested model was not
+eligible for the content. No
 message text or paths are written; a Jev HTTP error is logged by status only. In shadow mode
 `chosen` is what enforce would have used. The response's `model` field can still show the
 requested name; the log has the one that served it.
@@ -318,17 +348,24 @@ requested name; the log has the one that served it.
 ```sh
 python3 routing/reflex_router.py --selfcheck           # offline, Jev stubbed; part of npm test
 python3 routing/reflex_router.py --check "Rotate the prod DB password in .env" --model claude-haiku-4-5
-python3 routing/reflex_router.py --smoke               # 10 labelled prompts through live Jev
+npm run eval-routing                                   # routing/golden.json through live Jev
 ```
+
+`eval-routing` runs the 27 labelled prompts of `routing/golden.json` (sensitivity × tier, with
+tricky ones such as security vocabulary in a trivial task, or a short prompt standing for a
+multi-step production change) and reports sensitivity accuracy, tier accuracy, under- and
+over-tiering. It exits 1 when a tier is two levels too low or restricted / proprietary content
+is classified as public / application; details land in `REFLEX_DATA_DIR`.
 
 **Limits.** The Jev answer cache is per process: another worker asks Jev again (one call). The
 model each conversation is on is per process too, unless the proxy shares a Redis with its
 key cache (`litellm_settings.enable_redis_auth_cache: true` plus the proxy's Redis settings): then
 it is also stored there (`reflex:model:<conversation hash>`, 24 h) and stickiness holds across
 workers and restarts. Token counts are estimates (characters / 4). Prices in `policy.json` are
-list prices you maintain. LiteLLM merges model-level guardrails for the requested model before
-any pre-call hook runs, so a guardrail attached only to the routed-to model does not run; per-model
-rate limits and budgets enforced by hooks that run before this one count the requested model.
+list prices you maintain. The guardrail and limit comparison covers model-level guardrails and
+the key's per-model rpm / tpm / budget (key, then team metadata, then deployment defaults, as
+LiteLLM resolves them); team-, user- and end-user-level `model_max_budget` are not compared, and
+budgets are matched on the exact model name.
 
 ## Where this goes next
 

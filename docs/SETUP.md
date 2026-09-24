@@ -132,7 +132,7 @@ for TLS on Python builds without a CA bundle.
 
    ```sh
    python3 routing/reflex_router.py --selfcheck
-   python3 routing/reflex_router.py --smoke        # 10 prompts, ~0.7 s and ~850 input tokens each
+   npm run eval-routing                            # 27 labelled prompts, ~1k input tokens each
    ```
 
 2. Edit `routing/policy.json` for your gateway: one family per set of interchangeable model groups

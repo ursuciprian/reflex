@@ -1,6 +1,6 @@
 {
   "name": "Model routing",
-  "version": "routing-v2",
+  "version": "routing-v3",
   "subject": "Which model serves a request, by how sensitive its content is and how hard it is. Routing stays inside one family: the clients' credentials are not interchangeable across providers.",
   "latency_budget_ms": 1500,
   "cache_ttl_s": 3600,
@@ -9,6 +9,9 @@
     "model": null,
     "note": "enforce, when no model in the family is both eligible for the content and allowed for the caller's key: block (reject the request with an error), keep (send it to the requested model; the log marks the violation) or fallback_model (send it to `model`, which the key must be allowed to call; otherwise block). Shadow only logs the action."
   },
+  "require_same_guardrails": true,
+  "require_same_limits": true,
+  "require_same_note": "LiteLLM applies model-level guardrails (litellm_params.guardrails) and the key's per-model rpm / tpm limits and budget for the requested model before this hook runs, and not again for the model it picks. true: a model whose guardrails (or limits) differ from the requested model's is never chosen; the log lists it under excluded. The requested model itself is always allowed.",
   "paths_to_jev": "shape_outside_repo",
   "paths_to_jev_note": "full: every path as written. shape_outside_repo: paths inside the agent's working directory as repo-relative paths, others as their file name plus [outside repo, sensitive] flags. shape: every path as file name plus flags. restricted_paths are always matched on the full path, locally.",
   "fallback": {
@@ -39,8 +42,9 @@
   },
   "tiers": {
     "order": ["small", "medium", "large"],
+    "up_at": {"medium": 0.4, "large": 0.5},
     "from_score": {"small": 0, "medium": 0.6, "large": 1.4},
-    "note": "difficulty is a 0-2 score; the tier is the highest whose threshold the score reaches. A model of a higher tier may serve a lower one, never the reverse."
+    "note": "difficulty is a 0-2 score whose levels are the tiers in order. up_at: the tier is the highest whose probability mass P(level >= tier) reaches its threshold, so a hesitant answer routes up (under-tiering costs quality, over-tiering only money). from_score: used instead when an answer has no probabilities (the fallback) or up_at is absent; the tier is the highest whose threshold the expected score reaches. A model of a higher tier may serve a lower one, never the reverse."
   },
   "needs_tools_at": 0.5,
   "stickiness": {
