@@ -6,7 +6,7 @@
   "type": "module",
   "engines": {"node": ">=18"},
   "scripts": {
-    "test": "node policy.mjs && node gate.mjs --selfcheck && node instructions.mjs --selfcheck && node context.mjs --selfcheck && node router/server.mjs --selfcheck && python3 routing/reflex_router.py --selfcheck",
+    "test": "node policy.mjs && node gate.mjs --selfcheck && node instructions.mjs --selfcheck && node install.mjs --selfcheck && node context.mjs --selfcheck && node router/server.mjs --selfcheck && python3 routing/reflex_router.py --selfcheck",
     "eval": "node eval.mjs",
     "eval-instructions": "node eval-instructions.mjs",
     "eval-context": "node context.mjs --eval-context",

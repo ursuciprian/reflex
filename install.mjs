@@ -3,7 +3,7 @@
 // user prompt. Idempotent: re-running replaces only Reflex's own entries. Every file it edits is
 // backed up next to itself first.
 //
-//   node install.mjs --agent claude          Claude Code  ~/.claude/settings.json PreToolUse + UserPromptSubmit hooks
+//   node install.mjs --agent claude          Claude Code  ~/.claude/settings.json PreToolUse, PostToolUse, PermissionRequest + UserPromptSubmit hooks
 //   node install.mjs --agent codex           Codex CLI    ~/.codex/hooks.json PreToolUse + UserPromptSubmit (then trust them in /hooks)
 //   node install.mjs --agent opencode        opencode     ~/.config/opencode/plugins/reflex.js (tool.execute.before, chat.message)
 //   node install.mjs --agent pi | omp        pi / oh-my-pi ~/.{pi,omp}/agent/extensions/reflex.ts (tool_call, before_agent_start)
@@ -107,6 +107,8 @@ const AGENTS = {
       s.hooks.PreToolUse = [...(s.hooks.PreToolUse ?? []), group("Bash|Task|Agent", "--claude", 10)];
       for (const ev of ["PostToolUse", "PostToolUseFailure", "PermissionDenied"])
         s.hooks[ev] = [...(s.hooks[ev] ?? []), group("Bash|Task|Agent", "--claude-post", 5)];
+      // records that Claude Code showed its own dialog (never answers it): calibration and rejected spawns
+      s.hooks.PermissionRequest = [...(s.hooks.PermissionRequest ?? []), group("Bash|Task|Agent", "--claude-prompted", 5)];
       s.hooks.UserPromptSubmit = [...(s.hooks.UserPromptSubmit ?? []), promptGroup("--claude")];
       s.permissions.ask.push(...guard);
     }
@@ -198,6 +200,116 @@ if (argv.includes("--router")) {
   }
   console.log("\nNothing was changed. Downstream MCP servers go in router/config.json (REFLEX_ROUTER_CONFIG); see docs/GUIDE.md.");
   process.exit(0);
+}
+
+// --selfcheck: every agent's install, reinstall and uninstall with every feature flag, against a
+// throwaway HOME (this script in a child process), next to hooks and files that are not Reflex's.
+if (argv.includes("--selfcheck")) {
+  const {mkdtempSync} = await import("node:fs"), {tmpdir} = await import("node:os"), {spawnSync} = await import("node:child_process");
+  const ok = (c, m) => { if (!c) { console.error("FAIL", m); process.exitCode = 1; } };
+  const home = mkdtempSync(join(tmpdir(), "reflex-install-"));
+  const data = join(home, "data");
+  const run = (...a) => { const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...a], {encoding: "utf8",
+    env: {...process.env, HOME: home, PATH: "/usr/bin:/bin"}}); ok(r.status === 0, `install ${a.join(" ")}: ${r.stderr}`); return r.stdout; };
+  const read = f => existsSync(join(home, f)) ? readFileSync(join(home, f), "utf8") : null;
+  const put = (f, text) => { mkdirSync(dirname(join(home, f)), {recursive: true}); writeFileSync(join(home, f), text); };
+  const commands = j => Object.values(JSON.parse(j).hooks ?? {}).flat().flatMap(g => g.hooks.map(h => h.command));
+  try {
+    // claude and codex: JSON hook files shared with other tools
+    const foreign = {type: "command", command: "/usr/local/bin/other-hook", timeout: 3};
+    const seeds = {
+      ".claude/settings.json": {model: "opus", env: {FOO: "1"}, permissions: {allow: ["Bash(ls)"], ask: ["Bash(rm *)"]},
+        hooks: {PreToolUse: [{matcher: "Bash", hooks: [foreign]}], PermissionRequest: [{matcher: "*", hooks: [foreign]}],
+                UserPromptSubmit: [{hooks: [foreign]}]}},
+      ".codex/hooks.json": {hooks: {PreToolUse: [{matcher: "^Bash$", hooks: [foreign]}], Stop: [{hooks: [foreign]}]}},
+    };
+    const want = {
+      ".claude/settings.json": {PreToolUse: ["--claude "], PostToolUse: ["--claude-post"], PostToolUseFailure: ["--claude-post"],
+        PermissionDenied: ["--claude-post"], PermissionRequest: ["--claude-prompted"], UserPromptSubmit: ["instructions.mjs\" --claude"]},
+      ".codex/hooks.json": {PreToolUse: ["--codex "], PostToolUse: ["--codex-post"], UserPromptSubmit: ["instructions.mjs\" --codex"]},
+    };
+    for (const [agent, f] of [["claude", ".claude/settings.json"], ["codex", ".codex/hooks.json"]]) {
+      const seed = JSON.stringify(seeds[f], null, 2) + "\n";
+      put(f, seed);
+      run("--agent", agent);
+      const first = read(f), hooks = JSON.parse(first).hooks;
+      for (const [ev, flags] of Object.entries(want[f]))
+        ok(flags.every(fl => (hooks[ev] ?? []).some(g => g.hooks.some(h => h.command.includes(fl)))), `${agent}: ${ev} hook installed`);
+      ok(commands(first).filter(c => c.includes(q(GATE))).every(c => c.includes("--mode shadow --allow off")) &&
+         commands(first).filter(c => c.includes(q(INSTRUCTIONS))).every(c => c.endsWith("--mode shadow")), `${agent}: gate hooks carry --allow, instructions hooks do not`);
+      ok(commands(first).filter(c => c === foreign.command).length === commands(seed).length, `${agent}: foreign hooks survive the install`);
+      if (agent === "claude") {
+        const pre = hooks.PreToolUse.find(g => g.hooks.some(h => h.command.includes(q(GATE))));
+        const s = JSON.parse(first);
+        ok(pre.matcher === "Bash|Task|Agent" && s.model === "opus" && s.env.FOO === "1" && s.permissions.allow[0] === "Bash(ls)" &&
+           s.permissions.ask.includes("Bash(rm *)") && s.permissions.ask.some(r => r.startsWith("Edit(")), "claude: matcher, foreign settings and guard rules");
+      } else ok(hooks.PreToolUse.some(g => g.matcher === "^(Bash|spawn_agent)$"), "codex: Bash and spawn_agent");
+      run("--agent", agent);
+      ok(read(f) === first, `${agent}: reinstall is byte-identical`);
+      run("--agent", agent, "--mode", "enforce", "--allow", "on");
+      ok(commands(read(f)).filter(c => c.includes(q(GATE))).every(c => c.includes("--mode enforce --allow on")) &&
+         commands(read(f)).filter(c => c.includes(q(GATE))).length === commands(first).filter(c => c.includes(q(GATE))).length, `${agent}: mode and allow switch in place, no duplicates`);
+      run("--agent", agent, "--uninstall");
+      ok(JSON.stringify(JSON.parse(read(f))) === JSON.stringify(JSON.parse(seed)), `${agent}: uninstall leaves exactly the foreign settings`);
+      run("--agent", agent, "--uninstall");
+      ok(JSON.stringify(JSON.parse(read(f))) === JSON.stringify(JSON.parse(seed)), `${agent}: a second uninstall changes nothing`);
+    }
+    // the installed Claude hook really runs: the force-push canary is denied, even in shadow mode
+    put(".claude/settings.json", "{}\n");
+    run("--agent", "claude");
+    const pre = commands(read(".claude/settings.json")).find(c => c.includes("--claude "));
+    const r = spawnSync("/bin/sh", ["-c", pre], {encoding: "utf8", env: {...process.env, HOME: home, REFLEX_DATA_DIR: data},
+      input: JSON.stringify({hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {command: "git push --force origin main"}, session_id: "s", cwd: home})});
+    ok(JSON.parse(r.stdout || "{}").hookSpecificOutput?.permissionDecision === "deny", "claude: installed hook command denies the canary");
+    const pr = commands(read(".claude/settings.json")).find(c => c.includes("--claude-prompted"));
+    const r2 = spawnSync("/bin/sh", ["-c", pr], {encoding: "utf8", env: {...process.env, HOME: home, REFLEX_DATA_DIR: data},
+      input: JSON.stringify({hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: {command: "touch x"}, session_id: "s", prompt_id: "p"})});
+    ok(r2.stdout === "" && existsSync(join(data, "feedback.jsonl")) && /"event":"prompted"/.test(readFileSync(join(data, "feedback.jsonl"), "utf8")), "claude: PermissionRequest hook records and never answers");
+    run("--agent", "claude", "--uninstall");
+    // opencode, pi, omp: files of their own, next to other plugins / extensions
+    put(".config/opencode/plugins/other.js", "export const Other = async () => ({});\n");
+    run("--agent", "opencode");
+    const oc = read(".config/opencode/plugins/reflex.js");
+    ok(oc && !oc.includes("__REFLEX_") && oc.includes('"--allow", ALLOW') && oc.includes("chat.message") && oc.includes('input.tool === "task"'), "opencode: plugin filled, with gate, instructions and subgoals");
+    run("--agent", "opencode");
+    ok(read(".config/opencode/plugins/reflex.js") === oc, "opencode: reinstall is byte-identical");
+    run("--agent", "opencode", "--uninstall");
+    ok(read(".config/opencode/plugins/reflex.js") === null && read(".config/opencode/plugins/other.js") !== null, "opencode: uninstall removes only reflex.js");
+    for (const a of ["pi", "omp"]) {
+      const dir = `.${a}/agent/extensions`, ext = `${dir}/reflex.ts`, ctx = `${dir}/reflex-context.ts`;
+      put(`${dir}/other.ts`, "export default function () {}\n");
+      run("--agent", a);
+      const e = read(ext);
+      ok(e && !e.includes("__REFLEX_") && e.includes(`const AGENT = "${a}"`) && e.includes("before_agent_start") && e.includes("subgoalsOf") && read(ctx) === null,
+         `${a}: extension filled with gate, instructions and subgoals; no context layer by default`);
+      run("--agent", a);
+      ok(read(ext) === e, `${a}: reinstall is byte-identical`);
+      run("--agent", a, "--context");
+      const c = read(ctx);
+      ok(c && !c.includes("__REFLEX_"), `${a}: --context adds the context layer`);
+      run("--agent", a);
+      ok(read(ctx) === c && read(ext) === e, `${a}: a plain reinstall keeps the context layer, byte-identical`);
+      run("--agent", a, "--no-context");
+      ok(read(ctx) === null && read(ext) === e, `${a}: --no-context removes only the context layer`);
+      run("--agent", a, "--context");
+      run("--agent", a, "--uninstall");
+      ok(read(ext) === null && read(ctx) === null && read(`${dir}/other.ts`) !== null, `${a}: uninstall removes both, keeps other extensions`);
+    }
+    // hermes: printed, never written
+    const hm = run("--agent", "hermes", "--allow", "shadow");
+    ok(/pre_tool_call:[\s\S]*matcher: "terminal"[\s\S]*fail_closed: true[\s\S]*matcher: "delegate_task"[\s\S]*post_tool_call:[\s\S]*"terminal\|delegate_task"[\s\S]*pre_llm_call:/.test(hm) &&
+       /--hermes --mode shadow --allow shadow'/.test(hm) && /instructions\.mjs" --hermes --mode shadow'/.test(hm) && !existsSync(join(home, ".hermes")),
+       "hermes: gate, subgoal and instructions blocks printed, nothing written");
+    ok(/remove the reflex entries/.test(run("--agent", "hermes", "--uninstall")), "hermes: uninstall says what to remove");
+    // router registration is printed for every agent, never applied
+    const ro = run("--router");
+    ok(["claude", "codex", "pi", "omp", "opencode", "hermes"].every(a => ro.includes(`## ${a}`)) && /Nothing was changed/.test(ro), "router: printed for every agent");
+    const left = spawnSync("find", [home, "-type", "f", "-not", "-name", "*.bak-*", "-not", "-path", `${data}/*`], {encoding: "utf8"}).stdout.trim().split("\n").sort();
+    ok(left.join() === [".config/opencode/plugins/other.js", ".omp/agent/extensions/other.ts", ".pi/agent/extensions/other.ts",
+       ".claude/settings.json", ".codex/hooks.json"].map(f => join(home, f)).sort().join(), `nothing but foreign files and the emptied settings remain: ${left.join(" ")}`);
+  } finally { rmSync(home, {recursive: true, force: true}); }
+  console.log(process.exitCode ? "install selfcheck FAILED" : "install selfcheck OK");
+  process.exit();
 }
 
 const which = opt("--agent", "claude");
