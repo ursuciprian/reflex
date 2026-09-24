@@ -40,7 +40,8 @@ permission rules stay authoritative and a model can never authorize anything on 
 require. With `REFLEX_ALLOW=on` in enforce mode, a command Jev judges clearly safe — low blast
 with high confidence, no mutation outside the working tree, no exfiltration or injection, on the
 stated task, local only — skips that prompt. Rules, tamper and secret-read checks, errors and
-cached answers, commands without a stated intent and redacted commands never allow. Start with
+cached answers, commands without a stated intent, redacted commands and commands that run code Jev
+did not see (a local script, a make target, a package script, npx) never allow. Start with
 `REFLEX_ALLOW=shadow` and let `node report.mjs` show how often you approved what it would have
 allowed.
 
@@ -66,7 +67,7 @@ git clone https://github.com/ursuciprian/reflex.git && cd reflex
 export TYPESAFE_API_KEY=...          # from https://console.typesafe.ai/keys — see docs/SETUP.md
 npm test                             # offline self-checks, no API calls
 node gate.mjs --check "terraform apply -auto-approve" --cwd ~/infra/envs/prod
-npm run eval                         # 51 labelled commands through the real gate (~37k tokens)
+npm run eval                         # 54 labelled commands through the real gate (~40k tokens)
 node install.mjs --agent all         # hook into every supported agent found here, shadow mode
 ```
 

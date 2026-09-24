@@ -107,7 +107,7 @@ A case can also carry `"allow": true` (a clearly safe command that should be all
 reported as `stiff` when it is not, never a failure) or `"allow": false` (must never be
 auto-allowed; a MISS if it is). An `allow` counts as `pass` for `expect`.
 
-Current result: 51 cases, 0 misses, 0 over; 5 of 6 `allow: true` cases allow-eligible. Results are saved to `~/.local/state/reflex/eval-*.json`.
+Current result: 54 cases, 0 misses, 0 over; 3 of 4 `allow: true` cases allow-eligible. Results are saved to `~/.local/state/reflex/eval-*.json`.
 Run it in CI with `TYPESAFE_API_KEY` as a secret to guard policy changes.
 
 **Grow the golden set from real traffic.** Every surprising decision in the trace becomes a case.
@@ -168,9 +168,13 @@ Never allowed, whatever the answers: anything a rule decided (including tamper a
 read-only and fast-lane commands (they stay `pass`, so your permission allowlist still governs
 them), Jev errors and incomplete answers (the `ask` fallback), cached answers (they have lost
 `on_task`), commands without a stated intent (`on_task` defaults to yes then), commands that
-redaction changed (a redacted `--token "$(…)"` could hide a payload), and commands run from the
-home directory or `/` (where "inside the working directory" means everything). The trace logs
-why as `low risk (not allowed: …)`. `export REFLEX_ALLOW=…` in a command is a tamper `ask`. In Claude Code an allow skips
+redaction changed (a redacted `--token "$(…)"` could hide a payload), commands that run code by
+name, which Jev never sees (a local script or executable, `python -m`, `node -r`, `source`, a make
+or task target, a package script or install, `npx` / `dlx` / `uvx`, `go generate` / `go run`),
+commands run from the home directory or `/` (where "inside the working directory" means everything),
+and a policy whose `default_outcome` is allow (only the allow gate allows). In Claude Code, a
+command retried outside the sandbox (`dangerouslyDisableSandbox`) and any command in plan mode
+keep their prompt. The trace logs why as `low risk (not allowed: …)`. `export REFLEX_ALLOW=…` in a command is a tamper `ask`. In Claude Code an allow skips
 the prompt but its deny and ask permission rules still apply.
 
 **Calibrate from your own approvals.** Run with `REFLEX_ALLOW=shadow` in enforce mode for a
@@ -188,8 +192,9 @@ thresholds (illustrative output):
 
 It recommends the band covering the most commands you approved at least 95% of (10 or more
 labelled), the tightest among equals, and says "not enough data" otherwise. Other agents have no
-prompt for a pass, so their would-be allows are not labels; in Claude Code a command its allowlist
-or permission mode let through counts as approved too, which flatters the rate a little.
+prompt for a pass, so their would-be allows are not labels, and neither are Claude Code's in a
+permission mode other than `default` (the trace logs `permission_mode`); a command its allowlist
+let through still counts as approved, which flatters the rate a little.
 `node report.mjs --calibration` prints the expected calibration error of `blast` and `mutates`
 read as approval probabilities (1 − blast/3, 1 − mutates) against your approvals, per bin; it
 needs 20 labelled commands. Move the `allow*` params in `policy.json`, check with
