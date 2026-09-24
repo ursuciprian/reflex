@@ -3,7 +3,7 @@
 //
 //   node gate.mjs --decide        JSON call on stdin -> JSON decision on stdout (any agent adapter)
 //   node gate.mjs --record        JSON outcome on stdin -> feedback log
-//   node gate.mjs --claude        Claude Code PreToolUse hook   (--claude-post: PostToolUse)
+//   node gate.mjs --claude        Claude Code PreToolUse hook   (--claude-post: PostToolUse; --claude-prompted: PermissionRequest)
 //   node gate.mjs --codex         Codex CLI PreToolUse hook     (--codex-post)
 //   node gate.mjs --hermes        Hermes pre_tool_call hook     (--hermes-post)
 //   adapters/opencode.js, adapters/pi.ts                        plugins that call --decide / --record
@@ -721,15 +721,21 @@ async function subgoalJudge(call, asker = ask) {
   const now = Date.now(), pendingMs = (spec.pendingSeconds ?? 300) * 1000, tag = randomUUID().slice(0, 8);
   const who = {agent: call.agent ?? null, session_id: call.session_id ?? null, call_id: call.call_id ?? null};
   const mine = call.subgoals.map((s, item) => ({ts: new Date(now).toISOString(), id: `${tag}#${item}`, ...who, item,
-                                                subgoal: redact(s).slice(0, 2000)}));
+                                                ...(call.prompt_id && {prompt_id: call.prompt_id}), subgoal: redact(s).slice(0, 2000)}));
   // One write for the whole batch keeps its items in order and together.
   if (call.session_id) append(SUBGOALS(), mine);
   const rows = jsonLines(readTail(SUBGOALS())), fb = jsonLines(readTail(FEEDBACK()));
   const ran = new Set(fb.filter(r => r.event === "ran" && r.call_id).map(r => r.call_id));
   const gone = new Set(fb.filter(r => ["denied", "failed"].includes(r.event) && r.call_id).map(r => r.call_id));
   const dropped = new Set(rows.filter(r => r.dropped).map(r => r.id));
+  // Claude Code asked the user about a spawn (PermissionRequest) and it never ran: once the user
+  // has sent another prompt (a later prompt_id), the answer was no or the turn was interrupted.
+  // A rejected dialog fires no hook of its own, so this is the only sign; nothing to reuse.
+  const prompted = fb.filter(r => r.event === "prompted" && r.prompt_id && r.key);
+  const refused = r => call.prompt_id && !ran.has(r.call_id) && prompted.some(p => p.session_id === r.session_id &&
+    p.prompt_id !== call.prompt_id && p.ts >= r.ts && p.key === sha(r.subgoal));
   const live = r => r.subgoal && r.session_id === who.session_id && r.agent === who.agent && !dropped.has(r.id) &&
-    !gone.has(r.call_id) && (ran.has(r.call_id) || now - Date.parse(r.ts) < pendingMs);
+    !gone.has(r.call_id) && (ran.has(r.call_id) || now - Date.parse(r.ts) < pendingMs) && !refused(r);
   // Long subgoals that share a preamble differ at the end: an option keeps both.
   const clip = s => s.length > 600 ? `${s.slice(0, 400)} … ${s.slice(-200)}` : s;
   const base = {qset: spec.version, policy_version: spec.version, tag: "subgoal"};
@@ -813,7 +819,8 @@ const view = (j, effective) => ({effective: effective === "allow" && j.source !=
 export function record(ev) {
   if (CONFIG.mode === "off") return;
   append(FEEDBACK(), {ts: new Date().toISOString(), agent: ev.agent ?? null, event: ev.event ?? "ran",
-    session_id: ev.session_id ?? null, call_id: ev.call_id ?? null, exit_code: ev.exit_code ?? null});
+    session_id: ev.session_id ?? null, call_id: ev.call_id ?? null, exit_code: ev.exit_code ?? null,
+    ...(ev.prompt_id && {prompt_id: ev.prompt_id}), ...(ev.key && {key: ev.key})});
 }
 
 // Logs. One JSON line per judged command; the same shape report.mjs replays.
@@ -848,8 +855,21 @@ function claudeCall(input) {
   // A subagent's hooks carry its parent's session_id plus its own agent_id: its subgoals are its own.
   const session_id = subgoal && input.agent_id ? `${input.session_id}/${input.agent_id}` : input.session_id;
   return {agent: "claude-code", ...(subgoal ? {subgoal} : {command: t.command}), cwd: input.cwd,
-          session_id, call_id: input.tool_use_id, transcript_path: input.transcript_path, permission_mode: input.permission_mode,
-          unsandboxed: t.dangerouslyDisableSandbox === true};
+          session_id, call_id: input.tool_use_id, prompt_id: input.prompt_id, transcript_path: input.transcript_path,
+          permission_mode: input.permission_mode, unsandboxed: t.dangerouslyDisableSandbox === true};
+}
+// What a PermissionRequest is about, as the trace (state.call.command) and subgoals.jsonl store it:
+// PermissionRequest input has no tool_use_id, so the text is the join key.
+export const promptKey = text => sha(redact(text).slice(0, 2000));
+// PermissionRequest: Claude Code is about to show its permission dialog (or, where it cannot
+// prompt, to deny). Recorded, never answered, so the dialog appears as it would without Reflex.
+// A pass Claude Code's allowlist or permission mode let through has no such record, which is how
+// report.mjs tells a human approval from an allowlist, and subgoal dedup a rejected spawn.
+function claudePrompted(input) {
+  const call = claudeCall(input);
+  if (!call) return;
+  record({agent: "claude-code", event: "prompted", session_id: call.session_id, prompt_id: input.prompt_id,
+          key: promptKey(call.command ?? call.subgoal)});
 }
 async function claudePre(input) {
   const call = claudeCall(input);
@@ -1328,6 +1348,18 @@ async function selfcheck() {
     await G(`Deploy with token ghp_${"a".repeat(36)}`, pick("none"));
     ok(!readText(SG).includes("ghp_aaaa"), "subgoal: recorded redacted");
     ok((await decideSafe({agent: "x", subgoal: "y", session_id: "S1"}, {asker: async () => { throw new Error("boom"); }})).effective === "pass", "subgoal: an internal error passes");
+    // PermissionRequest: a spawn the user was asked about and that never ran is gone once the user has moved on
+    const Q = (prompt, prompt_id, call_id) => decide({agent: "claude-code", subgoal: prompt, session_id: "Q1", prompt_id, call_id, cwd: "/w"},
+                                                     {asker: pick("none")});
+    ok((await Q("Survey the logging setup", "u1", "q1")).effective === "pass", "prompted: first spawn passes");
+    claudePrompted({tool_name: "Agent", tool_input: {prompt: "Survey the logging setup"}, session_id: "Q1", prompt_id: "u1"});
+    ok(jsonLines(readText(FEEDBACK())).some(r => r.event === "prompted" && r.prompt_id === "u1" && r.key === promptKey("Survey the logging setup")),
+       "prompted: PermissionRequest is recorded with its turn and a key, not answered");
+    ok((await Q("Survey the logging setup", "u1", "q2")).effective === "deny", "prompted: same turn, the dialog may still be open: a duplicate");
+    ok((await Q("Survey the logging setup", "u2", "q3")).effective === "pass", "prompted: next turn, never ran: rejected, the spawn may be retried");
+    record({agent: "claude-code", event: "ran", session_id: "Q1", call_id: "q3"});
+    claudePrompted({tool_name: "Agent", tool_input: {prompt: "Survey the logging setup"}, session_id: "Q1", prompt_id: "u2"});
+    ok((await Q("Survey the logging setup", "u3", "q4")).effective === "deny", "prompted: approved and ran: still a duplicate in a later turn");
     // review fixes: parallel spawns, batches, prompts in the trace, a command beside a subgoal
     const judgeBy = rule => async state => { asked.push(state.subgoal.text);
       return {answers: {duplicate: {type: "choice", choice: rule(state.subgoal.text), confidence: 0.95}}, usage: {}, error: null, latency_s: 0}; };
@@ -1393,6 +1425,14 @@ async function selfcheck() {
     ok(/blast\s+ECE 0\.269/.test(rep(["--calibration"])), "report: expected calibration error");
     writeFileSync(TRACE(), row(1, 0.9, {decision: "would_allow", emitted: null}) + "\n");
     ok(/not enough data/.test(rep([])) && /not enough data: 1 labelled/.test(rep(["--calibration"])), "report: says when there is not enough data");
+    // with the PermissionRequest hook: only would-be allows that met a real dialog are labels
+    const later = new Date(Date.parse(old) + 1000).toISOString();
+    writeFileSync(TRACE(), [...Array(20)].map((_, i) => row(i, 0.9, {decision: "would_allow", emitted: null, session_id: "R",
+      state: {call: {command: `npm run gen${i}`}}})).join("\n") + "\n");
+    writeFileSync(FEEDBACK(), [...Array(20)].map((_, i) => JSON.stringify({event: "ran", call_id: `c${i}`}))
+      .concat([0, 1, 2].map(i => JSON.stringify({ts: later, event: "prompted", session_id: "R", key: promptKey(`npm run gen${i}`)})))
+      .concat(JSON.stringify({ts: new Date(Date.parse(old) - 1000).toISOString(), event: "prompted", session_id: "earlier", key: "x"})).join("\n") + "\n");
+    ok(/not enough data: 3 labelled/.test(rep(["--calibration"])), "report: allowlisted passes (no PermissionRequest) are not approvals");
   } finally { Object.assign(CONFIG, saved); rmSync(scratch, {recursive: true, force: true}); }
   // adapters
   const cc = claudeCall({tool_name: "Agent", tool_input: {prompt: "Find X", description: "find", subagent_type: "Explore"}, session_id: "s"});
@@ -1438,6 +1478,7 @@ if (!main) { /* imported as a library */ }
 else if (flag("--selfcheck")) await selfcheck();
 else if (flag("--claude")) await guarded(async () => claudePre(readStdin()));
 else if (flag("--claude-post")) await guarded(async () => claudePost(readStdin()));
+else if (flag("--claude-prompted")) await guarded(async () => claudePrompted(readStdin()));
 else if (flag("--codex")) await guarded(async () => codexPre(readStdin()));
 else if (flag("--codex-post")) await guarded(async () => codexPost(readStdin()));
 else if (flag("--hermes")) await guarded(async () => hermesPre(readStdin()));

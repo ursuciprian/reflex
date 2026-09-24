@@ -9,7 +9,7 @@
 //   node report.mjs --calibration           how well blast / mutates predict your approvals (ECE)
 import {existsSync, readFileSync} from "node:fs";
 import {join} from "node:path";
-import {CONFIG} from "./gate.mjs";
+import {CONFIG, promptKey} from "./gate.mjs";
 import {compile} from "./policy.mjs";
 
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i > -1 ? process.argv[i + 1] : d; };
@@ -18,7 +18,11 @@ const since = Date.now() - Number(arg("--since", 7)) * 864e5;
 // Subgoal checks (tag "subgoal") are counted apart: they are not commands and have no policy to replay.
 const logged = rows(join(CONFIG.data, "trace.jsonl")).filter(r => Date.parse(r.ts) >= since);
 const trace = logged.filter(r => r.tag !== "subgoal"), subgoals = logged.filter(r => r.tag === "subgoal");
-const ran = new Set(rows(join(CONFIG.data, "feedback.jsonl")).filter(r => r.event !== "denied").map(r => r.call_id ?? r.tool_use_id));
+const feedback = rows(join(CONFIG.data, "feedback.jsonl"));
+const ran = new Set(feedback.filter(r => r.event === "ran" || r.event === "failed" || r.event == null).map(r => r.call_id ?? r.tool_use_id));
+// Claude Code's PermissionRequest hook: the dialogs it actually showed, by session and command.
+const prompted = feedback.filter(r => r.event === "prompted");
+const promptedSince = prompted.map(r => r.ts).sort()[0];
 const policy = compile(JSON.parse(readFileSync(arg("--policy", join(CONFIG.setup, "policy.json")), "utf8")));
 
 const count = (list, key) => list.reduce((m, r) => { const k = key(r); m[k] = (m[k] ?? 0) + 1; return m; }, {});
@@ -38,13 +42,17 @@ const changed = replayed.filter(x => x.now !== (x.r.policy_decision ?? x.r.decis
 // Calibration: the Jev-judged commands a human ruled on, approved when the command then ran:
 // asks Reflex emitted in enforce mode, and commands allow would have let through (logged
 // would_allow, or allow on replay) in Claude Code, the one agent where a pass still meets a
-// prompt. ponytail: a pass its allowlist or permission mode let through also counts as approved;
-// a PermissionRequest signal would tell a real prompt apart. Commands actually allowed ran
-// without a human, so they carry no label; nor do would-be allows in a permission mode other than
-// default (acceptEdits, auto, bypassPermissions, plan), where a pass met no prompt or a different one.
+// prompt, but only when its PermissionRequest hook saw that prompt (within 10 minutes): a pass
+// its allowlist or permission mode let through never met a human. Rows older than the first
+// PermissionRequest record predate the hook; there, as before, any would-be allow in default
+// mode counts. ponytail: the first record marks the install, per machine rather than per session.
+// Commands actually allowed ran without a human, so they carry no label; nor do would-be allows in
+// a permission mode other than default (acceptEdits, auto, bypassPermissions, plan).
+const shown = r => !promptedSince || r.ts < promptedSince || prompted.some(p => p.session_id === r.session_id && p.ts >= r.ts &&
+  Date.parse(p.ts) - Date.parse(r.ts) < 6e5 && p.key === promptKey(r.state?.call?.command ?? ""));
 const labelled = replayed.filter(({r, now}) => r.emitted !== "allow" && r.answers?.blast?.score != null &&
     ((r.emitted === "ask" && r.mode === "enforce") || (r.agent === "claude-code" && [undefined, null, "default"].includes(r.permission_mode) &&
-      (now === "allow" || r.decision === "would_allow"))))
+      (now === "allow" || r.decision === "would_allow") && shown(r))))
   .map(({r}) => ({blast: r.answers.blast.score, conf: r.answers.blast.confidence ?? 0, mutates: r.answers.mutates?.noul, v: verdict(r)}))
   .filter(x => x.v !== "pending").map(x => ({...x, ok: x.v === "approved" ? 1 : 0}));
 const rate = xs => xs.length ? `${xs.filter(x => x.ok).length}/${xs.length} (${Math.round(100 * xs.filter(x => x.ok).length / xs.length)}%)` : "-";
@@ -62,7 +70,7 @@ if (process.argv.includes("--calibration")) {
   // Expected calibration error of each answer read as an approval probability: 1 - blast/3 and
   // 1 - mutates. ponytail: 5 equal-width bins; a reliability curve per question needs more data.
   const NEED = 20;
-  console.log(`calibration · ${labelled.length} labelled commands (approved = it ran after the ask, or after Claude Code's own prompt or allowlist)`);
+  console.log(`calibration · ${labelled.length} labelled commands (approved = it ran after the ask, or after Claude Code's own prompt)`);
   if (labelled.length < NEED) {
     console.log(`  not enough data: ${labelled.length} labelled, need ${NEED}. Run in enforce mode, or with REFLEX_ALLOW=shadow, and come back.`);
     process.exit(0);
