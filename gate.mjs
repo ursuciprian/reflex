@@ -20,7 +20,7 @@
 // mode Jev runs in a detached background process, so the agent never waits for it.
 // "allow" (skip the agent's own prompt) is opt-in twice, REFLEX_ALLOW=on and enforce mode, and
 // only for a fresh Jev answer that clears the policy's allow gate.
-import {appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync,
+import {appendFileSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync,
         openSync, readSync, writeSync, closeSync, rmSync, readdirSync, fstatSync} from "node:fs";
 import {createHash} from "node:crypto";
 import {execFileSync, spawn, spawnSync} from "node:child_process";
@@ -303,6 +303,30 @@ const FROM_STDIN = /^(?:(?:ba|z|da|k)?sh|python[\d.]*|node|ruby|perl)(?:\s+-[a-z
 // An earlier step that could have written the file this one runs: what is on disk now is not what will run.
 const WRITES = /(>|\s-o\s|--output|\btee\b|\bcp\b|\bmv\b|\bcurl\b|\bwget\b|\bsed\s+-i|\bgit\s+(checkout|pull|apply|restore)\b|\bpatch\b|\bunzip\b|\btar\b)/;
 const MAX_SCRIPTS = 8, LONG_LINE = 2000, SCAN_MS = 1500;
+// Runs code no file here shows: a package fetched or installed (its lifecycle and build scripts), a
+// module or a preload named on the command line, a task runner, go generate / run, find -exec of a
+// script. Always unseen, whatever else is read.
+const UNSEEN_RUN = new RegExp([
+  String.raw`^(npx|bunx|pnpx|uvx|pipx)\b`, String.raw`^(npm|pnpm|yarn|bun)\s+(\S+\s+)*(dlx|exec|x|install|i|ci|add)(\s|$)`,
+  String.raw`^uv\s+(run|tool|pip)\b`, String.raw`^(pip3?|poetry|pipenv)\s+(install|run|sync)\b`,
+  String.raw`^python[\d.]*\s+(-\S+\s+)*-m\s`, String.raw`^node\s(.*\s)?(-r|--require|--import|--loader|--experimental-loader)(\s|=)`,
+  String.raw`^(just|task|rake|invoke|nox|tox|gradle|mvn|\.\/gradlew|\.\/mvnw)\b`, String.raw`^go\s+(run|generate)\b`, String.raw`^cargo\s+run\b`,
+  String.raw`\s-exec(dir)?\s+(\S*\/)?${INTERP}\b`,
+].join("|"));
+// Variables that load code into whatever runs next (BASH_ENV runs a file before a script, NODE_OPTIONS
+// can --require one, PYTHONPATH picks which module an import finds).
+const CODE_ENV = /(^|\s)(BASH_ENV|NODE_OPTIONS|NODE_PATH|PYTHONPATH|PYTHONSTARTUP|PYTHONHOME|PERL5OPT|PERL5LIB|RUBYOPT|RUBYLIB|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_\w+)=/;
+// An interpreter given a program it did not match above (no extension, a variable): unseen.
+const INTERP_ARG = new RegExp(String.raw`^${INTERP}\s+(?!(-\S+\s+)*-[a-zA-Z]*[cen]\b)(-\S+\s+)*[^-\s]`);
+// Files whose content must not leave the machine, even redacted: rules scan them, Jev is not shown them.
+const SENSITIVE = /(^|\/)(\.env(\.[\w.-]+)?|\.netrc|\.npmrc|\.pypirc|credentials|id_[a-z0-9]+)$|\/\.(ssh|aws|gnupg|kube|docker)\/|\.(pem|key|p12|pfx)$/;
+// A local module a script imports runs too, and Jev did not see it.
+const LOCAL_IMPORT = /^\s*(from\s+\.|import\s*\(?\s*['"]\.{1,2}\/)|\brequire\(\s*['"]\.{1,2}\/|\bfrom\s+['"]\.{1,2}\//m;
+const pyImports = text => [...text.matchAll(/^\s*(?:from\s+([\w]+)[\w.]*\s+import|import\s+([\w, ]+))/gm)]
+  .flatMap(m => m[1] ? [m[1]] : m[2].split(",").map(x => x.trim().split(/\s|\./)[0])).filter(Boolean);
+// Programs installed on the system are judged by their command; a compiled program elsewhere (built
+// in the repo, downloaded) is code nobody showed Jev.
+const SYSTEM_BIN = /^(\/bin|\/sbin|\/usr|\/opt\/homebrew|\/nix|\/System|\/Library|\/Applications)\//;
 const PM_BUILTIN = new Set(("add install i ci remove rm uninstall up update upgrade why list ls info view init create dlx exec x " +
   "publish link unlink outdated audit config cache store import patch rebuild prune pack version set node workspace " +
   "workspaces bin help login logout whoami tag plugin dedupe env fetch licenses global root prefix search doctor").split(" "));
@@ -400,6 +424,10 @@ export function localScripts(command, cwd, depth = 0) {
     const cd = seg.match(/^(?:cd|pushd)\s+(["']?)([^"']+)\1$/);
     if (cd) { dir = under(dir, cd[2]); continue; }
     if (before.length && FROM_STDIN.test(seg)) { found.push(unseen(`stdin of ${seg.split(/\s/)[0]}`)); before.push(raw); continue; }
+    if (UNSEEN_RUN.test(seg) || CODE_ENV.test(raw)) found.push(unseen(seg.split(/\s+/).slice(0, 2).join(" ")));
+    // `bash -c '…'` runs its argument as a command line: the scripts that one runs are what matter.
+    const inline = seg.match(/^(?:ba|z|da|k)?sh\s+(?:-[a-zA-Z]+\s+)*-[a-zA-Z]*c[a-zA-Z]*\s+(["'])([\s\S]*?)\1(?=\s|$)/);
+    if (inline) { found.push(...(depth < 2 ? localScripts(inline[2], dir, depth + 1) : [unseen(seg)])); before.push(raw); continue; }
     const tokens = seg.split(/\s+/).slice(1), pm = seg.match(/^(npm|pnpm|yarn|bun)\b/)?.[0];
     let path, got, base = dir, shell = false, named = false;
     if (/^make\b/.test(seg)) {
@@ -422,17 +450,21 @@ export function localScripts(command, cwd, depth = 0) {
       try { scripts = JSON.parse(readText(path) ?? "null")?.scripts; } catch { scripts = null; }
       const lines = names.filter(k => typeof scripts?.[k] === "string").map(k => `${k}: ${scripts[k]}`);
       if (lines.length) got = {text: lines.join("\n"), partial: false, run: names.map(k => scripts?.[k]).filter(v => typeof v === "string").join("\n")};
-      named = ["run", "run-script"].includes(tokens.find(t => !t.startsWith("-")));
-      shell = true;
+      // A name the package.json does not have is still run: yarn, pnpm and bun fall back to a bin.
+      shell = named = true;
     } else {
       const i = LAUNCH.findIndex(re => re.test(seg));
       if (i > -1) {
         path = under(dir, seg.match(LAUNCH[i])[2]);
         got = readHead(path, RULE_BYTES);
-        if (got?.binary) { got = null; before.push(raw); continue; }   // a program, not a script: judged by its command
+        if (got?.binary) {   // a program, not a script: an installed one is judged by its command
+          if (!SYSTEM_BIN.test(path)) found.push(unseen(path));
+          before.push(raw);
+          continue;
+        }
         shell = i < 2 || /\.(sh|bash|zsh)$/.test(path) || /^#!.*\b(ba|z|da|k)?sh\b/.test(got?.text ?? "");
         named = true;
-      } else named = NAMES_SCRIPT.test(seg);
+      } else named = NAMES_SCRIPT.test(seg) || INTERP_ARG.test(seg);
     }
     // Written by an earlier step of the same command (curl -o x.sh && bash x.sh): not what will run.
     const name = path && path.split("/").pop();
@@ -446,8 +478,14 @@ export function localScripts(command, cwd, depth = 0) {
     // the redacted body, cut at a line end.
     const body = got.text, red = redact(body);
     const cut = red.length <= SCRIPT_BYTES ? red : red.slice(0, red.lastIndexOf("\n", SCRIPT_BYTES) + 1 || SCRIPT_BYTES);
-    // partial: Jev did not see all of it (cut, redacted, or a make target), so it can never be allowed.
-    found.push({path, excerpt: cut, body, partial: got.partial || cut !== body || new RegExp(`[^\\n]{${LONG_LINE + 1}}`).test(body)});
+    // partial: Jev did not see all of it (cut, redacted, a make target, or a credentials file it is
+    // never shown), so it can never be allowed.
+    const hide = SENSITIVE.test(path);
+    found.push({path, excerpt: hide ? "" : cut, body, partial: hide || got.partial || cut !== body || new RegExp(`[^\\n]{${LONG_LINE + 1}}`).test(body)});
+    // The local modules a Python or JavaScript script imports run too, unread.
+    const at = dirname(path);
+    if (/\.py$/.test(path) ? /^\s*from\s+\./m.test(body) || pyImports(body).some(m => existsSync(join(at, `${m}.py`)) || existsSync(join(at, m)))
+        : /\.[cm]?[jt]sx?$/.test(path) && LOCAL_IMPORT.test(body)) found.push(unseen(`local modules imported by ${path}`));
     // Two levels are read; what the second level runs is only marked unseen.
     if (shell && depth < 2) {
       const inner = localScripts((got.run ?? body).replace(/^\t/gm, ""), base, depth + 1);
@@ -957,9 +995,9 @@ async function selfcheck() {
     "/opt/homebrew/bin/bash wipe-home.sh", `cd ".." && bash fixtures/wipe-home.sh`, "bash wipe-home.sh>log", "../fixtures/wipe-home.sh",
     "make -C . nuke", "make --directory=. nuke", "make -j 4 nuke"]) ok(pc(c) === "rm-root", `script launch: ${c}`);
   for (const c of ["yarn reset", "pnpm reset", "npm run --silent reset", "npm --prefix . run reset"]) ok(pc(c) === "force-push-main", `package script: ${c}`);
-  ok(sc("./.venv/bin/python gen.py")[0] === "gen.py" && sc("sh -c 'bash build.sh'").length === 0, "script: interpreter by path; sh -c is the command's own text");
+  ok(sc("./.venv/bin/python gen.py")[0] === "gen.py" && sc("sh -c 'bash build.sh'")[0] === "build.sh", "script: interpreter by path; the scripts sh -c runs are read");
   ok(localScripts("bash missing.sh", FX)[0]?.unseen && localScripts("python3 -W ignore gen.py", FX)[0]?.unseen && localScripts("npm run nope", FX)[0]?.unseen &&
-     !localScripts("npm install zod", FX).length && localScripts("ls", null).length === 0, "script: named but unreadable is unseen");
+     localScripts("npm install zod", FX)[0]?.unseen && localScripts("ls", null).length === 0, "script: named but unreadable is unseen");
   const T = join(tmpdir(), `reflex-selfcheck-scripts-${process.pid}`);
   mkdirSync(T, {recursive: true});
   try {
@@ -1017,6 +1055,22 @@ async function selfcheck() {
     put("oneline.sh", "x".repeat(16370) + " wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n");
     ok(!localScripts("bash oneline.sh", T)[0].excerpt.includes("wJalrXUtn"), "script: redacted before it is cut");
     ok(localScripts("/bin/ls -la", T).length === 0, "script: a binary is a program, not an unseen script");
+    // third review: code that ran without being read, so a "clearly safe" answer about the entry point allowed it
+    mkdirSync(join(T, "lib"), {recursive: true}); mkdirSync(join(T, "mypkg"), {recursive: true}); mkdirSync(join(T, "bin"), {recursive: true});
+    put("helper.py", "import shutil\n"); put("imp.py", "import os, helper\nhelper.run()\n"); put("rel.py", "from .x import y\n");
+    put("std.py", "import os, sys\nprint(sys.argv)\n"); put("main.js", "require('./lib/x.js')\n"); put("esm.mjs", "import {x} from './lib/x.mjs'\n");
+    put("ok.js", "console.log(1)\n"); put("bin/cli", "console.log(1)\n"); put(".env", "STRIPE=zz9sEcr3tvalue\n");
+    copyFileSync("/bin/echo", join(T, "mybin"));
+    const unseenIn = c => localScripts(c, T).some(s => s.unseen);
+    for (const c of ["python3 imp.py", "python3 rel.py", "node main.js", "node esm.mjs", "python3 -m mypkg", "node -r ./ok.js ok.js",
+      "node --require=./ok.js ok.js", "NODE_OPTIONS=--require=./ok.js node ok.js", "BASH_ENV=./ok.sh bash nul.sh", "PYTHONPATH=. python3 std.py",
+      "node bin/cli", "./mybin hi", "npx some-pkg", "pnpm dlx cowsay", "yarn dlx x", "bunx x", "uvx ruff", "npm exec x", "npm install left-pad",
+      "pip install -r r.txt", "yarn somebin", "go generate ./...", "just deploy", "find . -name '*.sh' -exec bash {} ;"])
+      ok(unseenIn(c), `script: unread code is unseen (${c})`);
+    ok(!unseenIn("python3 std.py") && !unseenIn("node ok.js") && (put("plain.sh", "echo ok\n"), !unseenIn("bash plain.sh 2>/dev/null || true")), "script: stdlib imports and plain scripts stay fully seen");
+    ok(localScripts("sh -c 'bash nul.sh'", T)[0]?.path.endsWith("nul.sh") && pt(`bash -c "./nul.sh"`) === "rm-root", "script: what sh -c runs is read and ruled");
+    const envs = localScripts("source .env", T);
+    ok(envs[0]?.excerpt === "" && envs[0].partial, "script: a credentials file is scanned locally, never shown to Jev");
   } finally { rmSync(T, {recursive: true, force: true}); }
 
   // decide() end to end with a stubbed Jev, logging into a scratch directory
@@ -1039,6 +1093,25 @@ async function selfcheck() {
     ok(await e("prettier --write b", fake({}, "HTTP 500")) === "ask", "allow: a Jev error is the fallback");
     for (const c of ["rm -rf ~", "echo $TYPESAFE_API_KEY", "sed -i '' s/a/b/ ~/.claude/settings.json", "ls", "go test ./..."])
       ok(await e(c) !== "allow", `allow: never for a rule, tamper, secret read, read-only or fast lane (${c})`);
+    // bypasses from the review: each got allow from a "clearly safe" answer about a name
+    for (const c of ["./deploy.sh", "python3 gen.py", "node evil.js", "make release", "npm run ship", "yarn build", "npx some-pkg",
+      "python3 -m tool", "node -r ./hook.js -e 1", "bash -x build.sh", "FOO=1 ./x.sh", "cd a && bash b.sh", "source .env", "uv run x",
+      "pnpm dlx pkg", ".venv/bin/pip install -r r.txt", "npm install zod", "go run ./cmd/x"])
+      ok(await e(c) === "pass", `allow: never for code Jev did not see (${c})`);
+    ok(["prettier --write src/", `python3 -c "print(1)"`, `bash -c "echo 1"`, "docker build -t a .", `echo "./x.sh"`].every(c => !localScripts(c, "/w").length),
+       "allow: inline code, plain tools and quoted text are not unseen code");
+    ok(await e("prettier --write i", undefined, {cwd: `${homedir()}/.`}) === "pass" && await e("prettier --write j", undefined, {cwd: `${homedir()}/x/..`}) === "pass",
+       "allow: a home cwd spelled another way is still broad");
+    const held = await D("prettier --write k", undefined, {unsandboxed: true}), plan = await D("prettier --write l", undefined, {permission_mode: "plan"});
+    ok(held.effective === "pass" && held.decision === "pass" && plan.effective === "pass" && /plan mode/.test(plan.reason),
+       "allow: never skips the unsandboxed-retry prompt or a plan-mode prompt");
+    const alt = join(scratch, "setup");
+    cpSync(CONFIG.setup, alt, {recursive: true});
+    const pol = JSON.parse(readFileSync(join(alt, "policy.json"), "utf8"));
+    writeFileSync(join(alt, "policy.json"), JSON.stringify({...pol, gates: pol.gates.filter(g => g.outcome !== "allow"), default_outcome: "allow"}));
+    CONFIG.setup = alt;
+    ok(/not from an allow gate/.test((await D("prettier --write m")).reason), "allow: a default outcome of allow never allows");
+    CONFIG.setup = saved.setup;
     // Jev sees the script it runs, the cache follows its content, and a part-seen script never allows
     const proj = join(scratch, "proj"), states = [];
     mkdirSync(proj, {recursive: true});

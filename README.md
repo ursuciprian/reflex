@@ -68,7 +68,7 @@ git clone https://github.com/ursuciprian/reflex.git && cd reflex
 export TYPESAFE_API_KEY=...          # from https://console.typesafe.ai/keys — see docs/SETUP.md
 npm test                             # offline self-checks, no API calls
 node gate.mjs --check "terraform apply -auto-approve" --cwd ~/infra/envs/prod
-npm run eval                         # 62 labelled commands through the real gate (~44k tokens)
+npm run eval                         # 65 labelled commands through the real gate (~47k tokens)
 node install.mjs --agent all         # hook into every supported agent found here, shadow mode
 ```
 

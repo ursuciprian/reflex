@@ -52,12 +52,21 @@ hook (see the table in the README). Each adapter turns the agent's event into th
    `.env` file and also talks to the network. Using a key with `-i` does not count.
 
    A hit names the script: `reflex (rule): recursive delete of / or home (in /repo/scripts/reset.sh)`.
-   This runs before the fast lane, so `npm test` is only as safe as the test script. `sh -c`
-   (inline code, already in the command) and `bash -n` are not reads, and a compiled binary is
-   judged by its command.
+   This runs before the fast lane, so `npm test` is only as safe as the test script. The command
+   line `sh -c '…'` runs is inspected like the command itself; `bash -n` is not a read. A compiled
+   program under a system directory (`/usr`, `/bin`, `/opt/homebrew`, …) is judged by its command.
+   A credentials file that gets sourced (`.env`, `.netrc`, keys) is scanned by the rules but never
+   sent to Jev.
 
    Some code is marked unseen, so the command is never allowed:
-   - a named script that cannot be read (missing, or an unknown npm script);
+   - a named script that cannot be read (missing, or a package script the `package.json` lacks,
+     which yarn, pnpm and bun run as a bin);
+   - a package fetched or installed (`npx`, `pnpm dlx`, `bunx`, `uvx`, `npm install x`, `pip install`),
+     a module or preload by name (`python -m`, `node -r` / `--import`, `NODE_OPTIONS`, `BASH_ENV`,
+     `PYTHONPATH`, `LD_PRELOAD`), a task runner (`just`, `task`, `gradle` …), `go generate` / `go run`,
+     and `find -exec` of a script;
+   - the local modules a Python or JavaScript script imports (`import helper`, `require('./x')`);
+   - a compiled program outside the system directories (built in the repo, downloaded);
    - a workspace or filter script (`npm -w`, `pnpm --filter`, `yarn workspace`);
    - code piped into a shell (`curl … | bash`);
    - a file an earlier step of the same command wrote (`curl -o x.sh … && bash x.sh`);
@@ -151,7 +160,7 @@ auto-allowed; a MISS if it is). An `allow` counts as `pass` for `expect`.
 Cases with `"cwd": "$FIXTURES"` run in a temporary copy of `setup/tool-gate/fixtures/`, the
 scripts, Makefile and `package.json` those commands run (each guarded so it exits if run by hand).
 
-Current result: 62 cases, 0 misses, 0 over; 5 of 6 `allow: true` cases allow-eligible. Results are saved to `~/.local/state/reflex/eval-*.json`.
+Current result: 65 cases, 0 misses, 0 over; 5 of 6 `allow: true` cases allow-eligible. Results are saved to `~/.local/state/reflex/eval-*.json`.
 Run it in CI with `TYPESAFE_API_KEY` as a secret to guard policy changes.
 
 **Grow the golden set from real traffic.** Every surprising decision in the trace becomes a case.
@@ -212,11 +221,15 @@ Never allowed, whatever the answers: anything a rule decided (including tamper a
 read-only and fast-lane commands (they stay `pass`, so your permission allowlist still governs
 them), Jev errors and incomplete answers (the `ask` fallback), cached answers (they have lost
 `on_task`), commands without a stated intent (`on_task` defaults to yes then), commands that
-redaction changed (a redacted `--token "$(…)"` could hide a payload), commands whose script Jev
-did not see in full (redacted, over 16 KB, unreadable, or a make target, whose variables are not
-expanded), and commands run from the home directory or `/` (where "inside the working directory"
-means everything). The trace logs
-why as `low risk (not allowed: …)`. `export REFLEX_ALLOW=…` in a command is a tamper `ask`. In Claude Code an allow skips
+redaction changed (a redacted `--token "$(…)"` could hide a payload), commands that run code Jev
+did not see in full (a script that is redacted, over 16 KB, unreadable, a credentials file such as
+`.env`, or imports local modules; a make target, whose variables are not expanded; a compiled
+program outside the system directories; `python -m`, `node -r` / `--import`, `NODE_OPTIONS`,
+`BASH_ENV`, `PYTHONPATH`; `npx` / `dlx` / `uvx`, package installs, task runners, `go generate` /
+`go run`), commands run from the home directory or `/` (where "inside the working directory" means everything),
+and a policy whose `default_outcome` is allow (only the allow gate allows). In Claude Code, a
+command retried outside the sandbox (`dangerouslyDisableSandbox`) and any command in plan mode
+keep their prompt. The trace logs why as `low risk (not allowed: …)`. `export REFLEX_ALLOW=…` in a command is a tamper `ask`. In Claude Code an allow skips
 the prompt but its deny and ask permission rules still apply.
 
 **Calibrate from your own approvals.** Run with `REFLEX_ALLOW=shadow` in enforce mode for a
@@ -292,7 +305,7 @@ and [confidence](https://docs.typesafe.ai/confidence).
   redacted, the working directory path, environment names (AWS profile, region, kube context,
   terraform workspace, git branch), and the agent's last message and last five commands, also
   redacted and truncated, and the first 16 KB of a local script the command runs (a make recipe,
-  an npm script), redacted. Read-only, rule and fast-lane commands never leave the machine.
+  an npm script), redacted, never a credentials file such as `.env`. Read-only, rule and fast-lane commands never leave the machine.
 - **Redaction** covers AWS keys, GitHub / GitLab / Slack / OpenAI-style tokens, bearer and basic
   auth headers, `*SECRET*=`, `*TOKEN*=`, `*PASSWORD*=`, `--password x`, credentials in URLs,
   private key blocks and JWTs. It is a pattern list, not DLP: extend it when you see a new shape.
@@ -319,6 +332,12 @@ and [confidence](https://docs.typesafe.ai/confidence).
   only from simple `VAR=value` lines in the same script. A prod marker on one line and a delete on
   another no longer combine (see above), so `ENV=prod` set elsewhere and used as
   `kubectl delete … -n "$ENV"` is caught only if the variable is assigned in that script.
+- Scripts are read when the hook runs, not when the command runs. A script changed in between (by
+  a parallel tool call, a background job, or a symlink swapped to another file) runs unjudged; the
+  content hash in the cache key only makes an edit before the next call a fresh judgment. No agent
+  hook can pin the file it approved, so treat allow for scripts as "Jev read this version", and
+  keep `REFLEX_ALLOW` off where scripts can change under you. Symlinks are followed to their
+  target; a FIFO or device is never opened.
 - Rules and the read-only list are pattern matching, not a shell parser. They are designed to
   fail towards "ask Jev", not towards "pass", and the self-checks pin the known bypasses — but
   treat them as a strong filter, not a sandbox. Keep IAM, network controls, and least-privilege
