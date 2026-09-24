@@ -1,7 +1,7 @@
 {
   "name": "Agent tool gate",
-  "version": "tool-gate-v3",
-  "subject": "Shell commands an agent wants to run, gated by risk. The gate can only tighten Claude Code's own permissions, never loosen them.",
+  "version": "tool-gate-v4",
+  "subject": "Shell commands an agent wants to run, gated by risk. The gate tightens the agent's own permissions; it loosens them only through the opt-in allow gate (REFLEX_ALLOW=on, enforce mode).",
   "fallback": "ask",
   "params": {
     "denyAt": {
@@ -49,6 +49,37 @@
       "max": 1,
       "step": 0.05,
       "default": 0.6
+    },
+    "allowBlastMax": {
+      "label": "Allow at blast up to",
+      "min": 0,
+      "max": 3,
+      "step": 0.1,
+      "default": 1.2,
+      "note": "Highest blast score a command may have to run without the agent's own prompt (REFLEX_ALLOW)."
+    },
+    "allowConfidence": {
+      "label": "Allow when blast confidence at least",
+      "min": 0,
+      "max": 1,
+      "step": 0.05,
+      "default": 0.7,
+      "note": "Jev must be this sure of the blast score."
+    },
+    "allowRiskBelow": {
+      "label": "Allow when mutates, exfil and injection below",
+      "min": 0,
+      "max": 1,
+      "step": 0.05,
+      "default": 0.3
+    },
+    "allowOnTask": {
+      "label": "Allow when on-task at least",
+      "min": 0,
+      "max": 1,
+      "step": 0.05,
+      "default": 0.5,
+      "note": "A missing on-task answer (a cached one) never allows."
     }
   },
   "flags": {
@@ -67,6 +98,11 @@
       "label": "Ask",
       "color": "#8a5300",
       "blurb": "A human confirms first"
+    },
+    "allow": {
+      "label": "Allow",
+      "color": "#2f6f9f",
+      "blurb": "Clearly safe; runs without the agent's own prompt when REFLEX_ALLOW=on"
     },
     "pass": {
       "label": "Pass",
@@ -131,6 +167,14 @@
       "outcome": "ask",
       "detail": "blast confidence {blast.confidence}",
       "rule": "risk unclear"
+    },
+    {
+      "id": "allow",
+      "label": "Clearly safe?",
+      "test": "blast <= $allowBlastMax and blast.confidence >= $allowConfidence and mutates < $allowRiskBelow and exfil < $allowRiskBelow and injection < $allowRiskBelow and on_task >= $allowOnTask and env == 'local'",
+      "outcome": "allow",
+      "detail": "blast {blast} (confidence {blast.confidence}), mutates {mutates}, on_task {on_task}, {env}",
+      "rule": "clearly safe: blast {blast} at confidence {blast.confidence}"
     }
   ],
   "default_outcome": "pass",

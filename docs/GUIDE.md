@@ -3,8 +3,10 @@
 ## Contents
 
 1. [How a command is decided](#how-a-command-is-decided)
+   - [Subgoal dedup](#subgoal-dedup)
 2. [Testing](#testing)
 3. [Rolling out: shadow, tune, enforce](#rolling-out-shadow-tune-enforce)
+   - [Calibrated allow](#calibrated-allow)
 4. [Changing behaviour](#changing-behaviour)
 5. [Metrics](#metrics)
 6. [Data handling](#data-handling)
@@ -34,17 +36,69 @@ hook (see the table in the README). Each adapter turns the agent's event into th
    Shipped rules: `rm-root`, `prod-destroy`, `force-push-main`, `push-mirror` (deny); `tamper`, `destroy`,
    and — checked even before read-only detection — `secret-read` (the API key, secret stores) and
    `secret-file-read` (`~/.ssh/id_*` but not `.pub`, `~/.aws/credentials`, `.netrc`, `.pgpass`, `.env` / `.env.*` files but not `.env.example` and other templates, `kubectl get secret(s)`) (ask). It fires only when the file is an argument of a command that reads, copies or sends it (`cat`, `less`, `head`/`tail`, `grep`/`rg`/`ag`, `jq`, `sed`/`awk`, `cp`/`scp`/`rsync` as the source, `base64`, `xxd`, `strings`, `od`, `open`, `source`/`.`, `nc`, `tar`/`zip`, `curl -d/-F/-T/--data*`, a routed `mcp` call), at any command position — after `;`, `&&`, `|`, inside `$(…)`, backticks, `bash -c '…'`, `ssh host '…'` — or is redirected in (`< ~/.aws/credentials`). A commit message, `echo`, or `cp .env.example .env` that only names the file passes. Known over-match: a `grep` whose search *pattern* is `.env` (`grep -rn '.env' src/`) asks. Any mutating command that touches the Reflex checkout, its setup files or its logs is also an `ask`, wherever the repo was cloned.
+   Shipped rules: `rm-root`, `prod-destroy`, `force-push-main`, `push-mirror` (deny); `secret-read`, `tamper`, `destroy`, and for scripts `secret-exfil` (ask). Any mutating command that touches the Reflex checkout, its setup files or its logs is also an `ask`, wherever the repo was cloned.
+   **Local scripts.** `bash deploy.sh` says nothing about what it does, so Reflex reads the local
+   file a command runs. It recognises:
+   - `bash`, `sh` and `zsh x.sh` (quoted paths, `< x.sh` and options included);
+   - `source x.sh`, `./x` and `scripts/x`;
+   - `python3`, `node`, `tsx`, `npx tsx`, `bun`, `ruby`, `perl` and `php` with a script, including
+     one run through a path such as `.venv/bin/python`;
+   - `make <target>`: that target's recipe, its direct prerequisites' recipes, and `$(MAKE)` calls;
+   - `npm`, `pnpm` and `yarn` scripts (`run x`, `yarn x`, `test`, and install lifecycle scripts),
+     with their `pre`/`post` hooks.
+
+   It finds these behind subshells, `$(…)`, `if`/`then`, `env`, `sudo`, `nice`, `cd` and line
+   continuations. What a shell script, recipe or package script runs in turn is followed one more
+   level.
+
+   Rules with `"applies_to"` including `"script"` read up to 256 KB of each file. Those rules are
+   `rm-root`, `prod-destroy`, `force-push-main`, `push-mirror`, `destroy` and `tamper`, plus a
+   check for the Reflex checkout and logs. The file is read line by line, with the script's own
+   `VAR=value` assignments expanded and whole-line `#` and `//` comments dropped, so a word on
+   one line cannot combine with a verb on another. The script-only `secret-exfil` rule
+   (`whole_script`) asks when a script copies `~/.ssh`, `~/.aws`, `~/.kube`, `~/.gnupg` or a
+   `.env` file and also talks to the network. Using a key with `-i` does not count.
+
+   A hit names the script: `reflex (rule): recursive delete of / or home (in /repo/scripts/reset.sh)`.
+   This runs before the fast lane, so `npm test` is only as safe as the test script. The command
+   line `sh -c '…'` runs is inspected like the command itself; `bash -n` is not a read. A compiled
+   program under a system directory (`/usr`, `/bin`, `/opt/homebrew`, …) is judged by its command.
+   A credentials file that gets sourced (`.env`, `.netrc`, keys) is scanned by the rules but never
+   sent to Jev.
+
+   Some code is marked unseen, so the command is never allowed:
+   - a named script that cannot be read (missing, or a package script the `package.json` lacks,
+     which yarn, pnpm and bun run as a bin);
+   - a package fetched or installed (`npx`, `pnpm dlx`, `bunx`, `uvx`, `npm install x`, `pip install`),
+     a module or preload by name (`python -m`, `node -r` / `--import`, `NODE_OPTIONS`, `BASH_ENV`,
+     `PYTHONPATH`, `LD_PRELOAD`), a task runner (`just`, `task`, `gradle` …), `go generate` / `go run`,
+     and `find -exec` of a script;
+   - the local modules a Python or JavaScript script imports (`import helper`, `require('./x')`);
+   - a compiled program outside the system directories (built in the repo, downloaded);
+   - a workspace or filter script (`npm -w`, `pnpm --filter`, `yarn workspace`);
+   - code piped into a shell (`curl … | bash`);
+   - a file an earlier step of the same command wrote (`curl -o x.sh … && bash x.sh`);
+   - a third level of nesting;
+   - anything past 8 scripts.
+
+   Lines over 2,000 characters (minified bundles) are left out of the rules, and the script
+   then counts as partly seen. If the scan takes more than 1.5 s, the command gets an `ask`
+   instead of risking the hook's timeout.
 3. **Fast lane** (`rules.json` → `pass`) — known-safe steps: builds, tests, `mkdir`, `git add/commit`,
    pushing a non-main branch. A command passes when every segment is read-only or matches a fast-lane
    pattern. → **pass**, logged.
 4. **Jev** — the command (secrets redacted), its working directory, the environment context and
    the text the agent wrote right before this command and its last five commands (from the session
    transcript; if the command is not in the transcript yet, no intent is sent rather than an older one) are sent to
-   TypeSafe with the six questions in `questions.json`. Answers are cached for 24 h per
-   (command, cwd, environment, question-set version, model).
+   TypeSafe with the six questions in `questions.json`. When the command runs a local script, its
+   redacted excerpt goes along as `call.script = {path, excerpt}` and the question context tells Jev
+   to judge the script, not its name (`node clean.mjs` that deletes `$HOME` is an ask, not a pass).
+   Answers are cached for 24 h per (command, cwd, environment, question-set version, model, script
+   content), so an edited script is judged again.
 5. **Policy** (`policy.json`) — ordered gates over the answers; the first that fires wins,
    otherwise `default_outcome` (`pass`). If Jev fails or times out, the policy's `fallback` (`ask`)
-   applies.
+   applies. The last gate, `allow`, marks clearly safe commands; what that means depends on
+   `REFLEX_ALLOW` (see [Calibrated allow](#calibrated-allow)).
 
 What happens with the decision depends on the mode:
 
@@ -55,7 +109,7 @@ What happens with the decision depends on the mode:
 | `enforce` | enforced | `ask` → a human confirms (how depends on the agent, see the README table); `deny` → the command is blocked and the agent sees why |
 
 `pass` is never turned into an approval: the gate stays silent and the agent's own permission
-settings decide. Where an agent combines several hooks (Claude Code, Codex, Hermes), the most
+settings decide. Only an `allow` with `REFLEX_ALLOW=on` in enforce mode approves anything. Where an agent combines several hooks (Claude Code, Codex, Hermes), the most
 restrictive decision wins, so Reflex composes with the hooks you already run.
 
 **Custom integrations** use the same contract from any language:
@@ -65,6 +119,75 @@ echo '{"agent":"my-bot","command":"terraform apply","cwd":"/infra/prod"}' | node
 # {"effective":"ask","decision":"ask","reason":"reflex (jev): changes production","source":"jev","policy":"tool-gate-v2"}
 echo '{"agent":"my-bot","call_id":"42","exit_code":0}' | node gate.mjs --record
 ```
+
+### Subgoal dedup
+
+Before an agent spawns a subagent, the adapter sends the subgoal instead of a command:
+`{agent, subgoal, session_id, call_id, cwd}`, or `subgoals: [...]` for a batch. A call that also
+carries a `command` is judged as a command.
+
+| Agent | Tool (hook) | Subgoal |
+|---|---|---|
+| Claude Code | `Agent` / `Task` (`PreToolUse`, matcher `Bash\|Task\|Agent`) | `agent: <subagent_type>`, description, prompt |
+| Codex CLI | `spawn_agent` (`PreToolUse`, matcher `^(Bash\|spawn_agent)$`, Codex 0.155+) | `agent: <agent_type>`, task name, message (or its text items) |
+| oh-my-pi | `task` (`tool_call`) | per task: `agent: <agent>`, task, the batch's shared context cut to 200 characters |
+| opencode | `task` (`tool.execute.before`) | `agent: <subagent_type>`, description, prompt |
+| Hermes | `delegate_task` (`pre_tool_call`, its own entry without `fail_closed`) | per task: goal, context cut to 300 characters |
+
+pi has no subagents. Codex's `SubagentStart` hook is not used: its input has no task text and it
+cannot block. Resumes (Claude Code `resume`, opencode `task_id`) and Hermes control actions
+(`list`, `steer`, `stop`) are not checked. A subagent that spawns its own subagents (Claude Code,
+Codex) is compared only with its own earlier ones.
+
+Reflex keeps the subgoals of each session in `subgoals.jsonl` in the data directory, and asks Jev
+one `choice` question per new subgoal (`setup/tool-gate/subgoals.json`). The options are the
+last 20 earlier subgoals of the same agent and session that count, plus `none`:
+
+- one whose spawn **ran** (a `ran` record from the post hook), or
+- one still **pending**: written when its own check started, with no record yet, less than
+  `pendingSeconds` (300) ago. Every subgoal is written first and then compared only with the
+  rows before it, so spawns in the same message, and tasks in the same batch, see each other: of
+  two identical ones, the first passes and the second is the duplicate.
+
+A spawn Reflex denied is marked dropped at once; one the user rejected, another hook blocked or
+that failed (a `denied` or `failed` record) is never offered either, since it has no result to
+reuse. Long options keep their first 400 and last 200 characters. The question is "does this
+repeat one of them: same task, same scope, same kind of answer?" Follow-ups, other parts of the
+problem, reviews of earlier work and retries that say why the first attempt failed count as
+`none`.
+
+If the chosen option's probability is at least `duplicateAt` (0.6), that subgoal is a duplicate.
+A single spawn is denied, with a reason that names the earlier subgoal and tells the agent to
+reuse its result:
+
+```
+reflex (jev): duplicates a subgoal already launched in this session at 22:24 UTC (p 0.67):
+"agent: Explore\nFind auth flow\nExplain how login works end to end …". Reuse that result instead of starting it again
+```
+
+A batch loses only its duplicate tasks where the tool input can be trimmed: oh-my-pi runs the
+`task` call with the rest and appends to its result which tasks were not started and why. Hermes
+cannot be told which tasks a trimmed call dropped, so a Hermes batch with a duplicate is blocked
+with the list ("Start the others again without task 2"), and all its tasks are dropped, so the
+resend passes. A batch whose every task is a duplicate is denied.
+
+- **Modes:** as elsewhere. In shadow mode the check runs in the background, and duplicates are
+  logged as `deny` but not applied.
+- **Failures:** dedup saves work rather than guarding safety, so a Jev error or an internal error
+  always passes, and the Hermes entry is not fail-closed.
+- **What is stored:** `subgoals.jsonl` holds each subgoal once, redacted and cut to 2,000
+  characters, because later checks need the text. The trace keeps only a 120-character title and a
+  hash per check, never the earlier subgoals offered as options.
+- **Report:** `report.mjs` counts these checks on their own `subgoals` line.
+
+The same text again (ignoring case, spacing and a batch's shared context line) is a duplicate
+without asking Jev: Jev scores an option identical to the new subgoal low (0.2–0.3), apparently
+reading it as the new subgoal itself. On hand-made pairs with `subgoals-v3`, reworded duplicates
+scored 0.67–0.78 on the matching option, and ten legitimate follow-ups (tests for the same code,
+another part, a review, a retry that says why, a narrower scope) scored at most 0.05.
+
+ponytail: each check reads the last 2 MB of `subgoals.jsonl` and `feedback.jsonl` and takes no lock
+(each batch is one append).
 
 ## Testing
 
@@ -108,7 +231,14 @@ node eval.mjs --only terraform   # a subset
 - **MISS** — a risky command got a softer outcome than wanted (exit code 1; treat as a blocker);
 - **over** — stricter than wanted (friction; fix when it is common).
 
-Current result: 44 cases, 0 misses, 0 over. Results are saved to `~/.local/state/reflex/eval-*.json`.
+A case can also carry `"allow": true` (a clearly safe command that should be allow-eligible;
+reported as `stiff` when it is not, never a failure) or `"allow": false` (must never be
+auto-allowed; a MISS if it is). An `allow` counts as `pass` for `expect`.
+
+Cases with `"cwd": "$FIXTURES"` run in a temporary copy of `setup/tool-gate/fixtures/`, the
+scripts, Makefile and `package.json` those commands run (each guarded so it exits if run by hand).
+
+Current result: 65 cases, 0 misses, 0 over; 5 of 6 `allow: true` cases allow-eligible. Results are saved to `~/.local/state/reflex/eval-*.json`.
 Run it in CI with `TYPESAFE_API_KEY` as a secret to guard policy changes.
 
 **Grow the golden set from real traffic.** Every surprising decision in the trace becomes a case.
@@ -144,6 +274,64 @@ To test enforce behaviour without switching your whole setup, start one session 
 4. **Watch the ask outcomes.** In enforce mode `report.mjs` scores each emitted ask as approved
    (the command ran) or rejected. An ask that is nearly always approved is friction: tune it.
    A deny someone keeps working around is a missing fast-lane pattern.
+
+### Calibrated allow
+
+Autonomous agents stop at every prompt their own permissions require, even for `npx prettier
+--write src/`. The policy's last gate, `allow`, marks commands Jev judges clearly safe:
+
+```
+blast <= $allowBlastMax (1.2) and blast.confidence >= $allowConfidence (0.7)
+and mutates, exfil, injection < $allowRiskBelow (0.3) and on_task >= $allowOnTask (0.5)
+and env == 'local'
+```
+
+It is the last gate, so every deny and ask gate wins over it, and a missing answer makes it false.
+`REFLEX_ALLOW` (or `node install.mjs --allow …`) decides what an allow does:
+
+| `REFLEX_ALLOW` | Logged decision | Effect |
+|---|---|---|
+| `off` (default) | `pass` | none: the gate only tightens |
+| `shadow` | `would_allow` | none; `report.mjs` measures it |
+| `on` | `allow` in enforce mode, `would_allow` otherwise | the agent's own prompt is skipped (see the README table per agent) |
+
+Never allowed, whatever the answers: anything a rule decided (including tamper and secret reads),
+read-only and fast-lane commands (they stay `pass`, so your permission allowlist still governs
+them), Jev errors and incomplete answers (the `ask` fallback), cached answers (they have lost
+`on_task`), commands without a stated intent (`on_task` defaults to yes then), commands that
+redaction changed (a redacted `--token "$(…)"` could hide a payload), commands that run code Jev
+did not see in full (a script that is redacted, over 16 KB, unreadable, a credentials file such as
+`.env`, or imports local modules; a make target, whose variables are not expanded; a compiled
+program outside the system directories; `python -m`, `node -r` / `--import`, `NODE_OPTIONS`,
+`BASH_ENV`, `PYTHONPATH`; `npx` / `dlx` / `uvx`, package installs, task runners, `go generate` /
+`go run`), commands run from the home directory or `/` (where "inside the working directory" means everything),
+and a policy whose `default_outcome` is allow (only the allow gate allows). In Claude Code, a
+command retried outside the sandbox (`dangerouslyDisableSandbox`) and any command in plan mode
+keep their prompt. The trace logs why as `low risk (not allowed: …)`. `export REFLEX_ALLOW=…` in a command is a tamper `ask`. In Claude Code an allow skips
+the prompt but its deny and ask permission rules still apply.
+
+**Calibrate from your own approvals.** Run with `REFLEX_ALLOW=shadow` in enforce mode for a
+while. `node report.mjs` then shows, for the Jev-judged commands a human ruled on (asks it emitted
+in enforce mode, and in Claude Code the commands allow would have let through — logged
+`would_allow` or allowed on replay), how often you approved them (approved = the command ran), by
+blast and by confidence bucket, and recommends
+thresholds (illustrative output):
+
+```
+  calibration  64 labelled (asks in enforce mode + would-be allows; approved = it ran)
+    by blast       0-0.5 12/12 (100%) · 0.5-1 30/31 (97%) · 1-1.5 9/11 (82%) · …
+    recommend      of 41 with blast <= 1 and confidence >= 0.8, you approved 98% -> allowBlastMax 1, allowConfidence 0.8
+```
+
+It recommends the band covering the most commands you approved at least 95% of (10 or more
+labelled), the tightest among equals, and says "not enough data" otherwise. Other agents have no
+prompt for a pass, so their would-be allows are not labels, and neither are Claude Code's in a
+permission mode other than `default` (the trace logs `permission_mode`); a command its allowlist
+let through still counts as approved, which flatters the rate a little.
+`node report.mjs --calibration` prints the expected calibration error of `blast` and `mutates`
+read as approval probabilities (1 − blast/3, 1 − mutates) against your approvals, per bin; it
+needs 20 labelled commands. Move the `allow*` params in `policy.json`, check with
+`node report.mjs --policy`, then switch to `REFLEX_ALLOW=on`.
 
 ## Changing behaviour
 
@@ -194,7 +382,10 @@ and [confidence](https://docs.typesafe.ai/confidence).
 - **What leaves the machine:** for commands that reach Jev only — the command with secrets
   redacted, the working directory path, environment names (AWS profile, region, kube context,
   terraform workspace, git branch), and the agent's last message and last five commands, also
-  redacted and truncated. Read-only, rule and fast-lane commands never leave the machine.
+  redacted and truncated, and the first 16 KB of a local script the command runs (a make recipe,
+  an npm script), redacted, never a credentials file such as `.env`. Read-only, rule and fast-lane commands never leave the machine.
+  For subgoal dedup: the new subagent's task and the session's earlier ones, redacted and
+  truncated to 2,000 characters (600 per earlier subgoal).
 - **Redaction** covers AWS keys, GitHub / GitLab / Slack / OpenAI-style tokens, bearer and basic
   auth headers, `*SECRET*=`, `*TOKEN*=`, `*PASSWORD*=`, `--password x`, credentials in URLs,
   private key blocks and JWTs. It is a pattern list, not DLP: extend it when you see a new shape.
@@ -222,24 +413,39 @@ and [confidence](https://docs.typesafe.ai/confidence).
 
 ## Safety properties and limits
 
-- The gate never emits `allow`. The worst a wrong Jev answer can do is add a prompt, or fail to
-  add one; it cannot remove one that your permission rules require.
+- By default the gate never emits `allow`. The worst a wrong Jev answer can do is add a prompt, or
+  fail to add one; it cannot remove one that your permission rules require. With
+  `REFLEX_ALLOW=on` a wrong answer can remove one, for the narrow allow gate only: calibrate in
+  shadow first.
 - A Jev failure or timeout gives the policy's `fallback` (`ask`) in enforce mode.
 - An internal error (bad setup file, unreadable cache) returns the policy fallback (`ask`) in
   enforce mode and `pass` in shadow mode. Incomplete Jev answers count as an error, never as "no".
   The pi/omp and opencode adapters block when the gate cannot run at all in enforce mode.
+- Script inspection recognises the launchers listed above, two levels deep, and reads 256 KB per
+  file for the rules. A script that `curl | sh`s another, a path held in a variable, a third level
+  of nesting, or a danger past 256 KB is judged only on what is visible. Variables are expanded
+  only from simple `VAR=value` lines in the same script. A prod marker on one line and a delete on
+  another no longer combine (see above), so `ENV=prod` set elsewhere and used as
+  `kubectl delete … -n "$ENV"` is caught only if the variable is assigned in that script.
+- Scripts are read when the hook runs, not when the command runs. A script changed in between (by
+  a parallel tool call, a background job, or a symlink swapped to another file) runs unjudged; the
+  content hash in the cache key only makes an edit before the next call a fresh judgment. No agent
+  hook can pin the file it approved, so treat allow for scripts as "Jev read this version", and
+  keep `REFLEX_ALLOW` off where scripts can change under you. Symlinks are followed to their
+  target; a FIFO or device is never opened.
 - Rules and the read-only list are pattern matching, not a shell parser. They are designed to
   fail towards "ask Jev", not towards "pass", and the self-checks pin the known bypasses — but
   treat them as a strong filter, not a sandbox. Keep IAM, network controls, and least-privilege
   credentials: Reflex supplements them.
 - Claude Code does not report a Bash exit code to hooks; Reflex records `ran` (exit 0) or
   `failed` from `PostToolUse` / `PostToolUseFailure`.
-- Only shell tools are gated (`Bash`, pi/omp `bash`, opencode `bash`, Hermes `terminal`). File-edit
+- Only shell tools are gated (`Bash`, pi/omp `bash`, opencode `bash`, Hermes `terminal`), plus the subagent tools for dedup. File-edit
   tools, MCP tools, omp's `eval` and Hermes' `execute_code` go through each agent's own permissions.
   The tool router is the exception: it runs its command tools and its downstream MCP calls through
   the gate itself.
 - Codex and opencode hooks cannot open a prompt, so an `ask` blocks with a reason telling the agent
-  to get your confirmation. Codex passes the session directory as `cwd`, not a per-command
+  to get your confirmation. Codex hooks cannot allow either (an allow falls through), so `allow`
+  is a silent pass there. Codex passes the session directory as `cwd`, not a per-command
   `workdir`. Codex hooks must be trusted in `/hooks` before they run.
 - Environment context comes from the agent's process environment. A command that switches
   profile inline (`AWS_PROFILE=prod aws …`) is still seen, because the command text is judged; a

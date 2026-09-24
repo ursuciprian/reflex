@@ -12,11 +12,13 @@ import {spawnSync} from "node:child_process";
 const GATE = process.env.REFLEX_GATE ?? "__REFLEX_GATE__";
 const NODE = process.env.REFLEX_NODE ?? "__REFLEX_NODE__";
 const MODE = process.env.REFLEX_MODE ?? "__REFLEX_MODE__";
+const ALLOW = process.env.REFLEX_ALLOW ?? "__REFLEX_ALLOW__";
 const INSTRUCTIONS = GATE.replace(/gate\.mjs$/, "instructions.mjs");
 const selected = new Map();   // sessionID -> injected text. ponytail: never pruned; one short string per session.
 
 function gate(flag, payload, script = GATE) {
-  const r = spawnSync(NODE, [script, flag, "--mode", MODE], {input: JSON.stringify(payload), encoding: "utf8", timeout: 10000});
+  const args = script === GATE ? [script, flag, "--mode", MODE, "--allow", ALLOW] : [script, flag, "--mode", MODE];
+  const r = spawnSync(NODE, args, {input: JSON.stringify(payload), encoding: "utf8", timeout: 10000});
   return r.stdout;
 }
 
@@ -34,6 +36,18 @@ export const Reflex = async ({directory}) => ({
     if (text) output.system.push(text);
   },
   "tool.execute.before": async (input, output) => {
+    if (input.tool === "task") {
+      // Subgoal dedup: a subagent asked to repeat work already delegated in this session.
+      const a = output.args ?? {};
+      if (!a.prompt || a.task_id) return;   // task_id resumes earlier work on purpose
+      let d;
+      try {
+        d = JSON.parse(gate("--decide", {agent: "opencode", subgoal: [a.subagent_type && `agent: ${a.subagent_type}`, a.description, a.prompt]
+          .filter(Boolean).join("\n"), cwd: directory, session_id: input.sessionID, call_id: input.callID}));
+      } catch { return; }   // dedup saves work; it never blocks when the gate cannot run
+      if (d.effective === "deny") throw new Error(d.reason);
+      return;
+    }
     if (input.tool !== "bash") return;
     let d;
     try {
@@ -44,10 +58,13 @@ export const Reflex = async ({directory}) => ({
       if (MODE === "enforce") throw new Error("reflex: gate unavailable, blocked (fail-closed)");
       return;
     }
+    // pass and allow both run: opencode has no prompt of its own here to skip.
     if (d.effective === "deny") throw new Error(d.reason);
     if (d.effective === "ask") throw new Error(`${d.reason}. Needs human approval: ask the user to confirm before running it.`);
   },
   "tool.execute.after": async (input, output) => {
+    // A task that ran is a launched subgoal: dedup offers only those.
+    if (input.tool === "task") return void gate("--record", {agent: "opencode", event: "ran", session_id: input.sessionID, call_id: input.callID});
     if (input.tool !== "bash") return;
     gate("--record", {agent: "opencode", event: "ran", session_id: input.sessionID, call_id: input.callID,
                       exit_code: output?.metadata?.exit ?? null});

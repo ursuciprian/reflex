@@ -1,6 +1,6 @@
 {
-  "version": "rules-v8",
-  "note": "Deterministic and authoritative: checked before Jev, enforced even in shadow mode. Patterns are case-insensitive and run over the command plus its context (cwd=, aws_profile=, kube_context=, tf_workspace=, git_branch=). A rule fires when every pattern in `all` matches. `pass` patterns apply per segment: a command passes the fast lane when every segment is read-only or matches one.",
+  "version": "rules-v9",
+  "note": "Deterministic and authoritative: checked before Jev, enforced even in shadow mode. Patterns are case-insensitive and run over the command plus its context (cwd=, aws_profile=, kube_context=, tf_workspace=, git_branch=). A rule fires when every pattern in `all` matches. `pass` patterns apply per segment: a command passes the fast lane when every segment is read-only or matches one. `applies_to` says what a rule reads: the command (the default) and/or the local scripts the command runs. Script rules run line by line, with the script's simple VAR=value assignments expanded and whole-line comments dropped; `whole_script` rules see the whole body. `context: false` rules read the command without the cwd=/profile context.",
   "rules": [
     {
       "id": "secret-read",
@@ -24,23 +24,35 @@
       "id": "rm-root",
       "outcome": "deny",
       "rule": "recursive delete of / or home",
+      "applies_to": [
+        "command",
+        "script"
+      ],
       "all": [
-        "\\brm\\s+(-{1,2}[a-z-]+\\s+)*(--\\s+)?\\\"?(/|~|\\$home|\\$\\{home\\})\\\"?/?\\*?(\\s|$|[;&|)`'\"])"
+        "\\brm\\s+(-[a-z-]+\\s+)*(--\\s+)?\\\"?(/|~|\\$home|\\$\\{home\\})\\\"?/?\\*?(\\s|$|[;&|)`'\"])"
       ]
     },
     {
       "id": "prod-destroy",
       "outcome": "deny",
       "rule": "destructive operation on production",
+      "applies_to": [
+        "command",
+        "script"
+      ],
       "all": [
         "\\b(prod(uction)?|prd|live)(\\d+|\\b|_)",
-        "(\\baws\\s+\\S+\\s+(delete|terminate|remove|deregister)-|\\baws\\s+s3\\s+(rm\\b.*--recursive|rb\\b)|\\bkubectl\\b.*\\s(delete|drain)\\s|\\bkubectl\\b.*\\sscale\\b.*--replicas[= ]0\\b|\\bterraform\\s+(destroy|state\\s+rm|apply\\b.*\\s-(destroy|replace))|\\bhelm\\s+(uninstall|delete)\\s|\\b(drop\\s+(database|table|schema)|truncate(\\s+table)?\\s+\\w+|delete\\s+from)\\b|\\b(gcloud|az)\\b.*\\sdelete\\b)"
+        "(\\baws\\s+\\S+\\s+(delete|terminate|remove|deregister)-|\\baws\\s+s3\\s+(rm\\b.*--recursive|rb\\b)|\\bkubectl\\b.*\\s(delete|drain)\\s|\\bkubectl\\b.*\\sscale\\b.*--replicas[= ]0\\b|\\bterraform\\s+(-chdir=\\S+\\s+)?(destroy|state\\s+rm|apply\\b.*\\s-(destroy|replace))|\\bhelm\\s+(uninstall|delete)\\s|\\b(drop\\s+(database|table|schema)\\b|truncate\\s+(table\\s+)?[\\w.\"]+\\s*(;|'|\"|$|\\bcascade\\b|\\brestart\\b)|delete\\s+from\\b)|\\b(gcloud|az)\\b.*\\sdelete\\b)"
       ]
     },
     {
       "id": "force-push-main",
       "outcome": "deny",
       "rule": "force push or delete of main/master",
+      "applies_to": [
+        "command",
+        "script"
+      ],
       "all": [
         "\\bgit\\s+push\\b[^;&|]*(--force\\b|--force-with-lease\\b|--delete\\b|\\s-[a-zA-Z]*[fd][a-zA-Z]*\\b|\\s\\+|\\s:)",
         "\\b(main|master)\\b"
@@ -50,24 +62,58 @@
       "id": "push-mirror",
       "outcome": "deny",
       "rule": "mirror push rewrites every remote ref",
+      "applies_to": [
+        "command",
+        "script"
+      ],
       "all": [
         "\\bgit\\s+push\\b[^;&|]*--mirror\\b"
+      ]
+    },
+    {
+      "id": "secret-exfil",
+      "outcome": "ask",
+      "applies_to": [
+        "script"
+      ],
+      "rule": "script reads credentials or a .env file and talks to the network",
+      "whole_script": true,
+      "all": [
+        "(\\bcat\\b|\\bbase64\\b|\\b(tar|zip|gzip|openssl|scp|rsync)\\b[^\\n]{0,300}|\\bcurl\\b[^\\n]{0,300}(-T|--upload-file|-F|--form|-d|--data[\\w-]*)\\s*[^\\s<@;]{0,100}|<|@)\\s*[\"']?(?<!-i\\s*[\"']?)((~|\\$home|\\$\\{home\\})/\\.(ssh|aws|kube|gnupg)\\b|([^\\s<@;]{0,200}/)?\\.env(?![\\w.]))",
+        "\\b(curl|wget|nc|ncat|netcat|socat|scp|rsync|sftp|ftp)\\b|/dev/(tcp|udp)/"
       ]
     },
     {
       "id": "tamper",
       "outcome": "ask",
       "rule": "touches the Reflex gate or agent settings",
+      "context": false,
+      "applies_to": [
+        "command",
+        "script"
+      ],
       "all": [
-        "(/reflex(/|\\s|$)|\\.claude/(settings|hooks)|\\.codex/(hooks\\.json|config\\.toml|rules)|\\.hermes/.*config\\.yaml|opencode/(plugins?|opencode\\.jsonc?)|\\.(pi|omp)/agent/(extensions|settings)|reflex_mode)"
+        "(/reflex(/|\\s|$)|\\.claude/(settings|hooks)|\\.codex/(hooks\\.json|config\\.toml|rules)|\\.hermes/.*config\\.yaml|opencode/(plugins?|opencode\\.jsonc?)|\\.(pi|omp)/agent/(extensions|settings)|reflex_(mode|allow))"
+      ]
+    },
+    {
+      "id": "tamper",
+      "outcome": "ask",
+      "rule": "changes files in an agent settings or hooks directory",
+      "all": [
+        "cwd=\\S*(\\.claude/(settings|hooks)|\\.codex/(hooks|rules)|\\.hermes/|opencode/plugins?|\\.(pi|omp)/agent/(extensions|settings))"
       ]
     },
     {
       "id": "destroy",
       "outcome": "ask",
       "rule": "destructive operation",
+      "applies_to": [
+        "command",
+        "script"
+      ],
       "all": [
-        "(\\baws\\s+\\S+\\s+(delete|terminate|remove|deregister)-|\\baws\\s+s3\\s+(rm\\b.*--recursive|rb\\b)|\\bkubectl\\b.*\\s(delete|drain)\\s|\\bkubectl\\b.*\\sscale\\b.*--replicas[= ]0\\b|\\bterraform\\s+(destroy|state\\s+rm|apply\\b.*\\s-(destroy|replace))|\\bhelm\\s+(uninstall|delete)\\s|\\b(drop\\s+(database|table|schema)|truncate(\\s+table)?\\s+\\w+|delete\\s+from)\\b|\\b(gcloud|az)\\b.*\\sdelete\\b)"
+        "(\\baws\\s+\\S+\\s+(delete|terminate|remove|deregister)-|\\baws\\s+s3\\s+(rm\\b.*--recursive|rb\\b)|\\bkubectl\\b.*\\s(delete|drain)\\s|\\bkubectl\\b.*\\sscale\\b.*--replicas[= ]0\\b|\\bterraform\\s+(-chdir=\\S+\\s+)?(destroy|state\\s+rm|apply\\b.*\\s-(destroy|replace))|\\bhelm\\s+(uninstall|delete)\\s|\\b(drop\\s+(database|table|schema)\\b|truncate\\s+(table\\s+)?[\\w.\"]+\\s*(;|'|\"|$|\\bcascade\\b|\\brestart\\b)|delete\\s+from\\b)|\\b(gcloud|az)\\b.*\\sdelete\\b)"
       ]
     }
   ],

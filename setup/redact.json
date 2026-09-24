@@ -16,7 +16,7 @@
   { "pattern": "(authorization:\\s*(bearer|basic|token)\\s+)\\S+", "flags": "i", "replace": "$1<redacted>"},
   { "pattern": "((cookie|x-[\\w-]*(auth|token|key)[\\w-]*):\\s*)[^'\"\\n]+", "flags": "i", "replace": "$1<redacted>"},
   { "pattern": "(\\b[\\w.-]*(secret|token|passw(or)?d|api[_-]?key|access[_-]?key|credential)[\\w.-]*\"?\\s*[=:]\\s*)(\"[^\"]*\"|'[^']*'|\\S+)", "flags": "i", "replace": "$1<redacted>"},
-  { "pattern": "(--?(password|passwd|token|secret|api-key)[= ]\\s*)(\"[^\"]*\"|'[^']*'|\\S+)", "flags": "i", "replace": "$1<redacted>"},
+  { "pattern": "((?:^|\\s)--?(password|passwd|token|secret|api-key)[= ]\\s*)(\"[^\"]*\"|'[^']*'|\\S+)", "flags": "i", "replace": "$1<redacted>"},
   { "pattern": "((\\s-u|--user)\\s+[^\\s:]+:)\\S+", "flags": "", "replace": "$1<redacted>"},
   { "pattern": "(\\b(mysql|mariadb)\\b[^|;&]*\\s-p)(\\S+)", "flags": "", "replace": "$1<redacted>"},
   { "pattern": "(\\bsshpass\\s+-p\\s*)\\S+", "flags": "", "replace": "$1<redacted>"},
@@ -36,6 +36,8 @@
   {"in": "DB_PASSWORD='p a s s' API_KEY=\"q w\" client_secret: s3", "out": "DB_PASSWORD=<redacted> API_KEY=<redacted> client_secret: <redacted>"},
   {"in": "café AKIAABCDEFGHIJKLMNOP naïve_token=é1", "out": "café <redacted> naïve_token=<redacted>"},
   {"in": "postgres://admin:Sup3r@db.internal:5432/app", "out": "postgres://admin:<redacted>@db.internal:5432/app"},
-  {"in": "éAKIAABCDEFGHIJKLMNOP and ghp_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZé", "out": "é<redacted> and <redacted>é"}
+  {"in": "éAKIAABCDEFGHIJKLMNOP and ghp_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZé", "out": "é<redacted> and <redacted>é"},
+  {"in": "REFLEX_KEYCHAIN_SERVICE=dev/typesafe-ai-api-key npm run eval", "out": "REFLEX_KEYCHAIN_SERVICE=dev/typesafe-ai-api-key npm run eval"},
+  {"in": "tool --api-key abc123 -token t0k", "out": "tool --api-key <redacted> -token <redacted>"}
  ]
 }

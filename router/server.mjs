@@ -255,7 +255,7 @@ async function runShell(tool, args, intent) {
   const command = [tool.bin, ...list].map(shellQuote).join(" ");
   const d = await decideSafe({agent: "reflex-router", command, cwd: process.cwd(), intent});
   if (d.effective === "deny") return {status: "denied", tool: tool.name, command, reason: d.reason};
-  if (d.effective !== "pass") return {status: "needs_approval", tool: tool.name, command, reason: d.reason,
+  if (!["pass", "allow"].includes(d.effective)) return {status: "needs_approval", tool: tool.name, command, reason: d.reason,
     message: "Not run: this needs human approval. Ask the user to confirm, then run it through your own shell tool."};
   const r = await new Promise(res => execFile(tool.bin, list, {cwd: process.cwd(), env: childEnv(), timeout: R.execTimeoutMs, maxBuffer: 16 << 20},
     (err, stdout, stderr) => res({exit_code: err ? (typeof err.code === "number" ? err.code : 1) : 0, stdout, stderr,
@@ -273,7 +273,7 @@ export async function runMcp(t, args, intent) {
   if (!t.trusted) {
     const d = await decideSafe({agent: "reflex-router", command, cwd: process.cwd(), intent});
     if (d.effective === "deny") return {status: "denied", tool: t.name, args, reason: d.reason};
-    if (d.effective !== "pass") return {status: "needs_approval", tool: t.name, args, reason: d.reason,
+    if (!["pass", "allow"].includes(d.effective)) return {status: "needs_approval", tool: t.name, args, reason: d.reason,
       message: "Not run: this needs human approval. Ask the user to confirm, then call it through a server registered directly in the agent."};
     // The agent's per-tool MCP permissions only see `run`, so a tool that may write must not hide
     // behind it, whatever the gate says (in shadow mode Jev's opinion is only logged).
