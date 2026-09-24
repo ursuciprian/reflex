@@ -107,6 +107,16 @@ node install.mjs --agent all --mode enforce     # or --mode off to disable every
 `REFLEX_MODE` in the environment overrides the installed mode for one session, e.g.
 `REFLEX_MODE=enforce claude` to try enforce without changing the install.
 
+## 6. Optional: let clearly safe commands through
+
+```sh
+node install.mjs --agent all --mode enforce --allow shadow   # log would_allow, change nothing
+node report.mjs                                              # calibration section, after a while
+node install.mjs --agent all --mode enforce --allow on       # skip the agent's prompt for them
+```
+
+See [Calibrated allow](GUIDE.md#calibrated-allow). `REFLEX_ALLOW` overrides the installed value.
+
 ## Configuration
 
 All optional.
@@ -115,6 +125,7 @@ All optional.
 |---|---|---|
 | `TYPESAFE_API_KEY` | — | API key (or use the Keychain item) |
 | `REFLEX_MODE` | installed `--mode`, else `shadow` | `off` · `shadow` (rules enforce, Jev logs only) · `enforce` |
+| `REFLEX_ALLOW` | installed `--allow`, else `off` | `off` · `shadow` (log `would_allow`) · `on` (clearly safe commands skip the agent's prompt; enforce mode only) |
 | `REFLEX_MODEL` | `jev-1.13.0` | Pinned model; `jev-latest` follows TypeSafe's current version |
 | `REFLEX_TIMEOUT_MS` | `3000` | Budget for one Jev call, retry included; on timeout the policy fallback applies |
 | `REFLEX_SETUP_DIR` | `./setup/tool-gate` | Directory with rules / questions / policy / golden |

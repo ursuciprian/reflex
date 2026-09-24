@@ -9,13 +9,15 @@ import {spawn} from "node:child_process";
 const GATE = process.env.REFLEX_GATE ?? "__REFLEX_GATE__";
 const NODE = process.env.REFLEX_NODE ?? "__REFLEX_NODE__";
 const MODE = process.env.REFLEX_MODE ?? "__REFLEX_MODE__";
+const ALLOW = process.env.REFLEX_ALLOW ?? "__REFLEX_ALLOW__";
 const AGENT = "__REFLEX_AGENT__";
 
-type Decision = {effective: "pass" | "ask" | "deny"; reason?: string};
+// pass and allow both run: pi and omp have no prompt of their own for bash to skip.
+type Decision = {effective: "pass" | "allow" | "ask" | "deny"; reason?: string};
 
 function gate(flag: string, payload: unknown, signal?: AbortSignal): Promise<string> {
   return new Promise(resolve => {
-    const p = spawn(NODE, [GATE, flag, "--mode", MODE], {signal, stdio: ["pipe", "pipe", "ignore"]});
+    const p = spawn(NODE, [GATE, flag, "--mode", MODE, "--allow", ALLOW], {signal, stdio: ["pipe", "pipe", "ignore"]});
     let out = "";
     const t = setTimeout(() => p.kill("SIGKILL"), 20_000);   // omp gives a handler 30 s
     p.stdout.on("data", d => (out += d));

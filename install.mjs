@@ -10,6 +10,7 @@
 //   node install.mjs --agent all             every agent found on this machine
 //
 //   --mode shadow|enforce|off   (default shadow)   --node <path>   --uninstall
+//   --allow off|shadow|on       (default off) let clearly safe commands skip the agent's prompt (enforce only)
 import {copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync} from "node:fs";
 import {execFileSync} from "node:child_process";
 import {homedir} from "node:os";
@@ -28,12 +29,15 @@ const REPO = dirname(fileURLToPath(import.meta.url));
 const GATE = join(REPO, "gate.mjs");
 const MODE = opt("--mode", "shadow");
 const NODE = opt("--node", process.execPath);   // absolute, so hooks work without the shell's PATH
+const ALLOW = opt("--allow", "off");
 const UNINSTALL = argv.includes("--uninstall");
 if (!["off", "shadow", "enforce"].includes(MODE)) throw new Error("--mode must be off, shadow or enforce");
+if (!["off", "shadow", "on"].includes(ALLOW)) throw new Error("--allow must be off, shadow or on");
+if (ALLOW === "on" && MODE !== "enforce") console.error(`note: --allow on only takes effect with --mode enforce; in ${MODE} mode allows are logged as would_allow`);
 if (Number(process.versions.node.split(".")[0]) < 18) throw new Error(`node 18+ required, found ${process.versions.node}`);
 
 const q = s => `"${s}"`;
-const cmd = flag => `${q(NODE)} ${q(GATE)} ${flag} --mode ${MODE}`;
+const cmd = flag => `${q(NODE)} ${q(GATE)} ${flag} --mode ${MODE} --allow ${ALLOW}`;
 const isOurs = c => typeof c === "string" && c.includes(q(GATE));
 const readJson = f => existsSync(f) ? JSON.parse(readFileSync(f, "utf8")) : {};
 function writeFile(f, text) {
@@ -42,7 +46,8 @@ function writeFile(f, text) {
   writeFileSync(f, text);
 }
 const has = bin => { try { execFileSync("which", [bin], {stdio: "ignore"}); return true; } catch { return false; } };
-const fill = src => src.replaceAll("__REFLEX_GATE__", GATE).replaceAll("__REFLEX_NODE__", NODE).replaceAll("__REFLEX_MODE__", MODE);
+const fill = src => src.replaceAll("__REFLEX_GATE__", GATE).replaceAll("__REFLEX_NODE__", NODE)
+  .replaceAll("__REFLEX_MODE__", MODE).replaceAll("__REFLEX_ALLOW__", ALLOW);
 
 // Remove only Reflex's hook entries; a matcher group left empty is dropped, other hooks stay.
 function stripOurs(hooks) {
@@ -75,6 +80,7 @@ const AGENTS = {
     s.permissions ??= {};
     s.permissions.ask = (s.permissions.ask ?? []).filter(r => !guard.includes(r));
     if (s.env?.REFLEX_MODE) delete s.env.REFLEX_MODE;
+    if (s.env?.REFLEX_ALLOW) delete s.env.REFLEX_ALLOW;
     if (!UNINSTALL) {
       s.hooks.PreToolUse = [...(s.hooks.PreToolUse ?? []), group("Bash", "--claude", 10)];
       for (const ev of ["PostToolUse", "PostToolUseFailure", "PermissionDenied"])
@@ -131,4 +137,4 @@ const AGENTS = {
 const which = opt("--agent", "claude");
 const targets = which === "all" ? Object.keys(AGENTS).filter(a => has(AGENTS[a].bin)) : which.split(",");
 for (const a of targets) if (!AGENTS[a]) throw new Error(`unknown agent ${a}; one of ${Object.keys(AGENTS).join(", ")}, all`);
-for (const a of targets) console.log(`${a.padEnd(9)} ${UNINSTALL ? "uninstalled" : `installed (${MODE})`}: ${AGENTS[a].run()}`);
+for (const a of targets) console.log(`${a.padEnd(9)} ${UNINSTALL ? "uninstalled" : `installed (${MODE}, allow ${ALLOW})`}: ${AGENTS[a].run()}`);

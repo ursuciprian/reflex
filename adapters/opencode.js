@@ -8,9 +8,10 @@ import {spawnSync} from "node:child_process";
 const GATE = process.env.REFLEX_GATE ?? "__REFLEX_GATE__";
 const NODE = process.env.REFLEX_NODE ?? "__REFLEX_NODE__";
 const MODE = process.env.REFLEX_MODE ?? "__REFLEX_MODE__";
+const ALLOW = process.env.REFLEX_ALLOW ?? "__REFLEX_ALLOW__";
 
 function gate(flag, payload) {
-  const r = spawnSync(NODE, [GATE, flag, "--mode", MODE], {input: JSON.stringify(payload), encoding: "utf8", timeout: 10000});
+  const r = spawnSync(NODE, [GATE, flag, "--mode", MODE, "--allow", ALLOW], {input: JSON.stringify(payload), encoding: "utf8", timeout: 10000});
   return r.stdout;
 }
 
@@ -26,6 +27,7 @@ export const Reflex = async ({directory}) => ({
       if (MODE === "enforce") throw new Error("reflex: gate unavailable, blocked (fail-closed)");
       return;
     }
+    // pass and allow both run: opencode has no prompt of its own here to skip.
     if (d.effective === "deny") throw new Error(d.reason);
     if (d.effective === "ask") throw new Error(`${d.reason}. Needs human approval: ask the user to confirm before running it.`);
   },

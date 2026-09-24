@@ -5,6 +5,7 @@
 1. [How a command is decided](#how-a-command-is-decided)
 2. [Testing](#testing)
 3. [Rolling out: shadow, tune, enforce](#rolling-out-shadow-tune-enforce)
+   - [Calibrated allow](#calibrated-allow)
 4. [Changing behaviour](#changing-behaviour)
 5. [Metrics](#metrics)
 6. [Data handling](#data-handling)
@@ -38,7 +39,8 @@ hook (see the table in the README). Each adapter turns the agent's event into th
    (command, cwd, environment, question-set version, model).
 5. **Policy** (`policy.json`) — ordered gates over the answers; the first that fires wins,
    otherwise `default_outcome` (`pass`). If Jev fails or times out, the policy's `fallback` (`ask`)
-   applies.
+   applies. The last gate, `allow`, marks clearly safe commands; what that means depends on
+   `REFLEX_ALLOW` (see [Calibrated allow](#calibrated-allow)).
 
 What happens with the decision depends on the mode:
 
@@ -49,7 +51,7 @@ What happens with the decision depends on the mode:
 | `enforce` | enforced | `ask` → a human confirms (how depends on the agent, see the README table); `deny` → the command is blocked and the agent sees why |
 
 `pass` is never turned into an approval: the gate stays silent and the agent's own permission
-settings decide. Where an agent combines several hooks (Claude Code, Codex, Hermes), the most
+settings decide. Only an `allow` with `REFLEX_ALLOW=on` in enforce mode approves anything. Where an agent combines several hooks (Claude Code, Codex, Hermes), the most
 restrictive decision wins, so Reflex composes with the hooks you already run.
 
 **Custom integrations** use the same contract from any language:
@@ -101,7 +103,11 @@ node eval.mjs --only terraform   # a subset
 - **MISS** — a risky command got a softer outcome than wanted (exit code 1; treat as a blocker);
 - **over** — stricter than wanted (friction; fix when it is common).
 
-Current result: 44 cases, 0 misses, 0 over. Results are saved to `~/.local/state/reflex/eval-*.json`.
+A case can also carry `"allow": true` (a clearly safe command that should be allow-eligible;
+reported as `stiff` when it is not, never a failure) or `"allow": false` (must never be
+auto-allowed; a MISS if it is). An `allow` counts as `pass` for `expect`.
+
+Current result: 51 cases, 0 misses, 0 over; 5 of 6 `allow: true` cases allow-eligible. Results are saved to `~/.local/state/reflex/eval-*.json`.
 Run it in CI with `TYPESAFE_API_KEY` as a secret to guard policy changes.
 
 **Grow the golden set from real traffic.** Every surprising decision in the trace becomes a case.
@@ -137,6 +143,57 @@ To test enforce behaviour without switching your whole setup, start one session 
 4. **Watch the ask outcomes.** In enforce mode `report.mjs` scores each emitted ask as approved
    (the command ran) or rejected. An ask that is nearly always approved is friction: tune it.
    A deny someone keeps working around is a missing fast-lane pattern.
+
+### Calibrated allow
+
+Autonomous agents stop at every prompt their own permissions require, even for `npx prettier
+--write src/`. The policy's last gate, `allow`, marks commands Jev judges clearly safe:
+
+```
+blast <= $allowBlastMax (1.2) and blast.confidence >= $allowConfidence (0.7)
+and mutates, exfil, injection < $allowRiskBelow (0.3) and on_task >= $allowOnTask (0.5)
+and env == 'local'
+```
+
+It is the last gate, so every deny and ask gate wins over it, and a missing answer makes it false.
+`REFLEX_ALLOW` (or `node install.mjs --allow …`) decides what an allow does:
+
+| `REFLEX_ALLOW` | Logged decision | Effect |
+|---|---|---|
+| `off` (default) | `pass` | none: the gate only tightens |
+| `shadow` | `would_allow` | none; `report.mjs` measures it |
+| `on` | `allow` in enforce mode, `would_allow` otherwise | the agent's own prompt is skipped (see the README table per agent) |
+
+Never allowed, whatever the answers: anything a rule decided (including tamper and secret reads),
+read-only and fast-lane commands (they stay `pass`, so your permission allowlist still governs
+them), Jev errors and incomplete answers (the `ask` fallback), cached answers (they have lost
+`on_task`), commands without a stated intent (`on_task` defaults to yes then), commands that
+redaction changed (a redacted `--token "$(…)"` could hide a payload), and commands run from the
+home directory or `/` (where "inside the working directory" means everything). The trace logs
+why as `low risk (not allowed: …)`. `export REFLEX_ALLOW=…` in a command is a tamper `ask`. In Claude Code an allow skips
+the prompt but its deny and ask permission rules still apply.
+
+**Calibrate from your own approvals.** Run with `REFLEX_ALLOW=shadow` in enforce mode for a
+while. `node report.mjs` then shows, for the Jev-judged commands a human ruled on (asks it emitted
+in enforce mode, and in Claude Code the commands allow would have let through — logged
+`would_allow` or allowed on replay), how often you approved them (approved = the command ran), by
+blast and by confidence bucket, and recommends
+thresholds (illustrative output):
+
+```
+  calibration  64 labelled (asks in enforce mode + would-be allows; approved = it ran)
+    by blast       0-0.5 12/12 (100%) · 0.5-1 30/31 (97%) · 1-1.5 9/11 (82%) · …
+    recommend      of 41 with blast <= 1 and confidence >= 0.8, you approved 98% -> allowBlastMax 1, allowConfidence 0.8
+```
+
+It recommends the band covering the most commands you approved at least 95% of (10 or more
+labelled), the tightest among equals, and says "not enough data" otherwise. Other agents have no
+prompt for a pass, so their would-be allows are not labels; in Claude Code a command its allowlist
+or permission mode let through counts as approved too, which flatters the rate a little.
+`node report.mjs --calibration` prints the expected calibration error of `blast` and `mutates`
+read as approval probabilities (1 − blast/3, 1 − mutates) against your approvals, per bin; it
+needs 20 labelled commands. Move the `allow*` params in `policy.json`, check with
+`node report.mjs --policy`, then switch to `REFLEX_ALLOW=on`.
 
 ## Changing behaviour
 
@@ -200,8 +257,10 @@ and [confidence](https://docs.typesafe.ai/confidence).
 
 ## Safety properties and limits
 
-- The gate never emits `allow`. The worst a wrong Jev answer can do is add a prompt, or fail to
-  add one; it cannot remove one that your permission rules require.
+- By default the gate never emits `allow`. The worst a wrong Jev answer can do is add a prompt, or
+  fail to add one; it cannot remove one that your permission rules require. With
+  `REFLEX_ALLOW=on` a wrong answer can remove one, for the narrow allow gate only: calibrate in
+  shadow first.
 - A Jev failure or timeout gives the policy's `fallback` (`ask`) in enforce mode.
 - An internal error (bad setup file, unreadable cache) returns the policy fallback (`ask`) in
   enforce mode and `pass` in shadow mode. Incomplete Jev answers count as an error, never as "no".
@@ -215,7 +274,8 @@ and [confidence](https://docs.typesafe.ai/confidence).
 - Only shell tools are gated (`Bash`, pi/omp `bash`, opencode `bash`, Hermes `terminal`). File-edit
   tools, MCP tools, omp's `eval` and Hermes' `execute_code` go through each agent's own permissions.
 - Codex and opencode hooks cannot open a prompt, so an `ask` blocks with a reason telling the agent
-  to get your confirmation. Codex passes the session directory as `cwd`, not a per-command
+  to get your confirmation. Codex hooks cannot allow either (an allow falls through), so `allow`
+  is a silent pass there. Codex passes the session directory as `cwd`, not a per-command
   `workdir`. Codex hooks must be trusted in `/hooks` before they run.
 - Environment context comes from the agent's process environment. A command that switches
   profile inline (`AWS_PROFILE=prod aws …`) is still seen, because the command text is judged; a
