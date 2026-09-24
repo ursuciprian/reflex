@@ -624,6 +624,12 @@ async function selfcheck() {
   ok((await judge({command: "go test ./...", cwd: HERE, env: {}})).source === "fast-lane", "judge: normal work in the repo");
   // the router's command templates and server list decide what it executes: same protection as setup/
   ok((await judge({command: "sed -i '' s/rg/sh/ router/commands.json", cwd: HERE, env: {}})).outcome === "ask", "judge: tamper with the router");
+  // reading a key, credentials or cluster secrets is a read, but not a harmless one
+  for (const cmd of ["cat ~/.ssh/id_ed25519", "rg -n -e x -- /Users/a/.ssh/id_rsa", "grep -rn key ~/.aws/credentials", "cat .env",
+                     "grep -e X -- '.env.local'", "kubectl get secrets -A -o yaml", "kubectl -n x get secret db -o json"])
+    ok((await judge({command: cmd, cwd: "/w", env: {}})).rule === "reads a private key, a credentials file, a .env file or Kubernetes secrets", `secret file read: ${cmd}`);
+  for (const cmd of ["cat ~/.ssh/id_rsa.pub", "cat .env.example", "kubectl get pods", "ls ~/.ssh/known_hosts", "cat src/environment.ts"])
+    ok((await judge({command: cmd, cwd: "/w", env: {}})).source === "read-only", `not a secret read: ${cmd}`);
   console.log(process.exitCode ? "gate selfcheck FAILED" : "gate selfcheck OK");
 }
 

@@ -1,5 +1,5 @@
 {
-  "version": "rules-v6",
+  "version": "rules-v7",
   "note": "Deterministic and authoritative: checked before Jev, enforced even in shadow mode. Patterns are case-insensitive and run over the command plus its context (cwd=, aws_profile=, kube_context=, tf_workspace=, git_branch=). A rule fires when every pattern in `all` matches. `pass` patterns apply per segment: a command passes the fast lane when every segment is read-only or matches one.",
   "rules": [
     {
@@ -9,6 +9,15 @@
       "rule": "prints the Jev API key or reads a secret store value",
       "all": [
         "(\\$\\{?typesafe_api_key|find-generic-password\\b.*\\s-w|secretsmanager\\s+get-secret-value|ssm\\s+get-parameters?\\b.*--with-decryption)"
+      ]
+    },
+    {
+      "id": "secret-file-read",
+      "outcome": "ask",
+      "before_read_only": true,
+      "rule": "reads a private key, a credentials file, a .env file or Kubernetes secrets",
+      "all": [
+        "(\\.ssh/id_[\\w-]+\\b(?!\\.pub)|\\.aws/credentials\\b|(^|[\\s/'\"=])\\.env(\\.[\\w-]+)?(?=$|[\\s'\"])(?<!\\.example)|\\bkubectl\\b.*\\bget\\s+secrets?\\b)"
       ]
     },
     {
