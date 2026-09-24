@@ -74,7 +74,8 @@ const AGENTS = {
     s.hooks ??= {};
     stripOurs(s.hooks);
     // The agent must not quietly edit its own gate or its settings; a human confirms each change.
-    const guard = [REPO, join(HOME, ".local/state/reflex")]
+    // ~/.config/reflex holds personal instruction fragments, injected into every repo's sessions.
+    const guard = [REPO, join(HOME, ".local/state/reflex"), join(HOME, ".config/reflex")]
       .flatMap(d => { const p = d.replace(HOME, "~"); return [`Edit(${p}/**)`, `Write(${p}/**)`]; })
       .concat(["Edit(~/.claude/settings*.json)", "Write(~/.claude/settings*.json)"]);
     s.permissions ??= {};

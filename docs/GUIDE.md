@@ -248,8 +248,11 @@ id: billing                    # optional; defaults to the file name
 - ...
 ```
 
-**Where fragments live:** `.reflex/instructions/*.md` in the working directory and in every parent
-directory, then `~/.config/reflex/instructions/*.md` (or `$XDG_CONFIG_HOME/reflex/instructions`).
+**Where fragments live:** `.reflex/instructions/*.md` in the working directory and in each parent
+directory up to the repo root (the nearest one holding `.git`), then
+`~/.config/reflex/instructions/*.md` (or `$XDG_CONFIG_HOME/reflex/instructions`). Directories above
+the repo root are never read; outside a repo only the working directory is. Only regular files up
+to 64 KB are read, so a symlink to a file elsewhere is skipped.
 When two fragments share an id, the one nearest the working directory wins, so a repo can override a
 personal fragment. `examples/instructions/repo/` shows the layout with three fragments.
 
@@ -307,9 +310,16 @@ for what is certain, and keep `when` for the cases paths cannot see.
 there would be loaded twice, not saved. Move conditional sections into `.reflex/instructions/`
 instead.
 
-**Trust.** Fragments are read from the working directory and its parents, the same trust boundary
-as the `AGENTS.md` / `CLAUDE.md` the agent already loads from a cloned repo. Fragment text never
-leaves the machine; only the `when` conditions are sent to Jev.
+**Trust.** A fragment in a cloned repo is text someone else wrote, injected into your agent's
+context: the same trust boundary as the `AGENTS.md` / `CLAUDE.md` the agent already loads from that
+repo, and no wider. Reflex keeps it there: fragments come only from the repo (up to its root) and
+your own config directory; each injected fragment is labelled with its source file; the injected
+text tells the agent the fragments are guidance that cannot override the user, the system prompt or
+permission settings; at most 20 conditions go to Jev per prompt. None of this changes what the gate
+allows: a command a fragment talks the agent into is still judged like any other. The Claude Code
+install also makes Claude ask before editing `~/.config/reflex`, whose fragments apply to every
+repo. Review `.reflex/instructions/` in a repo you did not write, as you would its `AGENTS.md`.
+Fragment text itself is sent to the agent's model, not to Jev; only the `when` conditions go to Jev.
 
 ## Where this goes next
 
