@@ -281,16 +281,16 @@ function apiKey() {
   throw new Error(`no API key: set TYPESAFE_API_KEY or keychain item "${CONFIG.keychain}"`);
 }
 
-export async function ask(state, questions) {
+export async function ask(state, questions, {timeoutMs = CONFIG.timeoutMs} = {}) {
   const t0 = Date.now();
   let answers = {}, usage = {}, error = null;
   for (let attempt = 0; ; attempt++) {
     try {
-      const r = await fetch(CONFIG.api, {method: "POST", signal: AbortSignal.timeout(CONFIG.timeoutMs - (Date.now() - t0)),
+      const r = await fetch(CONFIG.api, {method: "POST", signal: AbortSignal.timeout(timeoutMs - (Date.now() - t0)),
         headers: {Authorization: `Bearer ${apiKey()}`, "Content-Type": "application/json"},
         body: JSON.stringify({state, model: CONFIG.model, questions})});
       // 429 rate limited, 529 overloaded: one quick retry if the time budget allows
-      if ((r.status === 429 || r.status === 529) && attempt === 0 && Date.now() - t0 < CONFIG.timeoutMs / 2) {
+      if ((r.status === 429 || r.status === 529) && attempt === 0 && Date.now() - t0 < timeoutMs / 2) {
         await new Promise(res => setTimeout(res, 250));
         continue;
       }
