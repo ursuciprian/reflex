@@ -6,6 +6,7 @@
 //   node install.mjs --agent codex           Codex CLI    ~/.codex/hooks.json PreToolUse (then trust it in /hooks)
 //   node install.mjs --agent opencode        opencode     ~/.config/opencode/plugins/reflex.js (tool.execute.before)
 //   node install.mjs --agent pi | omp        pi / oh-my-pi ~/.{pi,omp}/agent/extensions/reflex.ts (tool_call)
+//     --context                              also reflex-context.ts: the Jev context layer (context.mjs)
 //   node install.mjs --agent hermes          prints the config.yaml pre_tool_call block to paste per profile
 //   node install.mjs --agent all             every agent found on this machine
 //
@@ -29,6 +30,7 @@ const GATE = join(REPO, "gate.mjs");
 const MODE = opt("--mode", "shadow");
 const NODE = opt("--node", process.execPath);   // absolute, so hooks work without the shell's PATH
 const UNINSTALL = argv.includes("--uninstall");
+const CONTEXT = argv.includes("--context");
 if (!["off", "shadow", "enforce"].includes(MODE)) throw new Error("--mode must be off, shadow or enforce");
 if (Number(process.versions.node.split(".")[0]) < 18) throw new Error(`node 18+ required, found ${process.versions.node}`);
 
@@ -55,11 +57,15 @@ function stripOurs(hooks) {
 const group = (matcher, flag, timeout) => ({matcher, hooks: [{type: "command", command: cmd(flag), timeout}]});
 
 // pi and oh-my-pi load TypeScript extensions from <home>/agent/extensions/.
+// --context adds the context layer next to the gate; --uninstall removes both.
 function piLike(agent) {
-  const file = join(HOME, `.${agent}`, "agent/extensions/reflex.ts");
-  if (UNINSTALL) { rmSync(file, {force: true}); return `${file} removed`; }
+  const dir = join(HOME, `.${agent}`, "agent/extensions");
+  const file = join(dir, "reflex.ts"), ctx = join(dir, "reflex-context.ts");
+  if (UNINSTALL) { rmSync(file, {force: true}); rmSync(ctx, {force: true}); return `${file} removed`; }
   writeFile(file, fill(readFileSync(join(REPO, "adapters/pi.ts"), "utf8")).replaceAll("__REFLEX_AGENT__", agent));
-  return `${file} (restart ${agent})`;
+  if (!CONTEXT) return `${file} (restart ${agent})`;
+  writeFile(ctx, readFileSync(join(REPO, "adapters/pi-context.ts"), "utf8").replaceAll("__REFLEX_CONTEXT__", join(REPO, "context.mjs")));
+  return `${file}, ${ctx} (restart ${agent})`;
 }
 
 const AGENTS = {

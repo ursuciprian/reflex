@@ -1,0 +1,35 @@
+#!/usr/bin/env node
+// reflex-review: a read-only background review of the current change by another model.
+// It consumes a retrieval bundle (context.mjs bundle(): diff, changed files, the files and symbols
+// around them, rated once by Jev), so every background task shares one retrieval pass.
+//
+//   reflex-review --reviewer "codex exec -s read-only -" [--base REF] [--goal T] [--bundle F] [--out F]
+//   REFLEX_REVIEWER="claude -p --permission-mode plan" reflex-review &
+//
+// The prompt goes to the reviewer command on stdin; its stdout is the review, saved to --out or
+// $REFLEX_DATA_DIR/reviews/<time>.md. Exit code: the reviewer's.
+import {mkdirSync, readFileSync, writeFileSync} from "node:fs";
+import {spawnSync} from "node:child_process";
+import {dirname, join} from "node:path";
+import {bundle, log, reviewPrompt, writeBundle} from "../context.mjs";
+import {CONFIG} from "../gate.mjs";
+
+const argv = process.argv.slice(2);
+const opt = n => { const i = argv.indexOf(n); return i > -1 ? argv[i + 1] : undefined; };
+const reviewer = opt("--reviewer") ?? process.env.REFLEX_REVIEWER;
+if (!reviewer) { console.error("reflex-review: set --reviewer or REFLEX_REVIEWER, e.g. \"codex exec -s read-only -\""); process.exit(2); }
+
+const b = opt("--bundle") ? JSON.parse(readFileSync(opt("--bundle"), "utf8"))
+  : await bundle({base: opt("--base") ?? "HEAD", goal: opt("--goal")});
+if (!opt("--bundle")) console.error(`reflex-review: bundle ${writeBundle(b)}`);
+const t0 = Date.now();
+// The reviewer is the user's own configured command, so it runs through the shell as written.
+const r = spawnSync("/bin/sh", ["-c", reviewer], {cwd: b.cwd, input: reviewPrompt(b), encoding: "utf8",
+  maxBuffer: 64 << 20, timeout: 30 * 60_000, stdio: ["pipe", "pipe", "inherit"]});
+const out = opt("--out") ?? join(CONFIG.data, "reviews", `${Date.now()}.md`);
+mkdirSync(dirname(out), {recursive: true});
+writeFileSync(out, r.stdout ?? "");
+log({kind: "review", reviewer: reviewer.split(" ")[0], changed: b.changed.length, context: b.context.length,
+     status: r.status, error: r.error ? String(r.error) : null, wall_s: (Date.now() - t0) / 1000, out});
+console.error(`reflex-review: ${r.status === 0 ? "review" : `reviewer exited ${r.status}; output`} in ${out}`);
+process.exit(r.status ?? 1);

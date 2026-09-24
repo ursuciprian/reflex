@@ -23,6 +23,13 @@ and probabilities in well under a second — instead of a large LLM.
 
 All of them call the same decision core with the same rules, questions, policy and logs.
 
+**Context layer (pi and oh-my-pi, opt-in, experimental).** The same Jev client also decides what the
+model *sees*: a large tool output is cut, per request, to the chunks that matter (hide / short / long /
+full; the full text is kept and returned by an `expand_chunk` tool); earlier outputs are re-levelled
+when the request changes, but only when that beats keeping the provider's prompt cache; `/fresh <goal>`
+restarts with only the relevant old context; and one retrieval pass over a git change feeds read-only
+background tasks such as `bin/reflex-review`. See [docs/GUIDE.md](docs/GUIDE.md#context-layer-pi-and-oh-my-pi).
+
 ```
 agent wants to run a command
    │
@@ -76,13 +83,15 @@ week, `node report.mjs` shows the decisions, and `node install.mjs --mode enforc
 | File | What it is |
 |---|---|
 | `gate.mjs` | The decision core and CLI: read-only detection, rules, redaction, Jev client, cache, logs, and the Claude Code / Codex / Hermes hook adapters |
-| `adapters/` | `pi.ts` (pi and oh-my-pi extension), `opencode.js` (opencode plugin) |
+| `adapters/` | `pi.ts` (pi and oh-my-pi extension), `pi-context.ts` (pi / oh-my-pi context layer), `opencode.js` (opencode plugin) |
+| `context.mjs` | Context layer core: visibility ladder, chunk store, per-request assembly and cache decision, `/fresh` recall, retrieval bundles |
 | `bin/reflex-sh` | Drop-in `bash -c` for agents without hooks |
+| `bin/reflex-review` | Background cross-model review that consumes a retrieval bundle |
 | `policy.mjs` | Policy evaluator: ordered gates over answers, no `eval`, no domain knowledge |
 | `setup/tool-gate/` | `rules.json`, `questions.json`, `policy.json`, `golden.json` — all behaviour lives here |
 | `eval.mjs` | Runs the golden set through the real gate; exits 1 on any missed risk |
 | `report.mjs` | Summary, replay under a candidate policy, Prometheus Pushgateway export |
-| `install.mjs` | Adds / removes Reflex in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`) |
+| `install.mjs` | Adds / removes Reflex in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`; `--context` adds the pi / omp context layer) |
 | `dashboards/reflex.json` | Grafana dashboard for the pushed metrics |
 
 Node 18+, no dependencies.
