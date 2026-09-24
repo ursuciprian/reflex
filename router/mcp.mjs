@@ -11,6 +11,13 @@ const M = "io.modelcontextprotocol/";
 // Recognized modern errors (2026-07-28 schema): header mismatch, missing client capability, unsupported version.
 const MODERN_ERRORS = new Set([-32020, -32021, -32022]);
 
+// How long server/discover may go unanswered before a server counts as legacy (the spec only says
+// "a reasonable timeout"). Legacy servers normally answer the unknown method with an error at once;
+// only one that stays silent costs the full wait, once per start (a restart of a known legacy
+// server skips the probe). 1 s is safe because a modern server that is still starting and misses
+// the window refuses the fallback initialize, and connect() then probes again with the full timeout.
+export const PROBE_MS = Number(process.env.REFLEX_ROUTER_PROBE_MS ?? 1000);
+
 const BASE_ENV = ["HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER", "TMPDIR", "LANG", "LC_ALL"];
 
 /** Calls onMessage(obj | Error) once per line of `stream`. */
@@ -39,7 +46,7 @@ class PeerError extends Error { constructor(name, e) { super(`${name}: ${e.messa
  * the version, client info and capabilities in _meta. Any other error, or no answer within
  * `probeMs`, means a legacy server: fall back to the initialize handshake.
  */
-export async function connect({command, args = [], env = {}, cwd}, {timeoutMs = 30000, probeMs = 5000, name = command, era} = {}) {
+export async function connect({command, args = [], env = {}, cwd}, {timeoutMs = 30000, probeMs = PROBE_MS, name = command, era} = {}) {
   // Like the MCP SDKs: a server gets a minimal environment plus its own `env`, never the caller's
   // credentials (TYPESAFE_API_KEY, AWS_*, GITHUB_TOKEN ...).
   const base = Object.fromEntries(BASE_ENV.filter(k => process.env[k] != null).map(k => [k, process.env[k]]));
@@ -79,18 +86,30 @@ export async function connect({command, args = [], env = {}, cwd}, {timeoutMs = 
   const tools = [], seen = new Set();
   try {   // a server that hangs or fails during setup is not left running
     // The era is a property of the server: a restart of a known legacy server skips the probe.
-    init = era === "legacy" ? null : await request("server/discover", undefined, probeMs, MODERN[0]).then(r => ({era: "modern", ...r}), e => {
+    const probe = ms => request("server/discover", undefined, ms, MODERN[0]).then(r => ({era: "modern", ...r}), e => {
       if (!(e instanceof PeerError && MODERN_ERRORS.has(e.code))) return null;   // anything else: legacy
       if (e.code !== -32022) throw e;
       return {era: "modern", supportedVersions: e.data?.supported ?? []};       // modern, other versions: never initialize
     });
-    if (init) {
+    init = era === "legacy" ? null : await probe(probeMs);
+    if (!init) {
+      if (dead) throw dead;
+      // A short probe must not cost a slow-starting modern server its connection: when the
+      // fallback initialize is refused by a server that is still running, the probe missed
+      // the window, so probe once more with the full timeout before giving up.
+      init = await request("initialize", {protocolVersion: VERSIONS[0], capabilities: {}, clientInfo: CLIENT})
+        .then(r => ({era: "legacy", ...r}), async e => {
+          if (!(e instanceof PeerError) || era === "legacy" || dead) throw e;
+          const late = await probe(timeoutMs);
+          if (!late) throw e;
+          return late;
+        });
+    }
+    if (init.era === "modern") {
       modern = MODERN.find(v => init.supportedVersions?.includes(v));
       if (!modern) throw new Error(`${name}: no common protocol version (server: ${init.supportedVersions?.join(", ") || "none"}; reflex-router: ${MODERN.join(", ")})`);
       init.protocolVersion = modern;
-    } else {
-      if (dead) throw dead;
-      init = {era: "legacy", ...await request("initialize", {protocolVersion: VERSIONS[0], capabilities: {}, clientInfo: CLIENT})};
+    } else if (init.era === "legacy") {
       if (!VERSIONS.includes(init?.protocolVersion)) throw new Error(`${name}: unsupported protocol version ${init?.protocolVersion}`);
       send({jsonrpc: "2.0", method: "notifications/initialized"});
     }
@@ -109,18 +128,20 @@ export async function connect({command, args = [], env = {}, cwd}, {timeoutMs = 
 
 /**
  * connect(), and reconnect lazily: a request after the server died starts it again, at most once
- * per `retryMs`; in between, requests fail fast. The tool list is the one from the first connect.
+ * per `retryMs`; in between, requests fail fast. `tools` is always the live server's list: a
+ * restarted server may have been upgraded, so its tools/list is re-read, and `onRestart(tools)` is
+ * told about it.
  */
 export async function reconnecting(spec, opts = {}) {
-  const {retryMs = 30000, name = spec.command} = opts;
+  const {retryMs = 30000, name = spec.command, onRestart = () => {}} = opts;
   let c = await connect(spec, opts), last = 0, starting = null;
   return {
-    get init() { return c.init; }, tools: c.tools, get pid() { return c.pid; },
+    get init() { return c.init; }, get tools() { return c.tools; }, get pid() { return c.pid; },
     async request(method, params) {
       if (c.dead) {
         const wait = last + retryMs - Date.now();
         if (!starting && wait > 0) throw new Error(`${name} is down (${c.dead.message}); next restart attempt in ${Math.ceil(wait / 1000)} s`);
-        starting ??= (last = Date.now(), connect(spec, {...opts, era: c.init.era}).then(n => { c = n; }).finally(() => { starting = null; }));
+        starting ??= (last = Date.now(), connect(spec, {...opts, era: c.init.era}).then(n => { c = n; onRestart(n.tools); }).finally(() => { starting = null; }));
         await starting;
       }
       return c.request(method, params);

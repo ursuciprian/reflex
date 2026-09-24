@@ -20,7 +20,7 @@ import {tmpdir} from "node:os";
 import {dirname, join, resolve} from "node:path";
 import {fileURLToPath, pathToFileURL} from "node:url";
 import {ask as jevAsk, CONFIG, decideSafe, redact} from "../gate.mjs";
-import {connect, lines, reconnecting, VERSIONS} from "./mcp.mjs";
+import {connect, lines, PROBE_MS, reconnecting, VERSIONS} from "./mcp.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ENV = process.env;
@@ -49,7 +49,13 @@ export const commandTools = (all = false) =>
   JSON.parse(readFileSync(R.commands, "utf8")).tools.filter(t => all || onPath(t.bin)).map(t => ({...t, kind: "shell"}));
 
 const clients = [];
-async function downstreamTools() {
+// Downstream servers are connected once; their tools are read from each client every time, so a
+// server restarted after a crash contributes its current tool list, not the one it started with.
+const toolsOf = (server, spec, c) => c.tools.map(t => ({name: `${server}.${t.name}`, category: server, description: t.description ?? t.title ?? "",
+  inputSchema: t.inputSchema ?? {type: "object"}, kind: "mcp", server, tool: t.name, client: c,
+  trusted: spec.trusted === true,   // opts the server out of the gate: its calls run unjudged
+  readOnly: t.annotations?.readOnlyHint === true && t.annotations?.destructiveHint !== true}));
+async function downstream() {
   if (!existsSync(R.config)) return [];
   const servers = JSON.parse(readFileSync(R.config, "utf8")).mcpServers ?? {};
   const got = await Promise.all(Object.entries(servers).map(async ([server, spec]) => {
@@ -58,12 +64,10 @@ async function downstreamTools() {
       return [];
     }
     try {
-      const c = await reconnecting(spec, {name: server, timeoutMs: R.execTimeoutMs, retryMs: R.retryMs});
+      const c = await reconnecting(spec, {name: server, timeoutMs: R.execTimeoutMs, retryMs: R.retryMs,
+        onRestart: tools => console.error(`reflex-router: ${server} restarted, ${tools.length} tools`)});
       clients.push(c);
-      return c.tools.map(t => ({name: `${server}.${t.name}`, category: server, description: t.description ?? t.title ?? "",
-                                inputSchema: t.inputSchema ?? {type: "object"}, kind: "mcp", server, tool: t.name, client: c,
-                                trusted: spec.trusted === true,   // opts the server out of the gate: its calls run unjudged
-                                readOnly: t.annotations?.readOnlyHint === true && t.annotations?.destructiveHint !== true}));
+      return [{server, spec, c}];
     } catch (e) {
       console.error(`reflex-router: ${server} unavailable: ${e.message}`);   // one broken server must not take the router down
       return [];
@@ -71,9 +75,12 @@ async function downstreamTools() {
   }));
   return got.flat();
 }
-let catalogP;
-const catalog = () => catalogP ??= downstreamTools().then(ds => [...commandTools(), ...ds])
-  .catch(e => { catalogP = null; throw e; });   // a broken config file is retried on the next call
+let shellTools, downP;
+const catalog = async () => {
+  shellTools ??= commandTools();
+  const ds = await (downP ??= downstream().catch(e => { downP = null; throw e; }));   // a broken config file is retried on the next call
+  return [...shellTools, ...ds.flatMap(d => toolsOf(d.server, d.spec, d.c))];
+};
 // Children (shell tools, downstream servers) never see the TypeSafe key.
 const childEnv = () => Object.fromEntries(Object.entries(ENV).filter(([k]) => k !== "TYPESAFE_API_KEY"));
 const regex = p => { try { return new RegExp(p, "u"); } catch { try { return new RegExp(p); } catch { return null; } } };
@@ -620,6 +627,10 @@ async function selfcheck() {
     if (era === "silent") ok(Date.now() - t0 >= 300, "silent probe times out, then initialize");
     d.close();
   }
+  const slow = await connect(fakeIn("slow"), {name: "slow", probeMs: 200});
+  ok(slow.init.era === "modern" && (await echo(slow)).endsWith("era=modern"), "slow-starting modern server: short probe missed, initialize refused, re-probe connects");
+  slow.close();
+  ok(PROBE_MS === Number(ENV.REFLEX_ROUTER_PROBE_MS ?? 1000), "probe timeout: REFLEX_ROUTER_PROBE_MS, default 1 s");
   const future = await connect(fakeIn("future"), {name: "future"}).then(() => "connected", e => e.message);
   ok(/no common protocol version \(server: 2099-01-01/.test(future), "modern server without our version: error, no fallback to initialize");
   const rc = await reconnecting(fakeIn("modern"), {name: "rc", retryMs: 300});
@@ -633,6 +644,16 @@ async function selfcheck() {
   await new Promise(res => setTimeout(res, 300));
   ok(/is down/.test(fast) && (await echo(rc)).includes("echo: hi"), "restart backoff: fails fast, then restarts after retryMs");
   rc.close();
+  // a server upgraded between two starts: the restart re-reads its tools/list
+  const upMarker = join(tmp, "upgraded"), restarted = [];
+  const up = await reconnecting({...fakeIn("modern"), args: [...fakeIn("modern").args, upMarker]}, {name: "up", retryMs: 0, onRestart: t => restarted.push(t.length)});
+  ok(up.tools.length === 3, "before the upgrade: 3 tools");
+  writeFileSync(upMarker, "");
+  process.kill(up.pid, "SIGKILL");
+  await new Promise(res => setTimeout(res, 100));
+  ok((await echo(up)).includes("echo: hi") && up.tools.length === 4 && up.tools.some(t => t.name === "upgraded") && restarted.join() === "4",
+     "restart after an upgrade: tool list refreshed");
+  up.close();
 
   // eval-router scoring: only what would execute wrongly fails
   const F = (args, missing = [], confidence = 0.9) => ({args, missing, confidence});
