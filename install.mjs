@@ -1,12 +1,13 @@
 #!/usr/bin/env node
-// Wire Reflex into coding agents as a pre-execution hook. Idempotent: re-running replaces only
-// Reflex's own entries. Every file it edits is backed up next to itself first.
+// Wire Reflex into coding agents: the pre-execution gate plus conditional instructions on each
+// user prompt. Idempotent: re-running replaces only Reflex's own entries. Every file it edits is
+// backed up next to itself first.
 //
-//   node install.mjs --agent claude          Claude Code  ~/.claude/settings.json PreToolUse hook
-//   node install.mjs --agent codex           Codex CLI    ~/.codex/hooks.json PreToolUse (then trust it in /hooks)
-//   node install.mjs --agent opencode        opencode     ~/.config/opencode/plugins/reflex.js (tool.execute.before)
-//   node install.mjs --agent pi | omp        pi / oh-my-pi ~/.{pi,omp}/agent/extensions/reflex.ts (tool_call)
-//   node install.mjs --agent hermes          prints the config.yaml pre_tool_call block to paste per profile
+//   node install.mjs --agent claude          Claude Code  ~/.claude/settings.json PreToolUse + UserPromptSubmit hooks
+//   node install.mjs --agent codex           Codex CLI    ~/.codex/hooks.json PreToolUse + UserPromptSubmit (then trust them in /hooks)
+//   node install.mjs --agent opencode        opencode     ~/.config/opencode/plugins/reflex.js (tool.execute.before, chat.message)
+//   node install.mjs --agent pi | omp        pi / oh-my-pi ~/.{pi,omp}/agent/extensions/reflex.ts (tool_call, before_agent_start)
+//   node install.mjs --agent hermes          prints the config.yaml pre_tool_call / pre_llm_call blocks to paste per profile
 //   node install.mjs --agent all             every agent found on this machine
 //
 //   --mode shadow|enforce|off   (default shadow)   --node <path>   --uninstall
@@ -26,6 +27,7 @@ const opt = (n, d) => {
 const HOME = homedir();
 const REPO = dirname(fileURLToPath(import.meta.url));
 const GATE = join(REPO, "gate.mjs");
+const INSTRUCTIONS = join(REPO, "instructions.mjs");
 const MODE = opt("--mode", "shadow");
 const NODE = opt("--node", process.execPath);   // absolute, so hooks work without the shell's PATH
 const UNINSTALL = argv.includes("--uninstall");
@@ -33,8 +35,8 @@ if (!["off", "shadow", "enforce"].includes(MODE)) throw new Error("--mode must b
 if (Number(process.versions.node.split(".")[0]) < 18) throw new Error(`node 18+ required, found ${process.versions.node}`);
 
 const q = s => `"${s}"`;
-const cmd = flag => `${q(NODE)} ${q(GATE)} ${flag} --mode ${MODE}`;
-const isOurs = c => typeof c === "string" && c.includes(q(GATE));
+const cmd = (flag, script = GATE) => `${q(NODE)} ${q(script)} ${flag} --mode ${MODE}`;
+const isOurs = c => typeof c === "string" && (c.includes(q(GATE)) || c.includes(q(INSTRUCTIONS)));
 const readJson = f => existsSync(f) ? JSON.parse(readFileSync(f, "utf8")) : {};
 function writeFile(f, text) {
   if (existsSync(f)) copyFileSync(f, `${f}.bak-${Date.now()}`);
@@ -53,6 +55,9 @@ function stripOurs(hooks) {
   }
 }
 const group = (matcher, flag, timeout) => ({matcher, hooks: [{type: "command", command: cmd(flag), timeout}]});
+// UserPromptSubmit takes no matcher in either agent. Instructions are advisory: a slow Jev call
+// must not hold the prompt for long, and a failed hook injects nothing.
+const promptGroup = flag => ({hooks: [{type: "command", command: cmd(flag, INSTRUCTIONS), timeout: 10}]});
 
 // pi and oh-my-pi load TypeScript extensions from <home>/agent/extensions/.
 function piLike(agent) {
@@ -69,7 +74,8 @@ const AGENTS = {
     s.hooks ??= {};
     stripOurs(s.hooks);
     // The agent must not quietly edit its own gate or its settings; a human confirms each change.
-    const guard = [REPO, join(HOME, ".local/state/reflex")]
+    // ~/.config/reflex holds personal instruction fragments, injected into every repo's sessions.
+    const guard = [REPO, join(HOME, ".local/state/reflex"), join(HOME, ".config/reflex")]
       .flatMap(d => { const p = d.replace(HOME, "~"); return [`Edit(${p}/**)`, `Write(${p}/**)`]; })
       .concat(["Edit(~/.claude/settings*.json)", "Write(~/.claude/settings*.json)"]);
     s.permissions ??= {};
@@ -79,6 +85,7 @@ const AGENTS = {
       s.hooks.PreToolUse = [...(s.hooks.PreToolUse ?? []), group("Bash", "--claude", 10)];
       for (const ev of ["PostToolUse", "PostToolUseFailure", "PermissionDenied"])
         s.hooks[ev] = [...(s.hooks[ev] ?? []), group("Bash", "--claude-post", 5)];
+      s.hooks.UserPromptSubmit = [...(s.hooks.UserPromptSubmit ?? []), promptGroup("--claude")];
       s.permissions.ask.push(...guard);
     }
     if (!s.permissions.ask.length) delete s.permissions.ask;
@@ -94,6 +101,7 @@ const AGENTS = {
     if (!UNINSTALL) {
       s.hooks.PreToolUse = [...(s.hooks.PreToolUse ?? []), group("^Bash$", "--codex", 15)];
       s.hooks.PostToolUse = [...(s.hooks.PostToolUse ?? []), group("^Bash$", "--codex-post", 5)];
+      s.hooks.UserPromptSubmit = [...(s.hooks.UserPromptSubmit ?? []), promptGroup("--codex")];
     }
     writeFile(file, JSON.stringify(s, null, 2) + "\n");
     return `${file}${UNINSTALL ? "" : " — open Codex and trust the new hooks in /hooks, or they will not run"}`;
@@ -122,6 +130,9 @@ const AGENTS = {
       `    - matcher: "terminal"`,
       `      command: '${cmd("--hermes-post")}'`,
       "      timeout: 5",
+      "  pre_llm_call:",
+      `    - command: '${cmd("--hermes", INSTRUCTIONS)}'`,
+      "      timeout: 10",
       "",
     ].join("\n"));
     return "printed (Hermes config is YAML; paste it rather than have a script rewrite it)";

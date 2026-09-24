@@ -3,18 +3,36 @@
 //
 // opencode 1.4 plugins can block a tool call (throw) but cannot open a permission prompt, so an
 // "ask" blocks with a reason that tells the agent to get the user's confirmation first.
+//
+// Conditional instructions: chat.message sees each new user message and picks the fragments that
+// apply; experimental.chat.system.transform appends them to the system prompt of every model call
+// in that session until the next user message, so compaction cannot drop them.
 import {spawnSync} from "node:child_process";
 
 const GATE = process.env.REFLEX_GATE ?? "__REFLEX_GATE__";
 const NODE = process.env.REFLEX_NODE ?? "__REFLEX_NODE__";
 const MODE = process.env.REFLEX_MODE ?? "__REFLEX_MODE__";
+const INSTRUCTIONS = GATE.replace(/gate\.mjs$/, "instructions.mjs");
+const selected = new Map();   // sessionID -> injected text. ponytail: never pruned; one short string per session.
 
-function gate(flag, payload) {
-  const r = spawnSync(NODE, [GATE, flag, "--mode", MODE], {input: JSON.stringify(payload), encoding: "utf8", timeout: 10000});
+function gate(flag, payload, script = GATE) {
+  const r = spawnSync(NODE, [script, flag, "--mode", MODE], {input: JSON.stringify(payload), encoding: "utf8", timeout: 10000});
   return r.stdout;
 }
 
 export const Reflex = async ({directory}) => ({
+  "chat.message": async (input, output) => {
+    const prompt = (output.parts ?? []).filter(p => p.type === "text" && !p.synthetic).map(p => p.text).join("\n");
+    if (!prompt.trim()) return;
+    let r = null;
+    try { r = JSON.parse(gate("--select", {agent: "opencode", prompt, cwd: directory, session_id: input.sessionID}, INSTRUCTIONS)); }
+    catch { /* instructions are advisory: nothing is injected */ }
+    selected.set(input.sessionID, r?.text ?? "");
+  },
+  "experimental.chat.system.transform": async (input, output) => {
+    const text = input.sessionID && selected.get(input.sessionID);
+    if (text) output.system.push(text);
+  },
   "tool.execute.before": async (input, output) => {
     if (input.tool !== "bash") return;
     let d;
