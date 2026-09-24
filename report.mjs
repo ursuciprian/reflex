@@ -15,7 +15,9 @@ import {compile} from "./policy.mjs";
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i > -1 ? process.argv[i + 1] : d; };
 const rows = f => existsSync(f) ? readFileSync(f, "utf8").split("\n").filter(Boolean).map(l => JSON.parse(l)) : [];
 const since = Date.now() - Number(arg("--since", 7)) * 864e5;
-const trace = rows(join(CONFIG.data, "trace.jsonl")).filter(r => Date.parse(r.ts) >= since);
+// Subgoal checks (tag "subgoal") are counted apart: they are not commands and have no policy to replay.
+const logged = rows(join(CONFIG.data, "trace.jsonl")).filter(r => Date.parse(r.ts) >= since);
+const trace = logged.filter(r => r.tag !== "subgoal"), subgoals = logged.filter(r => r.tag === "subgoal");
 const ran = new Set(rows(join(CONFIG.data, "feedback.jsonl")).filter(r => r.event !== "denied").map(r => r.call_id ?? r.tool_use_id));
 const policy = compile(JSON.parse(readFileSync(arg("--policy", join(CONFIG.setup, "policy.json")), "utf8")));
 
@@ -94,10 +96,12 @@ console.log(`  by source    ${JSON.stringify(count(trace, r => r.source))}`);
 console.log(`  by decision  ${JSON.stringify(count(trace, r => r.decision))}`);
 console.log(`  by mode      ${JSON.stringify(count(trace, r => r.mode))}`);
 console.log(`  jev latency  p50 ${q(lat, .5)}s · p95 ${q(lat, .95)}s · p99 ${q(lat, .99)}s · fallbacks ${trace.filter(r => r.source === "fallback").length}`);
-console.log(`  tokens       ${trace.reduce((s, r) => s + (r.usage?.input_tokens ?? 0), 0)} input`);
+console.log(`  tokens       ${logged.reduce((s, r) => s + (r.usage?.input_tokens ?? 0), 0)} input (subgoal checks included)`);
 console.log(`  emitted asks ${JSON.stringify(resolved)}   (enforce mode only; approved = a human let it run)`);
 console.log(`  replay       ${changed.length} of ${jev.length} Jev decisions change under ${policy.version}`);
 for (const [k, v] of Object.entries(count(changed, x => `${x.r.decision} -> ${x.now}`))) console.log(`                 ${k}: ${v}`);
+console.log(`  subgoals     ${subgoals.length} checked · ${subgoals.filter(r => r.decision === "deny").length} duplicates` +
+            ` (${subgoals.filter(r => r.emitted === "deny").length} denied, the rest shadow)`);
 console.log(`  allow        ${JSON.stringify(count(trace.filter(r => ["allow", "would_allow"].includes(r.decision)), r => r.decision))}   (REFLEX_ALLOW ${CONFIG.allow})`);
 console.log(`  calibration  ${labelled.length} labelled (asks in enforce mode + would-be allows in Claude Code; approved = it ran)`);
 if (labelled.length) {
@@ -125,7 +129,7 @@ if (push) {
     "# TYPE reflex_replay_changes gauge",
     `reflex_replay_changes ${changed.length}`,
     "# TYPE reflex_input_tokens gauge",
-    `reflex_input_tokens ${trace.reduce((s, r) => s + (r.usage?.input_tokens ?? 0), 0)}`,
+    `reflex_input_tokens ${logged.reduce((s, r) => s + (r.usage?.input_tokens ?? 0), 0)}`,
   ];
   const user = encodeURIComponent(process.env.USER ?? "unknown");
   const r = await fetch(`${push.replace(/\/$/, "")}/metrics/job/reflex/user/${user}`,

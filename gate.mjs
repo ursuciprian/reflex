@@ -664,8 +664,17 @@ export async function judge({command, cwd, env = envContext(cwd), session = {}, 
 // do now: "pass" (no opinion, the agent's own permissions decide), "allow" (run it without the
 // agent's prompt), "ask" (a human confirms) or "deny" (block, show the reason).
 // In shadow mode only deterministic rules are effective; Jev's decision is logged, never applied.
+// A call with `subgoal` (the task a subagent is about to get) instead of `command` is checked for
+// duplicates, see subgoalJudge().
 export async function decide(call, {background = false, asker} = {}) {
-  if (CONFIG.mode === "off" || !call.command) return {effective: "pass", decision: "pass", reason: "reflex off", source: "off"};
+  if (CONFIG.mode === "off" || !(call.command || call.subgoal)) return {effective: "pass", decision: "pass", reason: "reflex off", source: "off"};
+  if (call.subgoal) {
+    if (CONFIG.mode !== "enforce" && !background) return inBackground(call);
+    const j = await subgoalJudge(call, asker);
+    const effective = CONFIG.mode === "enforce" ? j.outcome : "pass";
+    trace(j, {...call, command: `[subgoal] ${call.subgoal.slice(0, 2000)}`}, effective);
+    return view(j, effective);
+  }
   const env = envContext(call.cwd);
   const quick = background ? null : precheck(call.command, call.cwd, env);
   if (quick) {
@@ -674,13 +683,7 @@ export async function decide(call, {background = false, asker} = {}) {
     return view(quick, effective);
   }
   // Shadow mode: nobody waits for Jev. A detached copy of this script judges and logs.
-  if (CONFIG.mode !== "enforce" && !background) {
-    const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "--bg", "--mode", CONFIG.mode, "--allow", CONFIG.allow],
-                        {detached: true, stdio: ["pipe", "ignore", "ignore"]});
-    child.stdin.end(JSON.stringify(call));
-    child.unref();
-    return {effective: "pass", decision: "pending", reason: "reflex: judged in the background (shadow)", source: "shadow"};
-  }
+  if (CONFIG.mode !== "enforce" && !background) return inBackground(call);
   const session = sessionContext(call.transcript_path, call.call_id);
   if (call.intent) session.intent = redact(call.intent).slice(-600);
   if (call.recent?.length) session.recent = call.recent.slice(-5).map(c => redact(c).slice(0, 200));
@@ -689,11 +692,63 @@ export async function decide(call, {background = false, asker} = {}) {
   trace(j, call, effective);
   return view(j, effective);
 }
+function inBackground(call) {
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "--bg", "--mode", CONFIG.mode, "--allow", CONFIG.allow],
+                      {detached: true, stdio: ["pipe", "ignore", "ignore"]});
+  child.stdin.end(JSON.stringify(call));
+  child.unref();
+  return {effective: "pass", decision: "pending", reason: "reflex: judged in the background (shadow)", source: "shadow"};
+}
+
+// Subgoal dedup. Agents re-launch subagents for work they already delegated, and pay for it twice.
+// The new subgoal is compared with those launched earlier in the same session (subgoals.jsonl) by
+// one Jev choice question whose options are the earlier subgoals plus "none". A confident duplicate
+// is denied with a reason naming the earlier one, so the agent reuses its result; anything else is
+// recorded and passes. It saves work, it does not guard safety: a Jev error passes.
+// ponytail: whole-file read per spawn and no lock (parallel spawns do not see each other); a
+// per-session file when sessions get long.
+const SUBGOALS = () => join(CONFIG.data, "subgoals.jsonl");
+async function subgoalJudge(call, asker = ask) {
+  const spec = load("subgoals.json");
+  const text = redact(call.subgoal).slice(0, 2000);
+  // Only subgoals whose spawn actually ran count (a PostToolUse record): a spawn the user rejected,
+  // another hook blocked or that failed has no result to reuse. A torn line is skipped, not fatal.
+  const lines = f => (readText(f) ?? "").split("\n").flatMap(l => { try { return l ? [JSON.parse(l)] : []; } catch { return []; } });
+  const ran = new Set(lines(FEEDBACK()).filter(r => r.event === "ran" && r.call_id).map(r => r.call_id));
+  const earlier = lines(SUBGOALS()).filter(r => r.session_id === (call.session_id ?? null) && r.agent === (call.agent ?? null) &&
+    ran.has(r.call_id)).slice(-spec.keep);
+  // Long subgoals that share a preamble differ at the end: an option keeps both.
+  const clip = s => s.length > 600 ? `${s.slice(0, 400)} … ${s.slice(-200)}` : s;
+  const base = {qset: spec.version, policy_version: spec.version, tag: "subgoal"};
+  let j = {...base, outcome: "pass", rule: "first subgoal in this session", source: "subgoal"};
+  if (earlier.length && call.session_id) {
+    const criteria = Object.fromEntries(earlier.map((r, i) => [`s${i + 1}`, clip(r.subgoal)]));
+    criteria.none = "None of them: new work, a follow-up, a different part, or a review of earlier work.";
+    const questions = {duplicate: {type: "choice", instructions: spec.instructions, criteria}};
+    const state = {subgoal: {text, cwd: call.cwd}, [spec.context_key]: spec.context};
+    const res = await asker(state, questions);
+    const a = res.answers?.duplicate, i = /^s(\d+)$/.exec(a?.choice ?? "")?.[1];
+    const p = a?.probabilities?.[a.choice] ?? a?.confidence ?? 0;   // how likely that option is
+    const dup = !res.error && i && earlier[i - 1] && p >= spec.duplicateAt ? earlier[i - 1] : null;
+    j = {...base, ...res, state, questions,
+         outcome: dup ? "deny" : "pass", source: res.error ? "fallback" : "jev",
+         rule: res.error ? `jev unavailable (${res.error.slice(0, 80)}), subgoal not checked`
+           : dup ? `duplicates a subgoal already launched in this session at ${dup.ts.slice(11, 16)} UTC ` +
+                   `(p ${p.toFixed(2)}): "${dup.subgoal.slice(0, 160)}". Reuse that result instead of starting it again`
+           : "new subgoal"};
+  }
+  // A duplicate is never recorded, even when it runs anyway (shadow): the original stays the reference.
+  if (j.outcome !== "deny") append(SUBGOALS(), {ts: new Date().toISOString(), agent: call.agent ?? null,
+    session_id: call.session_id ?? null, call_id: call.call_id ?? null, subgoal: text});
+  return j;
+}
+
 // Any internal error is a decision too: the policy fallback when enforcing, logged either way.
+// Subgoal dedup saves work rather than guarding it, so its errors always pass.
 export async function decideSafe(call, opts) {
   try { return await decide(call, opts); } catch (e) {
     console.error(`reflex: ${e.message}`);
-    const fallback = CONFIG.mode === "enforce" ? (safeFallback() ?? "ask") : "pass";
+    const fallback = CONFIG.mode === "enforce" && !call.subgoal ? (safeFallback() ?? "ask") : "pass";
     return {effective: fallback, decision: "error", reason: `reflex error (${e.message.slice(0, 80)}), fallback ${fallback}`, source: "error"};
   }
 }
@@ -736,7 +791,7 @@ function append(path, obj) {
 function trace(j, call, effective) {
   const cmd = redact(call.command);
   const state = j.state ?? {call: {title: cmd.slice(0, 160), command: cmd, cwd: call.cwd}};
-  append(TRACE(), {ts: new Date().toISOString(), tag: "tool-gate", model: CONFIG.model,
+  append(TRACE(), {ts: new Date().toISOString(), tag: j.tag ?? "tool-gate", model: CONFIG.model,
     qset_version: j.qset ?? null, latency_s: j.latency_s ?? 0, state_sha: sha(state), state,
     questions: j.questions ?? {}, answers: j.answers ?? {}, usage: j.usage ?? {}, error: j.error ?? null,
     decision: j.outcome, policy_decision: j.policy_outcome ?? j.outcome, rule: j.rule, source: j.source, policy_version: j.policy_version ?? null,
@@ -748,13 +803,23 @@ function trace(j, call, effective) {
 // ---------------------------------------------------------------------------------------------
 // Claude Code adapter: PreToolUse / PostToolUse hook JSON <-> the contract above.
 // https://docs.claude.com/en/docs/claude-code/hooks
+function claudeCall(input) {
+  const t = input.tool_input ?? {};
+  // Agent (formerly Task) spawns a subagent: its type, description and prompt are the subgoal.
+  // A resume continues earlier work on purpose, so it is not checked.
+  const subgoal = ["Task", "Agent"].includes(input.tool_name) && t.prompt && !t.resume
+    ? [t.subagent_type && `agent: ${t.subagent_type}`, t.description, t.prompt].filter(Boolean).join("\n") : undefined;
+  if (input.tool_name !== "Bash" && !subgoal) return null;
+  // A subagent's hooks carry its parent's session_id plus its own agent_id: its subgoals are its own.
+  const session_id = subgoal && input.agent_id ? `${input.session_id}/${input.agent_id}` : input.session_id;
+  return {agent: "claude-code", ...(subgoal ? {subgoal} : {command: t.command}), cwd: input.cwd,
+          session_id, call_id: input.tool_use_id, transcript_path: input.transcript_path, permission_mode: input.permission_mode,
+          unsandboxed: t.dangerouslyDisableSandbox === true};
+}
 async function claudePre(input) {
-  if (input.tool_name !== "Bash") return;
-  const d = await decideSafe({agent: "claude-code", command: input.tool_input?.command, cwd: input.cwd,
-                          session_id: input.session_id, call_id: input.tool_use_id,
-                          transcript_path: input.transcript_path, permission_mode: input.permission_mode,
-                          unsandboxed: input.tool_input?.dangerouslyDisableSandbox === true});
-  const out = claudeOut(d);
+  const call = claudeCall(input);
+  if (!call) return;
+  const out = claudeOut(await decideSafe(call));
   if (out) process.stdout.write(JSON.stringify(out));
 }
 // pass is silent: Claude Code's own permission rules decide. allow skips its prompt, but its deny
@@ -762,7 +827,7 @@ async function claudePre(input) {
 const claudeOut = d => ["allow", "ask", "deny"].includes(d.effective) ? {hookSpecificOutput: {hookEventName: "PreToolUse",
   permissionDecision: d.effective, permissionDecisionReason: d.reason}} : null;
 function claudePost(input) {
-  if (input.tool_name && input.tool_name !== "Bash") return;
+  if (input.tool_name && !["Bash", "Task", "Agent"].includes(input.tool_name)) return;
   // Claude's Bash result carries no exit code; PostToolUseFailure is the failure signal.
   const ev = input.hook_event_name;
   record({agent: "claude-code", event: ev === "PermissionDenied" ? "denied" : ev === "PostToolUseFailure" ? "failed" : "ran",
@@ -1124,6 +1189,41 @@ async function selfcheck() {
     ok(await e("bash tok.sh", spy, {cwd: proj}) === "pass" && !states.at(-1).call.script.excerpt.includes("abc.def"), "script: redacted for Jev, and then never allowed");
     writeFileSync(join(proj, "big.sh"), "echo ok\n".repeat(3000));
     ok(await e("bash big.sh", spy, {cwd: proj}) === "pass" && states.at(-1).call.script.excerpt.length <= 16 * 1024, "script: over the cap, cut and never allowed");
+    // subgoal dedup with a stubbed Jev choice
+    let asked = [];
+    const pick = (choice, confidence = 0.93, error = null) => async (state, questions) => {
+      asked.push(questions.duplicate.criteria);
+      return {answers: {duplicate: {type: "choice", choice, confidence}}, usage: {}, error, latency_s: 0};
+    };
+    // G spawns and, when it passes, reports it ran (the PostToolUse record), unless ran = false
+    const G = async (subgoal, asker, session_id = "S1", opts = {}, ran = true) => {
+      const d = await decide({agent: "claude-code", subgoal, session_id, call_id: subgoal.slice(0, 20), cwd: "/w"}, {asker, ...opts});
+      if (ran && d.effective === "pass") record({agent: "claude-code", event: "ran", session_id, call_id: subgoal.slice(0, 20)});
+      return d;
+    };
+    await G("Refactor the retry loop", pick("none"), "S0", {}, false);
+    asked = [];
+    ok((await G("Refactor the retry loop again", pick("s1"), "S0")).effective === "pass" && asked.length === 0, "subgoal: a spawn that never ran is not offered");
+    appendFileSync(join(scratch, "subgoals.jsonl"), "{torn\n");
+    const first = await G("Find every caller of parseConfig", pick("none"));
+    ok(first.effective === "pass" && asked.length === 0, "subgoal: the first in a session passes without asking Jev; a torn line is skipped");
+    ok((await G("Write tests for the retry loop", pick("none"))).effective === "pass" && Object.keys(asked[0]).join() === "s1,none", "subgoal: earlier ones are the options, plus none");
+    const dup = await G("Locate all places that call parseConfig", pick("s1"));
+    ok(dup.effective === "deny" && dup.reason.includes("Find every caller of parseConfig") && /Reuse that result/.test(dup.reason), "subgoal: a confident duplicate is denied, naming the earlier one");
+    ok((await G("Find callers of parseConfig again", pick("s1", 0.5))).effective === "pass", "subgoal: an unsure duplicate passes");
+    ok((await G("Something else", pick("s9"))).effective === "pass", "subgoal: an option that does not exist passes");
+    ok((await G("Anything", pick("s1", 0.99, "HTTP 500"))).effective === "pass", "subgoal: a Jev error passes");
+    asked = [];
+    ok((await G("Find every caller of parseConfig", pick("s1"), "S2")).effective === "pass" && asked.length === 0, "subgoal: other sessions are not compared");
+    CONFIG.mode = "shadow";
+    const sh = await G("Find every caller of parseConfig", pick("s1"), "S1", {background: true});
+    ok(sh.effective === "pass" && sh.decision === "deny", "subgoal shadow: logged as deny, effective pass");
+    CONFIG.mode = "enforce";
+    const sg = readText(join(scratch, "subgoals.jsonl")).trim().split("\n").filter(l => l !== "{torn").map(l => JSON.parse(l));
+    ok(sg.filter(r => r.session_id === "S1").length === 5 && !sg.some(r => r.subgoal.startsWith("Locate")), "subgoal: passes are recorded, duplicates never");
+    await G(`Deploy with token ghp_${"a".repeat(36)}`, pick("none"));
+    ok(!readText(join(scratch, "subgoals.jsonl")).includes("ghp_aaaa"), "subgoal: recorded redacted");
+    ok((await decideSafe({agent: "x", subgoal: "y", session_id: "S1"}, {asker: async () => { throw new Error("boom"); }})).effective === "pass", "subgoal: an internal error passes");
     CONFIG.allow = "shadow";
     const w = await D("prettier --write c");
     ok(w.effective === "pass" && w.decision === "would_allow", "allow shadow: logged as would_allow, effective pass");
@@ -1151,6 +1251,11 @@ async function selfcheck() {
     ok(/not enough data/.test(rep([])) && /not enough data: 1 labelled/.test(rep(["--calibration"])), "report: says when there is not enough data");
   } finally { Object.assign(CONFIG, saved); rmSync(scratch, {recursive: true, force: true}); }
   // adapters
+  const cc = claudeCall({tool_name: "Agent", tool_input: {prompt: "Find X", description: "find", subagent_type: "Explore"}, session_id: "s"});
+  ok(cc.subgoal === "agent: Explore\nfind\nFind X" && !cc.command && claudeCall({tool_name: "Task", tool_input: {prompt: "p"}}).subgoal === "p" &&
+     claudeCall({tool_name: "Bash", tool_input: {command: "ls"}}).command === "ls" && claudeCall({tool_name: "Read", tool_input: {}}) === null, "claude: Agent/Task is a subgoal, Bash a command");
+  ok(claudeCall({tool_name: "Agent", tool_input: {prompt: "p", resume: "a1"}}) === null &&
+     claudeCall({tool_name: "Agent", tool_input: {prompt: "p"}, session_id: "s", agent_id: "a7"}).session_id === "s/a7", "claude: a resume is not checked; a subagent has its own subgoals");
   const dA = {effective: "allow", reason: "r"};
   ok(claudeOut(dA)?.hookSpecificOutput.permissionDecision === "allow" && claudeOut({effective: "pass"}) === null, "claude: allow skips its prompt, pass is silent");
   ok(codexOut(dA) === null && codexOut({effective: "ask", reason: "r"}).hookSpecificOutput.permissionDecision === "deny", "codex: allow is silent, ask blocks");

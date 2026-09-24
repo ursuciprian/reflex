@@ -82,9 +82,10 @@ const AGENTS = {
     if (s.env?.REFLEX_MODE) delete s.env.REFLEX_MODE;
     if (s.env?.REFLEX_ALLOW) delete s.env.REFLEX_ALLOW;
     if (!UNINSTALL) {
-      s.hooks.PreToolUse = [...(s.hooks.PreToolUse ?? []), group("Bash", "--claude", 10)];
+      // Task|Agent: subgoal dedup before a subagent is spawned, and its PostToolUse marks it launched
+      s.hooks.PreToolUse = [...(s.hooks.PreToolUse ?? []), group("Bash|Task|Agent", "--claude", 10)];
       for (const ev of ["PostToolUse", "PostToolUseFailure", "PermissionDenied"])
-        s.hooks[ev] = [...(s.hooks[ev] ?? []), group("Bash", "--claude-post", 5)];
+        s.hooks[ev] = [...(s.hooks[ev] ?? []), group("Bash|Task|Agent", "--claude-post", 5)];
       s.permissions.ask.push(...guard);
     }
     if (!s.permissions.ask.length) delete s.permissions.ask;
