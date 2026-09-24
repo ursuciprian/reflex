@@ -9,7 +9,8 @@
 5. [Metrics](#metrics)
 6. [Data handling](#data-handling)
 7. [Safety properties and limits](#safety-properties-and-limits)
-8. [Where this goes next](#where-this-goes-next)
+8. [Model routing](#model-routing)
+9. [Where this goes next](#where-this-goes-next)
 
 ## How a command is decided
 
@@ -224,11 +225,83 @@ and [confidence](https://docs.typesafe.ai/confidence).
   infrastructure history, about one in five commands never needed the API; the rest are mostly
   inline scripts and multi-step remote commands.
 
+## Model routing
+
+`routing/reflex_router.py` is a LiteLLM `CustomLogger` whose `async_pre_call_hook` runs before
+LiteLLM's router picks a deployment, so changing `data["model"]` there changes which model group
+serves the request. It only touches conversation calls (chat completions, `/v1/messages`,
+Responses); embeddings, images and files pass untouched.
+
+Per request:
+
+1. **Family.** The requested model must match a family in `routing/policy.json` (`claude-*`,
+   `gpt-*`, …). Routing never leaves the family: on a subscription gateway the clients' credentials
+   are not interchangeable across providers. Anything else is logged as `skip` and left alone.
+2. **Floors, no model.** A credential shape anywhere in the conversation (the same patterns as the
+   gate's redaction, tool results included) or a path matching `restricted_paths` (`.env`, `*.pem`,
+   `*.tfvars`, `envs/prod`, `secret` …) makes the request at least `restricted`, whatever Jev says.
+3. **Jev**, one call, cached for an hour by a hash of the question state. The state is the last
+   thing the user typed (tool results and `<system-reminder>` blocks removed), the first 400
+   characters of the system prompt, the tool names, the file paths mentioned anywhere in the
+   conversation, and the turn number — all redacted. Questions (`routing/questions.json`):
+
+   | Question | Type | Meaning |
+   |---|---|---|
+   | `sensitivity` | choice | public / application / restricted / proprietary |
+   | `difficulty` | score 0–2 | small / medium / large model tier |
+   | `needs_tools` | noul | does the answer need the offered tools |
+
+   `restricted` is also taken when P(restricted) + P(proprietary) ≥ `restricted_at` (0.25), so a
+   hesitant answer errs towards the safer pool.
+4. **Pool and tier.** `sensitivity.pools` names the model tags a sensitivity requires: `public`
+   any, `application` `first_party`, `restricted` and `proprietary` `first_party` + `frontier`.
+   The model is the cheapest eligible one at or above the difficulty tier; a model with
+   `"tools": false` is skipped when tools are needed.
+5. **Stickiness** (paper §II.A). Changing model mid-conversation makes the new model reprocess the
+   whole context. Per conversation (LiteLLM's `litellm_session_id`, set from `x-*-session-id`
+   headers and Claude Code's metadata; otherwise a hash of the system prompt and first message) the
+   last model is kept, and a move to a cheaper model happens only when
+
+   `(context × cache_read_factor + turn_tokens) × (old − new input price) × remaining_turns > context × new input price`
+
+   With `remaining_turns: 1` the switch must pay for itself on the next turn: small conversations
+   move down freely, large ones stay. Moving up a tier and moves forced by sensitivity always
+   happen; a Responses call with `previous_response_id` never moves for cost.
+6. **Key limits.** A model the caller's virtual key may not use is never chosen.
+
+| Mode (`REFLEX_ROUTING_MODE`) | Request | Decision |
+|---|---|---|
+| `off` | untouched | none |
+| `shadow` (default) | keeps the requested model, no added latency | made in a background task and logged |
+| `enforce` | model rewritten | made inline within `latency_budget_ms` (1.5 s) |
+
+**Errors.** A Jev error, timeout or incomplete answer uses `fallback` (restricted, medium): safe,
+not cheap. An internal error keeps the requested model; routing never fails a request.
+
+**Log.** `routing.jsonl` in `REFLEX_DATA_DIR`: conversation hash, state hash, requested / chosen /
+applied model, sensitivity, tier, Jev's raw answers, which floors fired, the stickiness reason,
+tokens, latency, and `violation: true` when the requested model was not eligible for the content.
+No message text or paths are written. In shadow mode `chosen` is what enforce would have used.
+
+**Test.**
+
+```sh
+python3 routing/reflex_router.py --selfcheck           # offline, Jev stubbed; part of npm test
+python3 routing/reflex_router.py --check "Rotate the prod DB password in .env" --model claude-haiku-4-5
+python3 routing/reflex_router.py --smoke               # 10 labelled prompts through live Jev
+```
+
+**Limits.** State (cache, per-conversation model) is per process: with several LiteLLM workers
+each keeps its own, so stickiness can be missed on a worker switch. Tokens are estimated as
+characters / 4. Prices in `policy.json` are list prices you maintain. When no model in the family
+is eligible for the content, the request keeps its model and the log marks the violation; it is
+not blocked.
+
 ## Where this goes next
 
 Reflex is the tool-gating slice of a wider decision layer: one engine (typed questions, a trace,
-a policy file, a replayable report) reused for other decisions. The same pieces fit model routing
-(a `choice` of small / medium / large before a request reaches the LLM gateway), LLM evals (a
+a policy file, a replayable report) reused for other decisions. Model routing is the first
+of these ([above](#model-routing)); the same pieces fit LLM evals (a
 `score` per dimension with an uncertain band escalated to a stronger judge), reranking (a
 comparable `score` per retrieved document) and confidence gating (policy thresholds per task,
 calibrated from the feedback log). Each is a new `setup/<name>/` directory and an integration
