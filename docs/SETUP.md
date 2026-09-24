@@ -128,6 +128,34 @@ All optional.
 | `REFLEX_INSTRUCTIONS_MAX_CHARS` | `6000` | Most fragment text injected per prompt; whole fragments are dropped, never cut |
 | `XDG_CONFIG_HOME` | `~/.config` | Personal fragments are read from `$XDG_CONFIG_HOME/reflex/instructions/`; they win over a repo fragment with the same id |
 
+## Optional: the tool router
+
+An MCP server that gives the agent three tools (`find_tools`, `describe_tool`, `run`) in front of
+built-in read-only shell tools and any MCP servers you list; Jev picks the tool and its arguments.
+How it works: [GUIDE → Tool router](GUIDE.md#tool-router).
+
+```sh
+node router/server.mjs --selfcheck                              # offline, also part of npm test
+node router/server.mjs --check "show the last 5 commits" --run  # one live Jev round trip
+npm run eval-router                                             # router/golden.json through live Jev; nothing runs; exit 1 only on unsafe
+node install.mjs --router                                       # prints the registration for every agent
+node install.mjs --router --agent codex --mode enforce          # one agent; --mode is the gate's mode for the router's calls
+```
+
+`--router` only prints: registering an MCP server writes the agent's global config (`~/.claude.json`,
+`~/.codex/config.toml`, …), so you run the printed command or paste the snippet yourself. If the key
+lives in the Keychain under a non-default name, run it with `REFLEX_KEYCHAIN_SERVICE` set and the
+snippets carry it in their `env`. To route other MCP servers, move their entries from the agent's
+config into `router/config.json` (`mcpServers`, `.mcp.json` shape; stdio only).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `REFLEX_ROUTER_CONFIG` | `router/config.json` | Downstream MCP servers |
+| `REFLEX_ROUTER_MIN_CONFIDENCE` | `0.5` | Below this probability for the tool or any argument, `run` returns candidates instead of running |
+| `REFLEX_ROUTER_TIMEOUT_MS` | `30000` | Per shell command and per downstream request |
+
+Selections are logged to `router.jsonl` in `REFLEX_DATA_DIR`.
+
 ## Optional: Grafana
 
 Push a snapshot of the metrics to a Prometheus Pushgateway, e.g. every five minutes from cron:

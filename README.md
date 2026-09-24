@@ -33,6 +33,13 @@ agent wants to run a command
       agent's stated intent ──► policy thresholds ──► pass / ask / deny
 ```
 
+**Tool router (optional).** `router/server.mjs` is an MCP server that puts three tools —
+`find_tools`, `describe_tool`, `run` — in front of a whole catalog: built-in read-only shell tools
+(ripgrep, git log/diff/blame, kubectl get, aws describe …) and every tool of the MCP servers you
+list in `router/config.json`. Jev picks the tool and fills its arguments from the agent's intent,
+and hands back candidates instead of guessing when it is unsure. Every call it makes, shell or
+downstream MCP, goes through the gate first (unless you mark a server `"trusted"`). See [GUIDE → Tool router](docs/GUIDE.md#tool-router).
+
 **The gate can only tighten.** It emits `ask` or `deny`, never `allow`, so your existing
 permission rules stay authoritative and a model can never authorize anything on its own.
 
@@ -66,7 +73,7 @@ git clone https://github.com/ursuciprian/reflex.git && cd reflex
 export TYPESAFE_API_KEY=...          # from https://console.typesafe.ai/keys — see docs/SETUP.md
 npm test                             # offline self-checks, no API calls
 node gate.mjs --check "terraform apply -auto-approve" --cwd ~/infra/envs/prod
-npm run eval                         # 44 labelled commands through the real gate (~33k tokens)
+npm run eval                         # 63 labelled commands through the real gate (~31k tokens)
 node install.mjs --agent all         # hook into every supported agent found here, shadow mode
 ```
 
@@ -94,6 +101,13 @@ week, `node report.mjs` shows the decisions, and `node install.mjs --mode enforc
 | `eval.mjs` | Runs the golden set through the real gate; exits 1 on any missed risk |
 | `report.mjs` | Summary, replay under a candidate policy, Prometheus Pushgateway export |
 | `install.mjs` | Adds / removes Reflex (gate and instructions) in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`) |
+| `install.mjs` | Adds / removes Reflex in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`); `--router` prints how to register the tool router in each agent |
+| `router/server.mjs` | Tool router: stdio MCP server (`find_tools`, `describe_tool`, `run`), Jev tool selection and argument filling, schema validation, gated shell execution, downstream MCP proxy |
+| `router/mcp.mjs` | Newline-delimited JSON-RPC over stdio, server and client side (no SDK) |
+| `router/commands.json` | Built-in command tools: name, description, argument schema, argv template |
+| `router/config.json` | Downstream stdio MCP servers whose tools join the catalog (`mcpServers`, same shape as `.mcp.json`) |
+| `router/golden.json` | Labelled intents for `npm run eval-router` (tool and arguments chosen by real Jev; nothing runs) |
+| `router/test/` | Fake downstream MCP server and stubbed Jev for `npm test` |
 | `dashboards/reflex.json` | Grafana dashboard for the pushed metrics |
 
 Node 18+, no dependencies.

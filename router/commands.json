@@ -1,0 +1,106 @@
+{
+  "version": "router-commands-1",
+  "about": "Built-in command tools. `args` is an argv template run with execFile (never a shell): \"{x}\" is replaced by argument x, \"{x...}\" by x split on spaces (enums only), and a nested array is a group kept only when every placeholder in it has a value (a boolean placeholder keeps its group when true and is itself dropped). A tool is offered only when `bin` is on PATH. Every run goes through the Reflex gate first.",
+  "tools": [
+    {
+      "name": "rg_search", "category": "search", "bin": "rg",
+      "description": "Search file contents in the working tree for a text or regular expression with ripgrep; prints matching lines with file and line number.",
+      "args": ["-n", "--no-heading", "--color", "never", ["-i", "{ignore_case}"], ["-g", "{glob}"], "-e", "{pattern}", "--", "{path}"],
+      "inputSchema": {"type": "object", "additionalProperties": false, "required": ["pattern"], "properties": {
+        "pattern": {"type": "string", "minLength": 1, "x-allow-dash": true, "description": "The text or regular expression to look for inside files"},
+        "path": {"type": "string", "minLength": 1, "pattern": "^[^*?]+$", "default": ".", "description": "The directory or file to search in (a real path: a wildcard such as *.go is a file-name filter, not a path)"},
+        "glob": {"type": "string", "description": "A file-name filter such as *.go or *.tf, limiting which files are searched"},
+        "ignore_case": {"type": "boolean", "description": "Match regardless of upper or lower case"}
+      }}
+    },
+    {
+      "name": "grep_search", "category": "search", "bin": "grep",
+      "description": "Search file contents under a directory for a text or regular expression with grep; prints matching lines with file and line number, skipping binary files.",
+      "args": ["-rnI", ["-i", "{ignore_case}"], ["--include", "{glob}"], "-e", "{pattern}", "--", "{path}"],
+      "inputSchema": {"type": "object", "additionalProperties": false, "required": ["pattern"], "properties": {
+        "pattern": {"type": "string", "minLength": 1, "x-allow-dash": true, "description": "The text or regular expression to look for inside files"},
+        "path": {"type": "string", "minLength": 1, "pattern": "^[^*?]+$", "default": ".", "description": "The directory or file to search in (a real path: a wildcard such as *.go is a file-name filter, not a path)"},
+        "glob": {"type": "string", "description": "A file-name filter such as *.py, limiting which files are searched"},
+        "ignore_case": {"type": "boolean", "description": "Match regardless of upper or lower case"}
+      }}
+    },
+    {
+      "name": "ast_grep", "category": "search", "bin": "ast-grep",
+      "description": "Structural code search with ast-grep: find code matching a syntax pattern such as console.log($A), not just text.",
+      "args": ["run", "-p", "{pattern}", ["-l", "{lang}"], "--", "{path}"],
+      "inputSchema": {"type": "object", "additionalProperties": false, "required": ["pattern"], "properties": {
+        "pattern": {"type": "string", "minLength": 1, "description": "The code pattern to match, written as code with $VARS as wildcards"},
+        "lang": {"type": "string", "enum": ["bash", "c", "cpp", "csharp", "css", "go", "html", "java", "javascript", "json", "kotlin", "lua", "python", "ruby", "rust", "scala", "swift", "tsx", "typescript", "yaml"], "description": "The programming language of the code being searched"},
+        "path": {"type": "string", "minLength": 1, "pattern": "^[^*?]+$", "default": ".", "description": "The directory or file to search in (a real path: a wildcard such as *.go is a file-name filter, not a path)"}
+      }}
+    },
+    {
+      "name": "git_log", "category": "git", "bin": "git",
+      "description": "Show the commit history of the repository, or of one file or directory: hash and subject per commit, newest first.",
+      "args": ["log", "--oneline", "--no-color", "-n", "{max_count}", ["--author", "{author}"], ["--since", "{since}"], "--", ["{path}"]],
+      "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
+        "path": {"type": "string", "minLength": 1, "description": "Only commits touching this file or directory"},
+        "max_count": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20, "description": "How many commits to show at most"},
+        "author": {"type": "string", "description": "Only commits by this person (name or email)"},
+        "since": {"type": "string", "description": "Only commits after this date or age, such as 2024-01-01 or 2.weeks"}
+      }}
+    },
+    {
+      "name": "git_diff", "category": "git", "bin": "git",
+      "description": "Show uncommitted changes in the working tree, or the changes between the working tree and a branch, tag or commit.",
+      "args": ["diff", "--no-color", "--no-ext-diff", "--no-textconv", ["--stat", "{stat}"], ["{ref}"], "--", ["{path}"]],
+      "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
+        "ref": {"type": "string", "pattern": "^[\\w./~^@{}-]+$", "description": "The branch, tag or commit to compare against, such as main or HEAD~1"},
+        "path": {"type": "string", "minLength": 1, "description": "Only changes to this file or directory"},
+        "stat": {"type": "boolean", "description": "Only a summary of changed files and line counts, not the full diff"}
+      }}
+    },
+    {
+      "name": "git_blame", "category": "git", "bin": "git",
+      "description": "Show who last changed each line of a file, and in which commit.",
+      "args": ["blame", "--no-textconv", ["-L", "{lines}"], "--", "{path}"],
+      "inputSchema": {"type": "object", "additionalProperties": false, "required": ["path"], "properties": {
+        "path": {"type": "string", "minLength": 1, "description": "The file to annotate"},
+        "lines": {"type": "string", "pattern": "^\\d+,\\d+$", "description": "Only this line range, written start,end such as 10,40"}
+      }}
+    },
+    {
+      "name": "kubectl_get", "category": "kubernetes", "bin": "kubectl",
+      "description": "List Kubernetes resources (pods, deployments, services, nodes, ...) in a cluster, read-only.",
+      "args": ["get", "{resource}", ["{name}"], ["-n", "{namespace}"], ["-A", "{all_namespaces}"], ["--context", "{context}"], ["-o", "{output}"]],
+      "inputSchema": {"type": "object", "additionalProperties": false, "required": ["resource"], "properties": {
+        "resource": {"type": "string", "pattern": "^(?!.*\\bsecrets?\\b)[a-z0-9.,/-]+$", "description": "The kind of Kubernetes resource to list (not secrets), such as pods, deployments, services or nodes"},
+        "name": {"type": "string", "pattern": "^[a-z0-9.-]+$", "description": "One resource by name"},
+        "namespace": {"type": "string", "pattern": "^[a-z0-9-]+$", "description": "The namespace to look in"},
+        "all_namespaces": {"type": "boolean", "description": "Look across every namespace"},
+        "context": {"type": "string", "pattern": "^[\\w.:@/-]+$", "description": "The kubeconfig context, which selects the cluster"},
+        "output": {"type": "string", "enum": ["wide", "yaml", "json", "name"], "description": "The output format"}
+      }}
+    },
+    {
+      "name": "kubectl_describe", "category": "kubernetes", "bin": "kubectl",
+      "description": "Show the detailed state and recent events of one Kubernetes resource, read-only; useful to see why a pod is failing.",
+      "args": ["describe", "{resource}", "{name}", ["-n", "{namespace}"], ["--context", "{context}"]],
+      "inputSchema": {"type": "object", "additionalProperties": false, "required": ["resource", "name"], "properties": {
+        "resource": {"type": "string", "pattern": "^[a-z0-9./-]+$", "description": "The kind of Kubernetes resource, such as pod, deployment or node"},
+        "name": {"type": "string", "pattern": "^[a-z0-9.-]+$", "description": "The name of the resource"},
+        "namespace": {"type": "string", "pattern": "^[a-z0-9-]+$", "description": "The namespace it lives in"},
+        "context": {"type": "string", "pattern": "^[\\w.:@/-]+$", "description": "The kubeconfig context, which selects the cluster"}
+      }}
+    },
+    {
+      "name": "aws_describe", "category": "aws", "bin": "aws",
+      "description": "Read-only AWS inventory: list or describe EC2 instances, VPCs, security groups, S3 buckets, RDS databases, EKS and ECS clusters, Lambda functions, IAM roles, CloudFormation stacks, or show the current identity.",
+      "args": ["{operation...}", ["--region", "{region}"], ["--profile", "{profile}"], "--no-cli-pager"],
+      "inputSchema": {"type": "object", "additionalProperties": false, "required": ["operation"], "properties": {
+        "operation": {"type": "string", "description": "What to look up in AWS", "enum": [
+          "sts get-caller-identity", "ec2 describe-instances", "ec2 describe-vpcs", "ec2 describe-subnets",
+          "ec2 describe-security-groups", "s3api list-buckets", "rds describe-db-instances", "rds describe-db-clusters",
+          "eks list-clusters", "ecs list-clusters", "lambda list-functions", "iam list-roles",
+          "cloudformation describe-stacks", "route53 list-hosted-zones"]},
+        "region": {"type": "string", "pattern": "^[a-z]{2}(-gov)?-[a-z]+-\\d$", "description": "The AWS region, such as eu-west-1"},
+        "profile": {"type": "string", "pattern": "^[\\w.+-]+$", "description": "The named AWS CLI profile, which selects the account"}
+      }}
+    }
+  ]
+}
