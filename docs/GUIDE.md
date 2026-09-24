@@ -12,6 +12,7 @@
 8. [Conditional instructions](#conditional-instructions)
 8. [Tool router](#tool-router)
 8. [Model routing](#model-routing)
+8. [Context layer (pi and oh-my-pi)](#context-layer-pi-and-oh-my-pi)
 9. [Where this goes next](#where-this-goes-next)
 
 ## How a command is decided
@@ -75,7 +76,8 @@ Four layers, cheapest first.
 npm test
 ```
 
-About 60 checks, no network: read-only detection (including bypass attempts such as
+`npm test` also runs `node context.mjs --selfcheck` (the context layer, against a fake Jev on
+localhost). About 60 gate checks, no network: read-only detection (including bypass attempts such as
 `rtk proxy rm`, `ssh h 'echo' '; rm -rf /'`, `$(security find-generic-password …)`), redaction,
 every shipped rule, the fast lane, every policy gate, and the whole path for non-Jev commands.
 Add an assertion whenever you change `readOnly()`, a rule or a gate.
@@ -205,6 +207,16 @@ and [confidence](https://docs.typesafe.ai/confidence).
 - **Conditional instructions** send, per prompt that has undecided fragments: the prompt (redacted,
   first 4,000 characters), the working directory, recently touched file paths, the last five
   commands (redacted), and each fragment's `when` condition. The fragment bodies stay local.
+- **Context layer (opt-in, pi / omp).** When installed with `--context`, redacted samples of tool
+  output (per chunk at most ~1,000 characters of start and end plus up to six matching lines of 200
+  characters), the user's request and the agent's last message go to TypeSafe for relevance judging;
+  `bin/reflex-review` and `context.mjs --bundle` send a redacted diff excerpt, the goal and matching
+  lines. The chunk store (`chunks/`) keeps full outputs **unredacted**, exactly as the tool printed
+  them, because `expand_chunk` must give the agent back what it would otherwise have seen; that is
+  the same data the agent's own session file holds. The store is local, its directories are 0700 and
+  its files 0600, and it is pruned (see *Context layer*). Bundles and reviews are written 0600: they
+  hold the unredacted diff and code. The reviewer command you configure receives the unredacted diff
+  and related code, because it is your own model.
 - **Locally**, logs contain the same redacted data and stay in `~/.local/state/reflex/`. Trace and
   feedback files rotate at 50 MB. Command output is never stored.
 
@@ -621,6 +633,118 @@ list prices you maintain. The guardrail and limit comparison covers model-level 
 the key's per-model rpm / tpm / budget (key, then team metadata, then deployment defaults, as
 LiteLLM resolves them); team-, user- and end-user-level `model_max_budget` are not compared, and
 budgets are matched on the exact model name.
+## Context layer (pi and oh-my-pi)
+
+The gate decides whether a command may run. The context layer uses the same Jev client for a
+different decision: what the model should *see* on each request. It follows *Jev Engineering for
+Coding Agents*: make agent state explicit and let a fast judge pick, per query, how much of each
+piece of context goes into the prompt, instead of compacting blindly when the window fills. It is an
+optimisation, not a safety control, so **everything fails open**: on any error (Jev down, timeout,
+incomplete answers, a store that cannot be written) the output or the message list is left exactly as
+it was. Every decision is a line in `~/.local/state/reflex/context.jsonl` (kind, levels, cost-model
+numbers, tokens, latency, error).
+
+Only pi and oh-my-pi let an extension rewrite tool results and the messages sent to the model, so the
+layer ships as a pi / omp extension, `adapters/pi-context.ts`, over a dependency-free core,
+`context.mjs`. Install it with `node install.mjs --agent pi,omp --context`; `--no-context` removes it;
+a plain re-install refreshes it only where it is already installed, so re-running the installer (for
+example to change `--mode`) never switches it on or off by accident.
+
+**Visibility ladder (§V), on `tool_result`.** An output of 200+ lines or 16 KB+ (bash, grep, find, ls,
+custom tools; not `read` / `edit` / `write`, whose exact text the model edits against) is split along
+its own structure (a grep hit list by file; a diff by file and hunk, never packing two files into one
+chunk while the budget allows; anything else by blank-line sections, also inside `cat -n` output)
+into at most 24 chunks. One Jev request carries one `choice` per chunk, **hide / short / long /
+full**, judged against the user's current request and the agent's last message. For each chunk Jev
+sees where it comes from (the files in a grep or diff chunk), `matches` (up to six numbered lines that
+share the most words with the request) and an excerpt of its start and end, and is asked whether any
+of it could be what the request is about (a definition, setting, default, error or call it names);
+*hide* only when nothing bears on it. Request words are the non-stop-words, prefix-stemmed ("cached"
+finds `CACHE_TTL`), minus words that occur on more than a fifth of the output's lines. Jev judges, it
+does not write text, so the levels are rendered by code: *short* = the first two and last line, up to
+12 lines that mention the request (most shared words first) and the chunk's first six definitions
+(`const`, `function`, `class`, … lines, because the line a question is about often shares no word
+with it); *long* = the same with three lines of context around each hit, up to 60 lines and twelve
+definitions; *full* = the chunk as is. A *hide* with probability under 0.7 becomes *short*: hiding is
+the only level that can cost the agent something. The model gets the kept lines, `… [lines a-b
+hidden] …` markers and one note naming the chunk id. The full output is written to
+`chunks/<session>/<id>.txt` before anything is replaced, and the **`expand_chunk`** tool (`{"id": …,
+"lines": "a-b"}`) returns it: a 2,400-line grep can be 12 hits for one question and come back whole
+for the next. If the view would not save 20 %, the output is left alone.
+
+**Chunk store.** Files are 0600 in 0700 directories. When the extension loads, chunks not written or
+read for `REFLEX_CHUNK_DAYS` (7) days are deleted, then the least recently used ones beyond
+`REFLEX_CHUNK_MB` (200) MB; `node context.mjs --prune` does the same by hand. Pruning is the one
+place where data can go: a session resumed after that long gets "chunk not found" from
+`expand_chunk` for outputs the ladder cut, and has to re-run the command. Raise the limits if you
+resume sessions after weeks.
+
+**Per-request assembly and the cache decision (§V), on `context`.** pi and omp fire `context` before
+every LLM call with a copy of the message list. When a new user request appears, one batched Jev
+request rates up to 24 of the largest earlier tool results against it (one `choice` each) and asks one
+`noul`: *is the context assembled for the previous request still the right context for this one?* A
+result the ladder already cut is judged and re-rendered from its stored full output (when the store
+still has it and the cut view is a selection of its lines), so a new request can see lines the first
+one did not need. The proposed view replaces hidden and shortened results with stubs pointing at
+`expand_chunk`; a view that would not be smaller than the message leaves it as it is. Whether it
+is applied is a cost decision, because providers cache the longest unchanged prompt prefix and
+changing message *k* re-sends everything after *k* uncached:
+
+```
+keep    = H · T · r
+rebuild = (T − S) · w + (H − 1) · (T − S) · r
+T  tokens after the first message the new view changes      S  tokens the new view saves
+r  cache-read price / uncached (REFLEX_CACHE_READ, 0.1)      w  cache-write price (REFLEX_CACHE_WRITE, 1.25)
+H  LLM calls expected to reuse the prefix: calls per user request so far, clamped to 2..20
+```
+
+It rebuilds when `rebuild < keep`, or when Jev says the old context no longer fits (noul < 0.5),
+because stale context costs answer quality, which the formula does not price. Otherwise the previous
+view is kept. Between requests the chosen view is re-applied on every call from memoised stubs, so
+the prefix stays byte-identical and cacheable, and no Jev call is made until the next user request.
+Tokens are estimated as characters / 4, which is enough for a comparison.
+
+**Restart with recall (§II.E), `/fresh <goal>`.** Rates the last 24 messages of the branch (user
+requests, assistant replies, tool results) against the new goal, starts a new session and sends the
+goal with only the relevant items, each at its level and with its `expand_chunk` id; the rest is
+left behind but still expandable. If Jev fails, the session is left as it is.
+
+**Shared retrieval for background tasks (§X), `node context.mjs --bundle`.** Given a change
+(`git diff <base>` plus untracked files that are not ignored, diffed against `/dev/null`), it
+collects the names defined on changed lines and in hunk context, plus the
+changed files' basenames, looks each up once with `git grep --untracked -w`, rates up to 24 candidate files with
+one Jev `choice` each (*irrelevant / related / essential*) and writes a bundle JSON: diff, changed
+files, symbols, related files with their matching lines, essential files in full, skipped files,
+tokens. Without Jev every candidate is kept as *related*, marked `judged: false`. Any read-only
+background task (cross-model review, eval generation, a progress page) can consume the bundle instead
+of searching again; `bin/reflex-review` is the example:
+
+```sh
+bin/reflex-review --reviewer "codex exec -s read-only -" --goal "normalise case in parseThing" &
+REFLEX_REVIEWER="claude -p --permission-mode plan" bin/reflex-review --base origin/main &
+```
+
+It sends a review prompt built from the bundle to the reviewer command on stdin and saves the output
+in `~/.local/state/reflex/reviews/`. The reviewer is responsible for staying read-only; pick its
+read-only mode as above.
+
+**Verified vs experimental.**
+
+| Piece | Status |
+|---|---|
+| Event and API surface | Read in the installed sources. pi 0.84.2, `dist/core/extensions/types.d.ts`: `tool_result` returns `{content, details, isError}`, `context` returns `{messages}`, `registerTool`, `registerCommand`, `ctx.newSession({withSession})`. omp 18.1.17, `src/extensibility/extensions/types.ts`: the same events, `newSession` without `withSession`, tool `approval` and `loadMode`; `runner.ts`: `emitContext`, 30 s handler budget; `sdk.ts`: `transformContext` calls `emitContext` before each LLM call. Both accept plain JSON Schema tool parameters (pi-ai / omp pi-ai `validateToolArguments`) |
+| Ladder, store, `expand_chunk`, assembly, cache decision, `/fresh`, bundle, reviewer | `node context.mjs --selfcheck`: the real extension driven with a fake `pi`, fake events and a fake Jev server on localhost, including every fail-open path |
+| Extension loads in the real agents | `pi -e` and `omp -e` load it without errors; in omp `expand_chunk` is in the provider request's tool list |
+| Extension loads in the real agents (this revision) | `pi -e` and `omp -e` with a throwaway `HOME` and `PI_CODING_AGENT_DIR` load it without extension errors |
+| Live Jev, ladder | `npm run eval-context`: 16 real outputs of this repo (greps, `cat -n`, a 1,026-line `git show`) at a pinned commit, each with the lines that must stay visible (`setup/context/golden.json`). jev-1.13.0, three runs: must-keep recall 17/17, 16/17 and 17/17, 73-74 % of characters hidden, ~188k input tokens per run (~12k per output). The ladder as first written: 15/17 on both runs, 83-85 % hidden. Twelve cases were used while tuning the question and the rendering; the four `late-*` cases were added afterwards and passed on every run of both versions. Jev's choices vary between runs, so treat one run as a sample |
+| Live Jev, smoke | `node context.mjs --smoke`: a ~490-line grep of this repo against a timeout question keeps the `timeoutMs` default and `ask()`; ~68 % hidden, ~11k input tokens, 1 s |
+| Quality over real sessions, the cost-model parameters, `/fresh` in a live session | **Experimental.** Not measured yet: read `context.jsonl` and tune. A miss is recoverable with `expand_chunk`, and it is why this layer is opt-in |
+
+Limits: only tool results are levelled, not tool-call inputs or reasoning (providers require some
+reasoning blocks to be replayed unchanged); which lines a *short* or *long* view keeps is lexical
+(request words and definitions), so a line that shares nothing with the request and is not a
+definition can be cut from a chunk Jev rated relevant; the bundle's symbol search is name matching,
+not a language index; the view lives in memory, so a resumed session starts with a fresh decision.
 
 ## Where this goes next
 

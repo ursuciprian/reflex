@@ -7,6 +7,8 @@
 //   node install.mjs --agent codex           Codex CLI    ~/.codex/hooks.json PreToolUse + UserPromptSubmit (then trust them in /hooks)
 //   node install.mjs --agent opencode        opencode     ~/.config/opencode/plugins/reflex.js (tool.execute.before, chat.message)
 //   node install.mjs --agent pi | omp        pi / oh-my-pi ~/.{pi,omp}/agent/extensions/reflex.ts (tool_call, before_agent_start)
+//     --context | --no-context               add / remove reflex-context.ts, the Jev context layer (context.mjs);
+//                                            with neither, an installed context layer is refreshed and kept
 //   node install.mjs --agent hermes          prints the config.yaml pre_tool_call / pre_llm_call blocks to paste per profile
 //   node install.mjs --agent all             every agent found on this machine
 //   node install.mjs --router [--agent x]    print (never apply) the MCP registration of router/server.mjs
@@ -32,6 +34,8 @@ const INSTRUCTIONS = join(REPO, "instructions.mjs");
 const MODE = opt("--mode", "shadow");
 const NODE = opt("--node", process.execPath);   // absolute, so hooks work without the shell's PATH
 const UNINSTALL = argv.includes("--uninstall");
+const CONTEXT = argv.includes("--context") ? "on" : argv.includes("--no-context") ? "off" : "keep";
+if (argv.includes("--context") && argv.includes("--no-context")) throw new Error("--context and --no-context conflict");
 if (!["off", "shadow", "enforce"].includes(MODE)) throw new Error("--mode must be off, shadow or enforce");
 if (Number(process.versions.node.split(".")[0]) < 18) throw new Error(`node 18+ required, found ${process.versions.node}`);
 
@@ -61,11 +65,21 @@ const group = (matcher, flag, timeout) => ({matcher, hooks: [{type: "command", c
 const promptGroup = flag => ({hooks: [{type: "command", command: cmd(flag, INSTRUCTIONS), timeout: 10}]});
 
 // pi and oh-my-pi load TypeScript extensions from <home>/agent/extensions/.
+// The context layer sits next to the gate: --context installs it, --no-context removes it, and a
+// plain re-install refreshes it only if it is already there, so re-running install never switches
+// it on or off by accident. --uninstall removes both.
 function piLike(agent) {
-  const file = join(HOME, `.${agent}`, "agent/extensions/reflex.ts");
-  if (UNINSTALL) { rmSync(file, {force: true}); return `${file} removed`; }
+  const dir = join(HOME, `.${agent}`, "agent/extensions");
+  const file = join(dir, "reflex.ts"), ctx = join(dir, "reflex-context.ts");
+  if (UNINSTALL) { rmSync(file, {force: true}); rmSync(ctx, {force: true}); return `${file} and ${ctx} removed`; }
   writeFile(file, fill(readFileSync(join(REPO, "adapters/pi.ts"), "utf8")).replaceAll("__REFLEX_AGENT__", agent));
-  return `${file} (restart ${agent})`;
+  if (CONTEXT === "off" || (CONTEXT === "keep" && !existsSync(ctx))) {
+    const had = existsSync(ctx);
+    rmSync(ctx, {force: true});
+    return `${file}${had ? `, ${ctx} removed` : ""} (restart ${agent})`;
+  }
+  writeFile(ctx, readFileSync(join(REPO, "adapters/pi-context.ts"), "utf8").replaceAll("__REFLEX_CONTEXT__", join(REPO, "context.mjs")));
+  return `${file}, ${ctx}${CONTEXT === "keep" ? " (context layer kept; --no-context removes it)" : ""} (restart ${agent})`;
 }
 
 const AGENTS = {

@@ -81,6 +81,13 @@ absolute path of the Node that ran `install.mjs`; pass `--node /path/to/node` to
 The instruction hooks do nothing until you add fragments (`.reflex/instructions/*.md` in a repo, or
 `~/.config/reflex/instructions/`); see [GUIDE: conditional instructions](GUIDE.md#conditional-instructions).
 
+**Optional, pi and oh-my-pi only: the context layer.** `node install.mjs --agent pi,omp --context` also
+writes `~/.{pi,omp}/agent/extensions/reflex-context.ts` (see the GUIDE's *Context layer*);
+`--no-context` removes it, and a plain re-install keeps it only where it is already installed. It
+sends redacted excerpts of tool output to TypeSafe, so turn it on deliberately. To try it for one session
+without installing: `pi -e /path/to/reflex/adapters/pi-context.ts` with
+`REFLEX_CONTEXT=/path/to/reflex/context.mjs` in the environment (same for `omp -e`).
+
 For an agent with no hook system, point its shell setting at `bin/reflex-sh`: it behaves like
 `bash`, but judges every `-c` command first. Set `REFLEX_AGENT=<name>` so the logs say which agent
 it was.
@@ -198,6 +205,11 @@ for TLS on Python builds without a CA bundle.
 | `REFLEX_DATA_DIR` | `~/.local/state/reflex` | Where `routing.jsonl` is written (inside Docker, mount a volume) |
 | `TYPESAFE_API_KEY` / `REFLEX_KEYCHAIN_SERVICE` | — / `typesafe-api-key` | Same key lookup as the gate; the Keychain is not reachable from a container, so use the variable there |
 | `REFLEX_MODEL`, `REFLEX_API_URL` | as the gate | Jev model and endpoint |
+| `REFLEX_CONTEXT_TIMEOUT_MS` | `8000` | Budget for one context-layer Jev call (up to 24 questions), capped at 25000 (omp gives a handler 30 s); on timeout the context is left as it was |
+| `REFLEX_CHUNK_DAYS` / `REFLEX_CHUNK_MB` | `7` / `200` | Context-layer chunk store: delete chunks unused for this many days, then the least recently used beyond this size |
+| `REFLEX_CACHE_READ` / `REFLEX_CACHE_WRITE` | `0.1` / `1.25` | Prompt-cache read and write price as a fraction of uncached input, for the rebuild-or-keep decision |
+| `REFLEX_CONTEXT` | set by `install.mjs` | Path to `context.mjs` for the pi / omp context extension |
+| `REFLEX_REVIEWER` | — | Reviewer command for `bin/reflex-review`, e.g. `codex exec -s read-only -` |
 
 ## Optional: Grafana
 
@@ -215,5 +227,5 @@ team.
 
 ```sh
 node install.mjs --agent all --uninstall
-rm -rf ~/.local/state/reflex        # optional: the logs
+rm -rf ~/.local/state/reflex        # optional: logs, the context layer's chunk store, bundles, reviews
 ```

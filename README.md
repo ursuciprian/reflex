@@ -28,6 +28,12 @@ judges how sensitive the conversation is and how hard the task is; `routing/poli
 restricted content (secrets, env and infra config, credentials, proprietary research) on first-party
 frontier models, sends easy public work to the cheapest model, and keeps a conversation on its model
 when switching would cost more than it saves. Shadow by default. See [docs/GUIDE.md](docs/GUIDE.md#model-routing).
+**Context layer (pi and oh-my-pi, opt-in, experimental).** The same Jev client also decides what the
+model *sees*: a large tool output is cut, per request, to the chunks that matter (hide / short / long /
+full; the full text is kept and returned by an `expand_chunk` tool); earlier outputs are re-levelled
+when the request changes, but only when that beats keeping the provider's prompt cache; `/fresh <goal>`
+restarts with only the relevant old context; and one retrieval pass over a git change feeds read-only
+background tasks such as `bin/reflex-review`. See [docs/GUIDE.md](docs/GUIDE.md#context-layer-pi-and-oh-my-pi).
 
 ```
 agent wants to run a command
@@ -101,7 +107,10 @@ week, `node report.mjs` shows the decisions, and `node install.mjs --mode enforc
 | `eval-instructions.mjs` | Scores fragment selection against `examples/instructions/golden.json` with the live API |
 | `examples/instructions/` | Example fragments (front end, billing, Terraform) in a fixture repo, and the golden set |
 | `adapters/` | `pi.ts` (pi and oh-my-pi extension), `opencode.js` (opencode plugin); both carry the gate and the instructions |
+| `adapters/` | `pi.ts` (pi and oh-my-pi extension), `pi-context.ts` (pi / oh-my-pi context layer), `opencode.js` (opencode plugin) |
+| `context.mjs` | Context layer core: visibility ladder, chunk store, per-request assembly and cache decision, `/fresh` recall, retrieval bundles |
 | `bin/reflex-sh` | Drop-in `bash -c` for agents without hooks |
+| `bin/reflex-review` | Background cross-model review that consumes a retrieval bundle |
 | `policy.mjs` | Policy evaluator: ordered gates over answers, no `eval`, no domain knowledge |
 | `setup/tool-gate/` | `rules.json`, `questions.json`, `policy.json`, `golden.json` — all behaviour lives here |
 | `eval.mjs` | Runs the golden set through the real gate; exits 1 on any missed risk |
@@ -114,6 +123,7 @@ week, `node report.mjs` shows the decisions, and `node install.mjs --mode enforc
 | `router/config.json` | Downstream stdio MCP servers whose tools join the catalog (`mcpServers`, same shape as `.mcp.json`) |
 | `router/golden.json` | Labelled intents for `npm run eval-router` (tool and arguments chosen by real Jev; nothing runs) |
 | `router/test/` | Fake downstream MCP server and stubbed Jev for `npm test` |
+| `install.mjs` | Adds / removes Reflex in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`; `--context` / `--no-context` adds / removes the pi / omp context layer) |
 | `dashboards/reflex.json` | Grafana dashboard for the pushed metrics |
 | `routing/` | LiteLLM pre-call hook for security- and cost-aware model routing (`reflex_router.py`, `questions.json`, `policy.json`, an example LiteLLM config) |
 
