@@ -1,0 +1,72 @@
+{
+  "version": "rules-v5",
+  "note": "Deterministic and authoritative: checked before Jev, enforced even in shadow mode. Patterns are case-insensitive and run over the command plus its context (cwd=, aws_profile=, kube_context=, tf_workspace=, git_branch=). A rule fires when every pattern in `all` matches. `pass` patterns apply per segment: a command passes the fast lane when every segment is read-only or matches one.",
+  "rules": [
+    {
+      "id": "secret-read",
+      "outcome": "ask",
+      "before_read_only": true,
+      "rule": "prints the Jev API key or reads a secret store value",
+      "all": [
+        "(\\$\\{?typesafe_api_key|find-generic-password\\b.*\\s-w|secretsmanager\\s+get-secret-value|ssm\\s+get-parameters?\\b.*--with-decryption)"
+      ]
+    },
+    {
+      "id": "rm-root",
+      "outcome": "deny",
+      "rule": "recursive delete of / or home",
+      "all": [
+        "\\brm\\s+(-{1,2}[a-z-]+\\s+)*(--\\s+)?\\\"?(/|~|\\$home|\\$\\{home\\})\\\"?/?\\*?(\\s|$|;|&)"
+      ]
+    },
+    {
+      "id": "prod-destroy",
+      "outcome": "deny",
+      "rule": "destructive operation on production",
+      "all": [
+        "\\b(prod(uction)?|prd|live)(\\d+|\\b|_)",
+        "(\\baws\\s+\\S+\\s+(delete|terminate|remove|deregister)-|\\baws\\s+s3\\s+(rm\\b.*--recursive|rb\\b)|\\bkubectl\\b.*\\s(delete|drain)\\s|\\bkubectl\\b.*\\sscale\\b.*--replicas[= ]0\\b|\\bterraform\\s+(destroy|state\\s+rm|apply\\b.*\\s-(destroy|replace))|\\bhelm\\s+(uninstall|delete)\\s|\\b(drop\\s+(database|table|schema)|truncate(\\s+table)?\\s+\\w+|delete\\s+from)\\b|\\b(gcloud|az)\\b.*\\sdelete\\b)"
+      ]
+    },
+    {
+      "id": "force-push-main",
+      "outcome": "deny",
+      "rule": "force push or delete of main/master",
+      "all": [
+        "\\bgit\\s+push\\b[^;&|]*(--force\\b|--force-with-lease\\b|--delete\\b|\\s-[a-zA-Z]*[fd][a-zA-Z]*\\b|\\s\\+|\\s:)",
+        "\\b(main|master)\\b"
+      ]
+    },
+    {
+      "id": "push-mirror",
+      "outcome": "deny",
+      "rule": "mirror push rewrites every remote ref",
+      "all": [
+        "\\bgit\\s+push\\b[^;&|]*--mirror\\b"
+      ]
+    },
+    {
+      "id": "tamper",
+      "outcome": "ask",
+      "rule": "touches the Reflex gate or agent settings",
+      "all": [
+        "(/reflex(/|\\s|$)|\\.claude/(settings|hooks)|\\.codex/(hooks\\.json|config\\.toml|rules)|\\.hermes/.*config\\.yaml|opencode/(plugins?|opencode\\.jsonc?)|\\.(pi|omp)/agent/(extensions|settings)|reflex_mode)"
+      ]
+    },
+    {
+      "id": "destroy",
+      "outcome": "ask",
+      "rule": "destructive operation",
+      "all": [
+        "(\\baws\\s+\\S+\\s+(delete|terminate|remove|deregister)-|\\baws\\s+s3\\s+(rm\\b.*--recursive|rb\\b)|\\bkubectl\\b.*\\s(delete|drain)\\s|\\bkubectl\\b.*\\sscale\\b.*--replicas[= ]0\\b|\\bterraform\\s+(destroy|state\\s+rm|apply\\b.*\\s-(destroy|replace))|\\bhelm\\s+(uninstall|delete)\\s|\\b(drop\\s+(database|table|schema)|truncate(\\s+table)?\\s+\\w+|delete\\s+from)\\b|\\b(gcloud|az)\\b.*\\sdelete\\b)"
+      ]
+    }
+  ],
+  "pass": [
+    "^(go\\s+(build|test|vet|fmt)|pytest|uv\\s+run\\s+pytest|python3?\\s+-m\\s+(pytest|py_compile)|cargo\\s+(build|test|check|clippy|fmt)|npm\\s+(test|ci|run\\s+(test|lint|build|smoke))|node\\s+--check|bash\\s+-n|terraform\\s+(init|validate|fmt))\\b[^<>`$]*$",
+    "^(mkdir|touch)\\s[^<>`$]*$",
+    "^chmod\\s+[+u]?x\\s[^<>`$]*$",
+    "^git\\s+(add|commit|stash(\\s+push)?|checkout\\s+-b|switch(\\s+-c)?|restore\\s+--staged)\\b[^<>`$]*$",
+    "^git\\s+push\\s+(-u\\s+|--set-upstream\\s+)?origin\\s+(?!-)(?!(main|master|release|prod)\\b)[\\w./-]+$"
+  ]
+}

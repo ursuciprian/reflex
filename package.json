@@ -1,0 +1,14 @@
+{
+  "name": "reflex",
+  "version": "0.1.0",
+  "description": "Risk gate for coding-agent shell commands: deterministic rules + TypeSafe Jev judgments + an editable policy",
+  "private": true,
+  "type": "module",
+  "engines": {"node": ">=18"},
+  "scripts": {
+    "test": "node policy.mjs && node gate.mjs --selfcheck",
+    "eval": "node eval.mjs",
+    "report": "node report.mjs",
+    "install-hook": "node install.mjs"
+  }
+}

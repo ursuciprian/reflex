@@ -1,0 +1,138 @@
+{
+  "name": "Agent tool gate",
+  "version": "tool-gate-v2",
+  "subject": "Shell commands an agent wants to run, gated by risk. The gate can only tighten Claude Code's own permissions, never loosen them.",
+  "fallback": "ask",
+  "params": {
+    "denyAt": {
+      "label": "Deny at blast",
+      "min": 0,
+      "max": 3,
+      "step": 0.1,
+      "default": 2.7,
+      "note": "Blast score at which a production command is refused outright."
+    },
+    "askAt": {
+      "label": "Ask at blast",
+      "min": 0,
+      "max": 3,
+      "step": 0.1,
+      "default": 1.6,
+      "note": "Blast score at which a human confirms before the command runs."
+    },
+    "exfilAt": {
+      "label": "Ask at exfil",
+      "min": 0,
+      "max": 1,
+      "step": 0.05,
+      "default": 0.5
+    },
+    "unsureBelow": {
+      "label": "Ask when blast confidence below",
+      "min": 0,
+      "max": 1,
+      "step": 0.05,
+      "default": 0.5,
+      "note": "Spread-out blast answers on a mutating command get a human look."
+    },
+    "onTaskFloor": {
+      "label": "Ask when on-task below",
+      "min": 0,
+      "max": 1,
+      "step": 0.05,
+      "default": 0.3,
+      "note": "How sure we must be that a mutating command serves the agent's stated task."
+    },
+    "injectionAt": {
+      "label": "Deny at injection",
+      "min": 0,
+      "max": 1,
+      "step": 0.05,
+      "default": 0.6
+    }
+  },
+  "flags": {
+    "prodAlwaysAsks": {
+      "label": "Any production mutation asks",
+      "default": true
+    }
+  },
+  "outcomes": {
+    "deny": {
+      "label": "Deny",
+      "color": "#8c2f3c",
+      "blurb": "Refused; the agent must find another way"
+    },
+    "ask": {
+      "label": "Ask",
+      "color": "#8a5300",
+      "blurb": "A human confirms first"
+    },
+    "pass": {
+      "label": "Pass",
+      "color": "#2b7f6c",
+      "blurb": "No opinion; normal permissions apply"
+    }
+  },
+  "gates": [
+    {
+      "id": "injection",
+      "label": "Talking to the reviewer?",
+      "test": "injection >= $injectionAt",
+      "outcome": "deny",
+      "detail": "injection {injection}",
+      "rule": "command text tries to influence its own review"
+    },
+    {
+      "id": "prod-destroy",
+      "label": "Serious production change?",
+      "test": "env == 'production' and blast >= $denyAt",
+      "outcome": "deny",
+      "detail": "{env}, blast {blast}",
+      "rule": "production blast {blast} at or above {$denyAt}"
+    },
+    {
+      "id": "exfil",
+      "label": "Secrets or data leaving?",
+      "test": "exfil >= $exfilAt",
+      "outcome": "ask",
+      "detail": "exfil {exfil}",
+      "rule": "may read secrets or send data out"
+    },
+    {
+      "id": "prod",
+      "label": "Production mutation?",
+      "enabled_when": "$prodAlwaysAsks",
+      "test": "env == 'production' and mutates >= 0.5",
+      "outcome": "ask",
+      "detail": "{env}, mutates {mutates}",
+      "rule": "changes production"
+    },
+    {
+      "id": "off-task",
+      "label": "Off the stated task?",
+      "test": "mutates >= 0.5 and on_task < $onTaskFloor",
+      "outcome": "ask",
+      "detail": "on_task {on_task}",
+      "rule": "does not match what the agent said it was doing"
+    },
+    {
+      "id": "blast",
+      "label": "High blast?",
+      "test": "blast >= $askAt",
+      "outcome": "ask",
+      "detail": "blast {blast}",
+      "rule": "blast {blast} at or above {$askAt}"
+    },
+    {
+      "id": "unsure",
+      "label": "Unsure about a mutation?",
+      "test": "mutates >= 0.5 and blast.confidence < $unsureBelow",
+      "outcome": "ask",
+      "detail": "blast confidence {blast.confidence}",
+      "rule": "risk unclear"
+    }
+  ],
+  "default_outcome": "pass",
+  "default_rule": "low risk"
+}
