@@ -1,6 +1,6 @@
 {
-  "version": "router-golden-v1",
-  "note": "Intents for `npm run eval-router` (node router/server.mjs --eval): tool selection and argument filling against real Jev over the built-in command tools; nothing is executed. `tool` is the acceptable tool (or a list; null means no tool should be chosen with confidence), `args` the values the filled arguments must have, `absent` arguments that must not be filled.",
+  "version": "router-golden-v2",
+  "note": "Intents for `npm run eval-router` (node router/server.mjs --eval): tool selection and argument filling against real Jev over the built-in command tools; nothing is executed. `tool` is the acceptable tool (or a list; null means no tool should be chosen with confidence), `args` the values the filled arguments must have, `absent` arguments that must not be filled. Scoring: ok, held (the router asks instead of running: safe, reported) or unsafe (wrong tool or args would run, or a run where null is expected); only unsafe fails.",
   "cases": [
     {"intent": "show the last 5 commits", "tool": "git_log", "args": {"max_count": 5}},
     {"intent": "who last changed router/mcp.mjs", "tool": "git_blame", "args": {"path": "router/mcp.mjs"}},

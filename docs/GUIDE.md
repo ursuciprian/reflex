@@ -30,7 +30,7 @@ hook (see the table in the README). Each adapter turns the agent's event into th
    of its patterns match. Rules are **enforced in every mode**, because they are code, not a model.
    Shipped rules: `rm-root`, `prod-destroy`, `force-push-main`, `push-mirror` (deny); `tamper`, `destroy`,
    and — checked even before read-only detection — `secret-read` (the API key, secret stores) and
-   `secret-file-read` (`~/.ssh/id_*` but not `.pub`, `~/.aws/credentials`, `.netrc`, `.pgpass`, `.env` / `.env.*` files but not `.env.example` and other templates, `kubectl get secret(s)`) (ask). It matches the text, so a commit message or `echo` that names `.env` also asks. Any mutating command that touches the Reflex checkout, its setup files or its logs is also an `ask`, wherever the repo was cloned.
+   `secret-file-read` (`~/.ssh/id_*` but not `.pub`, `~/.aws/credentials`, `.netrc`, `.pgpass`, `.env` / `.env.*` files but not `.env.example` and other templates, `kubectl get secret(s)`) (ask). It fires only when the file is an argument of a command that reads, copies or sends it (`cat`, `less`, `head`/`tail`, `grep`/`rg`/`ag`, `jq`, `sed`/`awk`, `cp`/`scp`/`rsync` as the source, `base64`, `xxd`, `strings`, `od`, `open`, `source`/`.`, `nc`, `tar`/`zip`, `curl -d/-F/-T/--data*`, a routed `mcp` call), at any command position — after `;`, `&&`, `|`, inside `$(…)`, backticks, `bash -c '…'`, `ssh host '…'` — or is redirected in (`< ~/.aws/credentials`). A commit message, `echo`, or `cp .env.example .env` that only names the file passes. Known over-match: a `grep` whose search *pattern* is `.env` (`grep -rn '.env' src/`) asks. Any mutating command that touches the Reflex checkout, its setup files or its logs is also an `ask`, wherever the repo was cloned.
 3. **Fast lane** (`rules.json` → `pass`) — known-safe steps: builds, tests, `mkdir`, `git add/commit`,
    pushing a non-main branch. A command passes when every segment is read-only or matches a fast-lane
    pattern. → **pass**, logged.
@@ -256,7 +256,19 @@ the agent only sees what it asks for (tiered disclosure):
 
 It is the same shape as a Claude Code `.mcp.json`, so you can move servers over. Servers start the
 first time a tool is needed; a server that fails to start is skipped with a message on stderr.
-Only stdio servers are supported.
+Only stdio servers are supported. A server that crashes later is started again by the next call to
+one of its tools, at most once per `REFLEX_ROUTER_RETRY_MS` (30 s); calls in between fail at once
+with the time of the next attempt. The tool list stays the one read at the first start.
+
+**Protocol eras.** The router connects to both kinds of downstream server, as the 2026-07-28
+revision's stdio backward-compatibility rules describe: it first sends `server/discover` with
+`io.modelcontextprotocol/protocolVersion: 2026-07-28` (plus `clientInfo` and `clientCapabilities`) in
+`_meta`. A `DiscoverResult` that lists 2026-07-28 makes the server modern: no handshake, and every
+request carries those three `_meta` fields. A recognized modern error (`-32020`…`-32022`, e.g.
+`UnsupportedProtocolVersion` naming only other versions) is a modern server the router cannot
+speak to: it is skipped, never retried with `initialize`. Any other error, or no answer within 5 s,
+is a legacy server: the router falls back to `initialize` (2025-11-25 … 2024-11-05). The era is
+remembered across restarts of the same server.
 
 **Choosing the tool.** `find_tools` and `run` ask one Jev `choice`: which tool does what
 `request.intent` asks, over every tool's description plus `none_of_these`. A choice takes 255
@@ -334,7 +346,11 @@ also in `trace.jsonl` (redacted), like any gated command.
 **Trying it.** `node router/server.mjs --check "who last changed router/mcp.mjs"` prints the
 ranking; add `--run` to run it. `npm run eval-router` routes the intents in
 `router/golden.json` through live Jev and scores the chosen tool and the filled arguments; nothing
-runs. Registering it in an agent: `node install.mjs --router` prints the
+runs. Each intent is `ok` (the expected tool with the expected arguments would run), `held` (the
+router would return `choose_tool` or `needs_args` where the golden expected a run: nothing runs and
+the agent is asked, so it is reported but safe) or `unsafe` (a wrong tool or wrong arguments would
+run, or something would run where the golden expects no tool). Only `unsafe` exits 1; a growing
+`held` count means routing got less decisive, not less safe. Registering it in an agent: `node install.mjs --router` prints the
 command or config snippet for every agent, and changes nothing:
 
 | Agent | Where the MCP server goes |
@@ -351,9 +367,9 @@ command or config snippet for every agent, and changes nothing:
 - The gate judges a downstream call by its name and arguments only; it does not know what the tool
   does beyond that, and the read-only annotation is the server's own claim. `"trusted"` turns both
   checks off for a server.
-- A downstream server that crashes stays unavailable until the router restarts. Downstream servers
-  must speak a handshake revision (2025-11-25 or earlier); a modern-only (2026-07-28) server fails
-  to connect and is skipped.
+- A legacy downstream server that ignores the `server/discover` probe costs 5 s at the first start.
+  Modern-era features beyond plain requests (multi round-trip `input_required` results,
+  `subscriptions/listen`, result caching) are not implemented; an `input_required` result is an error.
 - Only stdio downstream servers; no resources, prompts, sampling or `listChanged` from them.
 - The server speaks the `initialize`-handshake MCP revisions (2024-11-05 … 2025-11-25). A client of
   the handshake-free 2026-07-28 revision probes with `server/discover`, gets "method not found",

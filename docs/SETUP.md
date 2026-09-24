@@ -131,7 +131,7 @@ How it works: [GUIDE → Tool router](GUIDE.md#tool-router).
 ```sh
 node router/server.mjs --selfcheck                              # offline, also part of npm test
 node router/server.mjs --check "show the last 5 commits" --run  # one live Jev round trip
-npm run eval-router                                             # router/golden.json through live Jev; nothing runs
+npm run eval-router                                             # router/golden.json through live Jev; nothing runs; exit 1 only on unsafe
 node install.mjs --router                                       # prints the registration for every agent
 node install.mjs --router --agent codex --mode enforce          # one agent; --mode is the gate's mode for the router's calls
 ```

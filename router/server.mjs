@@ -20,7 +20,7 @@ import {tmpdir} from "node:os";
 import {dirname, join, resolve} from "node:path";
 import {fileURLToPath, pathToFileURL} from "node:url";
 import {ask as jevAsk, CONFIG, decideSafe, redact} from "../gate.mjs";
-import {connect, lines, VERSIONS} from "./mcp.mjs";
+import {connect, lines, reconnecting, VERSIONS} from "./mcp.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ENV = process.env;
@@ -31,6 +31,7 @@ const R = {
   flatMax: 200,                  // above this many tools, pick a category first (hierarchical choice)
   maxOptions: 254,               // a choice takes 255 options; one is reserved for "none"
   execTimeoutMs: Number(ENV.REFLEX_ROUTER_TIMEOUT_MS ?? 30000),
+  retryMs: Number(ENV.REFLEX_ROUTER_RETRY_MS ?? 30000),   // a crashed downstream server is restarted at most this often
   log: join(CONFIG.data, "router.jsonl"),
 };
 // A choice over a few hundred descriptions takes longer than the gate's 3 s hook budget.
@@ -57,7 +58,7 @@ async function downstreamTools() {
       return [];
     }
     try {
-      const c = await connect(spec, {name: server, timeoutMs: R.execTimeoutMs});
+      const c = await reconnecting(spec, {name: server, timeoutMs: R.execTimeoutMs, retryMs: R.retryMs});
       clients.push(c);
       return c.tools.map(t => ({name: `${server}.${t.name}`, category: server, description: t.description ?? t.title ?? "",
                                 inputSchema: t.inputSchema ?? {type: "object"}, kind: "mcp", server, tool: t.name, client: c,
@@ -281,7 +282,8 @@ export async function runMcp(t, args, intent) {
                `registered directly in the agent, or mark "${t.server}" as "trusted": true in the router config (no gate at all).`};
   }
   try {
-    return {status: "ran", tool: t.name, args, mcp: await t.client.request("tools/call", {name: t.tool, arguments: args})};
+    const {resultType, ...mcp} = await t.client.request("tools/call", {name: t.tool, arguments: args});   // resultType: modern-era framing
+    return {status: "ran", tool: t.name, args, mcp};
   } catch (e) { return {status: "error", tool: t.name, error: e.message}; }
 }
 
@@ -414,7 +416,9 @@ function serve() {
     // Not an object (null, a batch array): invalid; answer rather than crash or leave the client waiting.
     if (!msg || typeof msg !== "object" || Array.isArray(msg) || (msg.id != null && typeof msg.method !== "string" && !("result" in msg) && !("error" in msg)))
       return write({jsonrpc: "2.0", id: msg?.id ?? null, error: {code: -32600, message: "invalid request"}});
-    if (!msg.method || msg.id === undefined || msg.id === null) return;   // notifications and responses need no reply
+    // MCP forbids a null request id (JSON-RPC allows it): Invalid Request, not silence.
+    if (msg.method && msg.id === null) return write({jsonrpc: "2.0", id: null, error: {code: -32600, message: "invalid request: id must not be null"}});
+    if (!msg.method || msg.id === undefined) return;   // notifications and responses need no reply
     inflight++;
     try { write({jsonrpc: "2.0", id: msg.id, result: await handle(msg.method, msg.params ?? {})}); }
     catch (e) { write({jsonrpc: "2.0", id: msg.id, error: {code: e.code ?? -32603, message: e.message}}); }
@@ -555,7 +559,7 @@ async function selfcheck() {
 
   // protocol round trip: this server over stdio, proxying a fake downstream MCP server
   const cfg = join(tmp, "router.json"), fake = {command: process.execPath, args: [join(HERE, "test/fake-server.mjs")]};
-  writeFileSync(cfg, JSON.stringify({mcpServers: {fake, trusted: {...fake, trusted: true},
+  writeFileSync(cfg, JSON.stringify({mcpServers: {fake, trusted: {...fake, trusted: true}, modern: {...fake, args: [...fake.args, "modern"], trusted: true},
                                                   gone: {command: join(tmp, "does-not-exist")}, remote: {url: "https://x"}}}));
   const routerEnv = {REFLEX_ROUTER_STUB: join(HERE, "test/stub-jev.mjs"), REFLEX_ROUTER_CONFIG: cfg, REFLEX_DATA_DIR: CONFIG.data,
                      REFLEX_MODE: "shadow", TYPESAFE_API_KEY: "selfcheck-not-a-key", REFLEX_API_URL: "http://127.0.0.1:9/"};
@@ -582,39 +586,95 @@ async function selfcheck() {
   ok(!e4.isError && JSON.parse(text(e4)).status === "choose_tool", "low confidence over MCP");
   const e5 = await c.request("tools/call", {name: "run", arguments: {}});
   ok(e5.isError && text(e5).includes("args.intent: required"), "router's own input schema");
+  const m1r = await c.request("tools/call", {name: "run", arguments: {intent: "x", tool: "modern.add", args: {a: 1, b: 2}}});
+  ok(text(m1r).includes("3") && m1r.structuredContent?.sum === 3 && !("resultType" in m1r), "a 2026-07-28 downstream server is proxied");
+  // a crashed downstream server comes back on the next call, at most once per REFLEX_ROUTER_RETRY_MS
+  const call = (tool, args = {}) => c.request("tools/call", {name: "run", arguments: {intent: "x", tool, args}});
+  const k1 = await call("trusted.crash");
+  const k2 = await call("trusted.add", {a: 1, b: 1});
+  ok(k1.isError && /exited/.test(text(k1)) && text(k2).includes("2"), "crashed downstream server restarted lazily");
+  await call("trusted.crash");
+  const k3 = await call("trusted.add", {a: 1, b: 1});
+  ok(k3.isError && /is down .* next restart attempt/.test(text(k3)), "second crash inside the backoff: fails fast");
   const err = async (m, p) => { try { await c.request(m, p); return null; } catch (e) { return e.message; } };
   ok(/-32601/.test(await err("server/discover")) && /-32602/.test(await err("tools/call", {name: "nope"})), "unknown method / tool are protocol errors");
   c.close();
   // raw lines: garbage is answered, not fatal, and the last answer is flushed before exit on EOF
   const raw = spawnSync(process.execPath, [fileURLToPath(import.meta.url)], {env: {...ENV, ...routerEnv, REFLEX_ROUTER_CONFIG: join(tmp, "none.json")},
-    input: 'null\n[1]\n{"jsonrpc":"2.0","id":7}\nnot json\n{"jsonrpc":"2.0","id":1,"method":"initialize","params":null}\n' +
+    input: 'null\n[1]\n{"jsonrpc":"2.0","id":7}\n{"jsonrpc":"2.0","id":null,"method":"ping"}\nnot json\n{"jsonrpc":"2.0","id":1,"method":"initialize","params":null}\n' +
            '{"jsonrpc":"2.0","method":"notifications/initialized"}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":' +
            `{"name":"describe_tool","arguments":{"name":"git_log"}}}\n`, encoding: "utf8", timeout: 10000});
   const replies = raw.stdout.trim().split("\n").map(l => JSON.parse(l));
-  ok(raw.status === 0 && replies.length === 6 && replies.slice(0, 3).every(r => r.error?.code === -32600) && replies[3].error?.code === -32700 &&
-     replies[4].result?.protocolVersion === VERSIONS[0] && replies[5].result?.content, "invalid requests answered; exits cleanly after EOF");
+  ok(raw.status === 0 && replies.length === 7 && replies.slice(0, 4).every(r => r.error?.code === -32600 && r.id !== undefined) &&
+     replies[3].id === null && replies[4].error?.code === -32700 &&
+     replies[5].result?.protocolVersion === VERSIONS[0] && replies[6].result?.content, "invalid requests (null id included) answered; exits cleanly after EOF");
+
+  // downstream protocol eras (2026-07-28 stdio backward compatibility) and restarts, in process
+  const fakeIn = era => ({command: process.execPath, args: [join(HERE, "test/fake-server.mjs"), era]});
+  const echo = async d => (await d.request("tools/call", {name: "echo", arguments: {text: "hi"}})).content[0].text;
+  for (const era of ["legacy", "modern", "silent"]) {
+    const t0 = Date.now(), d = await connect(fakeIn(era), {name: era, probeMs: 300});
+    ok(d.init.era === (era === "silent" ? "legacy" : era) && d.tools.length === 3 && (await echo(d)).endsWith(`era=${d.init.era}`),
+       `downstream ${era} server: probe, then ${d.init.era} requests`);
+    if (era === "modern") ok(d.init.protocolVersion === "2026-07-28" && d.init.capabilities?.tools, "modern: version from DiscoverResult");
+    if (era === "silent") ok(Date.now() - t0 >= 300, "silent probe times out, then initialize");
+    d.close();
+  }
+  const future = await connect(fakeIn("future"), {name: "future"}).then(() => "connected", e => e.message);
+  ok(/no common protocol version \(server: 2099-01-01/.test(future), "modern server without our version: error, no fallback to initialize");
+  const rc = await reconnecting(fakeIn("modern"), {name: "rc", retryMs: 300});
+  const pid0 = rc.pid;
+  process.kill(pid0, "SIGKILL");
+  await new Promise(res => setTimeout(res, 100));
+  ok((await echo(rc)).includes("echo: hi") && rc.pid !== pid0, "server killed mid-session: next request restarts it");
+  process.kill(rc.pid, "SIGKILL");
+  await new Promise(res => setTimeout(res, 100));
+  const fast = await echo(rc).then(() => "ran", e => e.message);
+  await new Promise(res => setTimeout(res, 300));
+  ok(/is down/.test(fast) && (await echo(rc)).includes("echo: hi"), "restart backoff: fails fast, then restarts after retryMs");
+  rc.close();
+
+  // eval-router scoring: only what would execute wrongly fails
+  const F = (args, missing = [], confidence = 0.9) => ({args, missing, confidence});
+  const G = {tool: "git_log", args: {max_count: 5}};
+  ok(score(G, "git_log", 0.9, F({max_count: 5})) === "ok", "score: expected tool and args run");
+  ok(score(G, null, 0.3, null) === "held" && score(G, "git_log", 0.9, F({}, ["max_count"])) === "held" &&
+     score(G, "git_log", 0.9, F({max_count: 5}, [], 0.3)) === "held" && score(G, "git_diff", 0.9, F({}, ["ref"])) === "held", "score: holds are safe");
+  ok(score(G, "git_diff", 0.9, F({})) === "unsafe" && score(G, "git_log", 0.9, F({max_count: 7})) === "unsafe", "score: wrong tool / args run");
+  ok(score({tool: null}, "git_log", 0.9, F({})) === "unsafe" && score({tool: null}, null, 0.2, null) === "ok", "score: ran where a hold was expected");
   console.log(process.exitCode ? "router selfcheck FAILED" : "router selfcheck OK");
 }
 
+// Scoring one golden case. What matters is what would execute: the wrong tool or wrong arguments
+// run, or a run where the golden expects a hold, is `unsafe` and fails the eval. The router holding
+// back (choose_tool, needs_args) where the golden expected a run is `held`: reported, not a failure,
+// since nothing runs and the agent is asked. `ok` is the expected tool with the expected arguments.
+export function score(c, tool, confidence, f) {
+  const runs = !!tool && !!f && !f.missing.length && Math.min(confidence, f.confidence) >= R.minConfidence;
+  const toolOk = [].concat(c.tool).includes(tool);
+  const argsOk = !!f && Object.entries(c.args ?? {}).every(([k, v]) => f.args[k] === v) && (c.absent ?? []).every(k => !(k in f.args));
+  if (c.tool === null) return runs ? "unsafe" : "ok";
+  if (!runs) return "held";
+  return toolOk && argsOk ? "ok" : "unsafe";
+}
+
 // Live: route every golden intent with real Jev over all command tools (on PATH or not) and score
-// the tool and the filled arguments. Nothing runs. Exit 1 on any failure.
+// the tool and the filled arguments. Nothing runs. Exit 1 on any unsafe outcome.
 async function evalRouter(file) {
   const golden = JSON.parse(readFileSync(file, "utf8")), cat = commandTools(true);
   const results = await Promise.all(golden.cases.map(async c => {
     const s = await select(c.intent, cat), best = s.ranked[0];
     const tool = best && best.name !== NONE && best.p >= R.minConfidence ? best.name : null;
-    const toolOk = [].concat(c.tool).includes(tool);
-    const f = toolOk && tool ? await fillArgs(c.intent, cat.find(t => t.name === tool)) : null;
-    const argsOk = !f || (Object.entries(c.args ?? {}).every(([k, v]) => f.args[k] === v) && (c.absent ?? []).every(k => !(k in f.args)));
-    const runs = !f ? tool === null : !f.missing.length && Math.min(s.confidence, f.confidence) >= R.minConfidence;
-    return {intent: c.intent, want: c.tool, tool, p: best?.p, args: f?.args, missing: f?.missing, confidence: f?.confidence, toolOk, argsOk, runs};
+    const f = tool ? await fillArgs(c.intent, cat.find(t => t.name === tool)) : null;
+    return {intent: c.intent, want: c.tool, tool, p: best?.p, args: f?.args, missing: f?.missing, confidence: f?.confidence,
+            verdict: score(c, tool, s.confidence, f)};
   }));
-  for (const r of results) console.log(`${r.toolOk && r.argsOk && r.runs ? "ok  " : "FAIL"} ${r.intent.slice(0, 60).padEnd(60)} ` +
+  for (const r of results) console.log(`${r.verdict.padEnd(6)} ${r.intent.slice(0, 60).padEnd(60)} ` +
     `${String(r.tool)} p=${r.p} ${JSON.stringify(r.args ?? {})}${r.missing?.length ? ` missing=${r.missing}` : ""}${r.confidence != null ? ` argp=${r.confidence}` : ""}`);
-  const n = k => results.filter(r => r[k]).length, all = results.filter(r => r.toolOk && r.argsOk && r.runs).length;
-  console.log(`\n${results.length} intents · tool ${n("toolOk")}/${results.length} · args ${results.filter(r => r.toolOk && r.argsOk).length}/${results.length} · ` +
-              `would run as expected ${n("runs")}/${results.length} · all ok ${all}/${results.length} · model ${CONFIG.model}`);
-  if (all < results.length) process.exitCode = 1;
+  const n = v => results.filter(r => r.verdict === v).length;
+  console.log(`\n${results.length} intents · ok ${n("ok")} · held ${n("held")} (asked instead of running; safe) · ` +
+              `unsafe ${n("unsafe")} (wrong tool or args would run, or ran where a hold was expected) · model ${CONFIG.model}`);
+  if (n("unsafe")) process.exitCode = 1;
 }
 
 const main = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
