@@ -9,7 +9,8 @@
 5. [Metrics](#metrics)
 6. [Data handling](#data-handling)
 7. [Safety properties and limits](#safety-properties-and-limits)
-8. [Where this goes next](#where-this-goes-next)
+8. [Conditional instructions](#conditional-instructions)
+9. [Where this goes next](#where-this-goes-next)
 
 ## How a command is decided
 
@@ -195,6 +196,9 @@ and [confidence](https://docs.typesafe.ai/confidence).
   [Data Processing Agreement](https://typesafe.ai/legal/data-processing), and zero data retention
   is available for enterprise customers ([legal](https://docs.typesafe.ai/legal)). Check this
   against your own data policy before rollout.
+- **Conditional instructions** send, per prompt that has undecided fragments: the prompt (redacted,
+  first 4,000 characters), the working directory, recently touched file paths, the last five
+  commands (redacted), and each fragment's `when` condition. The fragment bodies stay local.
 - **Locally**, logs contain the same redacted data and stay in `~/.local/state/reflex/`. Trace and
   feedback files rotate at 50 MB. Command output is never stored.
 
@@ -223,6 +227,89 @@ and [confidence](https://docs.typesafe.ai/confidence).
 - Jev adds ~0.7 s in enforce mode to each command that reaches it. On one engineer's heavy
   infrastructure history, about one in five commands never needed the API; the rest are mostly
   inline scripts and multi-step remote commands.
+
+## Conditional instructions
+
+`AGENTS.md` and `CLAUDE.md` are loaded in full at the start of a session. Guidance for billing, the
+front end and Terraform all sits in the context for a typo fix, and compaction can drop any of it
+halfway through a task. `instructions.mjs` loads each piece of guidance only while its condition
+holds, and adds it again on every prompt where the condition still holds.
+
+**A fragment** is a markdown file with front-matter:
+
+```markdown
+---
+when: the task involves billing, payments, invoices, refunds, subscriptions or money amounts
+paths: ["billing/**"]          # optional globs, matched against files named in the prompt or recently touched
+keywords: [stripe, ledger]     # optional whole words in the prompt
+id: billing                    # optional; defaults to the file name
+---
+- Money is integer minor units (`amount_cents`); never floats.
+- ...
+```
+
+**Where fragments live:** `.reflex/instructions/*.md` in the working directory and in every parent
+directory, then `~/.config/reflex/instructions/*.md` (or `$XDG_CONFIG_HOME/reflex/instructions`).
+When two fragments share an id, the one nearest the working directory wins, so a repo can override a
+personal fragment. `examples/instructions/repo/` shows the layout with three fragments.
+
+**Per prompt:**
+
+1. **Deterministic.** A fragment is selected, with no API call, when one of its `paths` globs
+   matches a file named in the prompt or one the agent touched recently. Recent files come from
+   `file_path` in the Claude Code transcript, `apply_patch` headers in the Codex transcript, and the
+   `path` argument of tool calls in pi/omp. A fragment is also selected when one of its `keywords`
+   appears in the prompt. Globs match any trailing part of a path, so `web/**/*.tsx` matches
+   `/home/me/repo/web/src/App.tsx`.
+2. **Jev.** Every other fragment that has a `when` gets one `noul` question: *does this condition hold
+   for this request and the current work?* All the questions go in **one** request. The state is the
+   redacted prompt, the working directory, recent files and the last five commands. A fragment is
+   selected at `p >= REFLEX_INSTRUCTIONS_THRESHOLD` (0.5). Answers are cached for 24 h by prompt
+   hash, working directory and conditions.
+3. **Inject.** Deterministic matches come first, then Jev matches by probability. Whole fragments
+   are added until `REFLEX_INSTRUCTIONS_MAX_CHARS` (6000) is reached; a fragment is never cut.
+
+| Agent | Where the fragments go | Installed by `install.mjs` |
+|---|---|---|
+| Claude Code | `UserPromptSubmit` hook, `additionalContext` | yes, a `UserPromptSubmit` entry in `~/.claude/settings.json` |
+| Codex CLI | `UserPromptSubmit` hook, `additionalContext`. The matcher is ignored for this event; Codex caps hook context at ~2,500 tokens by default | yes, in `~/.codex/hooks.json`. Trust it again in `/hooks` |
+| pi, oh-my-pi | `before_agent_start` handler; appended to that turn's system prompt | yes, in the same `reflex.ts` extension |
+| opencode | `chat.message` picks the fragments; `experimental.chat.system.transform` appends them to the system prompt for the rest of the turn | yes, in the same `reflex.js` plugin. The system hook is marked experimental in opencode |
+| Hermes | `pre_llm_call` shell hook; the text is appended to the turn's user message | printed with the rest of the `hooks:` block |
+| `reflex-sh` | not supported, because the shell never sees the prompt | — |
+
+**Advisory, not safety.** Any failure injects nothing and never blocks a prompt: a bad fragment
+file, a Jev error or timeout, a missing key, or a crash. If only the Jev call fails, fragments
+matched by path or keyword are still injected. `REFLEX_MODE=off` turns this off too. With no
+fragment files there is no API call.
+
+**Try it:**
+
+```sh
+node instructions.mjs --check "customers are charged twice on webhook retries" --cwd examples/instructions/repo
+node instructions.mjs --check "rename a variable" --cwd examples/instructions/repo --files infra/envs/prod/main.tf
+npm run eval-instructions     # golden prompts through the live API, paths/keywords off, so Jev judges every case
+```
+
+Current result: 20 prompts, all exact, precision 100 %, recall 100 % at threshold 0.5
+(`jev-1.13.0`, ~690 input tokens and ~0.35 s median per prompt).
+
+**Logs.** `instructions.jsonl` in the data directory holds one line per prompt: the prompt hash
+(never the text), fragment ids, how each was matched, Jev's probability, whether it was injected,
+latency and tokens.
+
+**Writing conditions.** Describe the work, not a topic: *"the task changes Terraform or runs
+infrastructure commands"* rather than *"Terraform"*. A question about Terraform is not a change to
+Terraform, and the golden set checks that such a question does not load the fragment. Use `paths`
+for what is certain, and keep `when` for the cases paths cannot see.
+
+**Why not sections of AGENTS.md?** Agents load `AGENTS.md` in full themselves, so a marked section
+there would be loaded twice, not saved. Move conditional sections into `.reflex/instructions/`
+instead.
+
+**Trust.** Fragments are read from the working directory and its parents, the same trust boundary
+as the `AGENTS.md` / `CLAUDE.md` the agent already loads from a cloned repo. Fragment text never
+leaves the machine; only the `when` conditions are sent to Jev.
 
 ## Where this goes next
 

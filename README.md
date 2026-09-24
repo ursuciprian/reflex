@@ -36,6 +36,14 @@ agent wants to run a command
 **The gate can only tighten.** It emits `ask` or `deny`, never `allow`, so your existing
 permission rules stay authoritative and a model can never authorize anything on its own.
 
+**Conditional instructions.** Reflex can also load agent instructions only when they apply. Put
+fragments in `.reflex/instructions/*.md`, each with a `when:` condition such as *"the task touches
+billing"* and optional `paths:` / `keywords:`. On every prompt, Reflex checks the paths and keywords
+first, then asks Jev one yes/no question per remaining fragment, all in a single request (~0.7 s).
+The fragments that apply are injected into that turn. The instructions that apply are added again
+on every prompt, so compaction cannot drop them, and the rest stay out of the context. See
+[GUIDE: conditional instructions](docs/GUIDE.md#conditional-instructions) and `examples/instructions/`.
+
 ## What Jev is asked
 
 | Question | Type | Meaning |
@@ -76,13 +84,16 @@ week, `node report.mjs` shows the decisions, and `node install.mjs --mode enforc
 | File | What it is |
 |---|---|
 | `gate.mjs` | The decision core and CLI: read-only detection, rules, redaction, Jev client, cache, logs, and the Claude Code / Codex / Hermes hook adapters |
-| `adapters/` | `pi.ts` (pi and oh-my-pi extension), `opencode.js` (opencode plugin) |
+| `instructions.mjs` | Conditional instructions: fragment discovery, path / keyword matching, one Jev request per prompt, and the Claude Code / Codex / Hermes prompt hooks |
+| `eval-instructions.mjs` | Scores fragment selection against `examples/instructions/golden.json` with the live API |
+| `examples/instructions/` | Example fragments (front end, billing, Terraform) in a fixture repo, and the golden set |
+| `adapters/` | `pi.ts` (pi and oh-my-pi extension), `opencode.js` (opencode plugin); both carry the gate and the instructions |
 | `bin/reflex-sh` | Drop-in `bash -c` for agents without hooks |
 | `policy.mjs` | Policy evaluator: ordered gates over answers, no `eval`, no domain knowledge |
 | `setup/tool-gate/` | `rules.json`, `questions.json`, `policy.json`, `golden.json` — all behaviour lives here |
 | `eval.mjs` | Runs the golden set through the real gate; exits 1 on any missed risk |
 | `report.mjs` | Summary, replay under a candidate policy, Prometheus Pushgateway export |
-| `install.mjs` | Adds / removes Reflex in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`) |
+| `install.mjs` | Adds / removes Reflex (gate and instructions) in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`) |
 | `dashboards/reflex.json` | Grafana dashboard for the pushed metrics |
 
 Node 18+, no dependencies.

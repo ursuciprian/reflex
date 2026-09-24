@@ -71,12 +71,15 @@ absolute path of the Node that ran `install.mjs`; pass `--node /path/to/node` to
 
 | Agent | What `install.mjs` does | After installing |
 |---|---|---|
-| Claude Code | `~/.claude/settings.json`: `PreToolUse` hook on `Bash` (`gate.mjs --claude`), `PostToolUse` / `PostToolUseFailure` / `PermissionDenied` hooks (`--claude-post`), and permission rules that make Claude Code ask before editing the Reflex checkout, its logs or its own settings | restart sessions |
-| Codex CLI | `~/.codex/hooks.json`: `PreToolUse` + `PostToolUse` on `^Bash$` | open Codex, run `/hooks` and **trust** the Reflex hooks — untrusted hooks do not run |
-| pi | `~/.pi/agent/extensions/reflex.ts` | restart pi |
-| oh-my-pi | `~/.omp/agent/extensions/reflex.ts` | restart omp |
-| opencode | `~/.config/opencode/plugins/reflex.js` | restart opencode |
-| Hermes | prints a `hooks:` block (Hermes config is YAML, so you paste it) | add it to each profile's `config.yaml`, then `hermes hooks list` to accept it |
+| Claude Code | `~/.claude/settings.json`: `PreToolUse` hook on `Bash` (`gate.mjs --claude`), `PostToolUse` / `PostToolUseFailure` / `PermissionDenied` hooks (`--claude-post`), a `UserPromptSubmit` hook for conditional instructions (`instructions.mjs --claude`), and permission rules that make Claude Code ask before editing the Reflex checkout, its logs or its own settings | restart sessions |
+| Codex CLI | `~/.codex/hooks.json`: `PreToolUse` + `PostToolUse` on `^Bash$`, and `UserPromptSubmit` (`instructions.mjs --codex`) | open Codex, run `/hooks` and **trust** the Reflex hooks — untrusted hooks do not run |
+| pi | `~/.pi/agent/extensions/reflex.ts` (gate on `tool_call`, instructions on `before_agent_start`) | restart pi |
+| oh-my-pi | `~/.omp/agent/extensions/reflex.ts` (same file) | restart omp |
+| opencode | `~/.config/opencode/plugins/reflex.js` (gate on `tool.execute.before`, instructions on `chat.message` + `experimental.chat.system.transform`) | restart opencode |
+| Hermes | prints a `hooks:` block with `pre_tool_call`, `post_tool_call` and `pre_llm_call` (Hermes config is YAML, so you paste it) | add it to each profile's `config.yaml`, then `hermes hooks list` to accept it |
+
+The instruction hooks do nothing until you add fragments (`.reflex/instructions/*.md` in a repo, or
+`~/.config/reflex/instructions/`); see [GUIDE: conditional instructions](GUIDE.md#conditional-instructions).
 
 For an agent with no hook system, point its shell setting at `bin/reflex-sh`: it behaves like
 `bash`, but judges every `-c` command first. Set `REFLEX_AGENT=<name>` so the logs say which agent
@@ -92,7 +95,7 @@ node report.mjs            # should show 1 judged command, source "jev", mode "s
 node report.mjs --list pass
 ```
 
-Logs live in `~/.local/state/reflex/` (`trace.jsonl`, `feedback.jsonl`, `cache.json`).
+Logs live in `~/.local/state/reflex/` (`trace.jsonl`, `feedback.jsonl`, `instructions.jsonl`, `cache.json`).
 
 A quick check that a rule blocks in each agent, even in shadow mode: in an empty scratch
 directory ask the agent to run `git push --force origin main`. It must be refused with
@@ -121,6 +124,9 @@ All optional.
 | `REFLEX_DATA_DIR` | `~/.local/state/reflex` | Trace, feedback, cache, eval results |
 | `REFLEX_KEYCHAIN_SERVICE` | `typesafe-api-key` | macOS Keychain item holding the key |
 | `REFLEX_API_URL` | TypeSafe System One endpoint | Override for a proxy |
+| `REFLEX_INSTRUCTIONS_THRESHOLD` | `0.5` | Jev probability at which a conditional instruction fragment is injected |
+| `REFLEX_INSTRUCTIONS_MAX_CHARS` | `6000` | Most fragment text injected per prompt; whole fragments are dropped, never cut |
+| `XDG_CONFIG_HOME` | `~/.config` | Personal fragments are read from `$XDG_CONFIG_HOME/reflex/instructions/` |
 
 ## Optional: Grafana
 

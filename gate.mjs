@@ -46,8 +46,8 @@ const CACHE_TTL_MS = 24 * 3600 * 1000;
 const ROTATE_BYTES = 50 * 1024 * 1024;
 
 const load = f => JSON.parse(readFileSync(join(CONFIG.setup, f), "utf8"));
-const sha = v => createHash("sha256").update(typeof v === "string" ? v : JSON.stringify(v)).digest("hex").slice(0, 12);
-const readText = p => { try { return readFileSync(p, "utf8"); } catch { return null; } };
+export const sha = v => createHash("sha256").update(typeof v === "string" ? v : JSON.stringify(v)).digest("hex").slice(0, 12);
+export const readText = p => { try { return readFileSync(p, "utf8"); } catch { return null; } };
 
 // ---------------------------------------------------------------------------------------------
 // Read-only detection. ponytail: a prefix list plus a little shell awareness, not a parser.
@@ -202,14 +202,20 @@ export function envContext(cwd) {
 // tail. The intent is the text that precedes this call's own tool_use entry. When that entry is not
 // in the transcript yet (Claude Code can write it after the hook fires), there is no intent: an
 // older message would be judged against the wrong task, which is worse than none.
-export function sessionContext(path, toolUseId) {
-  if (!path || !existsSync(path)) return {};
+/** The last 512 KB of a transcript, or "" when there is none. */
+export function transcriptTail(path) {
+  if (!path || !existsSync(path)) return "";
   const size = statSync(path).size, len = Math.min(size, 512 * 1024), buf = Buffer.alloc(len);
   const fd = openSync(path, "r");
   readSync(fd, buf, 0, len, size - len);
   closeSync(fd);
+  return buf.toString("utf8");
+}
+export function sessionContext(path, toolUseId) {
+  const text = transcriptTail(path);
+  if (!text) return {};
   let lastText, intent, recent = [];
-  for (const line of buf.toString("utf8").split("\n")) {
+  for (const line of text.split("\n")) {
     let r;
     try { r = JSON.parse(line); } catch { continue; }
     if (r.type === "user" && r.message?.content?.some?.(c => c.type !== "tool_result")) lastText = undefined;
@@ -260,7 +266,7 @@ export function precheck(command, cwd, env) {
   // The checkout itself is protected wherever it was cloned, not only under a directory named reflex.
   const inRepo = cwd && (cwd + "/").startsWith(HERE + "/");
   if (command.includes(HERE) || command.includes(CONFIG.data) ||
-      (inRepo && /\b(gate|policy|install|eval|report)\.mjs\b|\bsetup\/|\bbin\/reflex-sh\b|\badapters\/|\.git\/hooks/.test(command)))
+      (inRepo && /\b(gate|policy|install|eval|report|instructions)\.mjs\b|\bsetup\/|\bbin\/reflex-sh\b|\badapters\/|\.git\/hooks/.test(command)))
     return ruled({outcome: "ask", rule: "touches the Reflex gate, its setup or its logs", id: "tamper"});
   const hit = checkRules(haystack, {rules: rules.rules.filter(r => !r.before_read_only)});
   if (hit) return ruled(hit);
@@ -311,13 +317,13 @@ export async function ask(state, questions) {
 // threshold change applies at once. ponytail: answers tied to one moment (on_task) are dropped on a
 // hit, so a repeat of the same command skips the on-task check.
 const SESSION_BOUND = ["on_task"];
-function cacheGet(key) {
+export function cacheGet(key) {
   let c;
   try { c = JSON.parse(readText(CACHE) ?? "{}")[key]; } catch { return null; }
   if (!c || Date.now() - c.at > CACHE_TTL_MS) return null;
   return Object.fromEntries(Object.entries(c.answers).filter(([k]) => !SESSION_BOUND.includes(k)));
 }
-function cachePut(key, answers) {
+export function cachePut(key, answers) {
   // ponytail: whole-file rewrite; parallel hooks can drop an entry, which only costs a re-ask.
   try {
     mkdirSync(CONFIG.data, {recursive: true});
@@ -408,7 +414,7 @@ export function record(ev) {
 }
 
 // Logs. One JSON line per judged command; the same shape report.mjs replays.
-function append(path, obj) {
+export function append(path, obj) {
   mkdirSync(CONFIG.data, {recursive: true});
   if (existsSync(path) && statSync(path).size > ROTATE_BYTES) renameSync(path, path.replace(/\.jsonl$/, `.${Date.now()}.jsonl`));
   appendFileSync(path, JSON.stringify(obj) + "\n");
@@ -622,6 +628,7 @@ async function selfcheck() {
   ok((await judge({command: `sed -i '' s/deny/pass/ ${join(HERE, "setup/tool-gate/policy.json")}`, cwd: "/w", env: {}})).outcome === "ask", "judge: tamper by path");
   ok((await judge({command: "sed -i '' s/deny/pass/ setup/tool-gate/policy.json", cwd: HERE, env: {}})).outcome === "ask", "judge: tamper by cwd");
   ok((await judge({command: "go test ./...", cwd: HERE, env: {}})).source === "fast-lane", "judge: normal work in the repo");
+  ok((await judge({command: "sed -i '' s/0.5/0/ instructions.mjs", cwd: HERE, env: {}})).outcome === "ask", "judge: tamper with instructions.mjs");
   console.log(process.exitCode ? "gate selfcheck FAILED" : "gate selfcheck OK");
 }
 

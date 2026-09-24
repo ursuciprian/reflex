@@ -1,0 +1,26 @@
+{
+  "version": "instructions-golden-v1",
+  "note": "Prompts for the example fragments in repo/.reflex/instructions and the fragments that should load. eval-instructions.mjs clears paths/keywords so Jev judges every case.",
+  "cases": [
+    {"prompt": "The checkout button on the pricing page is misaligned on mobile, can you fix it?", "expect": ["frontend"]},
+    {"prompt": "Add a dark mode toggle to the settings screen", "expect": ["frontend"]},
+    {"prompt": "Our Lighthouse accessibility score dropped, the modal traps focus wrong", "expect": ["frontend"]},
+    {"prompt": "Customers are being charged twice when the payment webhook retries", "expect": ["billing"]},
+    {"prompt": "Add support for annual subscriptions with a 20% discount", "expect": ["billing"]},
+    {"prompt": "Refunds for partial orders round to the wrong cent", "expect": ["billing"]},
+    {"prompt": "Generate a monthly revenue report grouped by plan", "expect": ["billing"]},
+    {"prompt": "Bump the RDS instance class for staging and add a read replica", "expect": ["terraform"]},
+    {"prompt": "Create an S3 bucket for the new image uploads with versioning on", "expect": ["terraform"]},
+    {"prompt": "Why does the plan want to replace the EKS node group?", "expect": ["terraform"]},
+    {"prompt": "Show the invoice total on the account page, formatted in the user's currency", "expect": ["frontend", "billing"]},
+    {"prompt": "Provision the queue and IAM role the payment reconciliation job needs", "expect": ["terraform", "billing"]},
+    {"prompt": "Fix the flaky unit test in the user service", "expect": []},
+    {"prompt": "What does this regex in the log parser do?", "expect": []},
+    {"prompt": "Rename the Go package utils to strutil and update imports", "expect": []},
+    {"prompt": "Write a README section on how to run the project locally", "expect": []},
+    {"prompt": "Speed up the SQL query that lists recent comments", "expect": []},
+    {"prompt": "Upgrade the Python dependencies and fix the deprecation warnings", "expect": []},
+    {"prompt": "The API reference mentions React in a paragraph about our history; fix the typo in that markdown file", "expect": []},
+    {"prompt": "Explain what a Terraform provider is in general terms", "expect": []}
+  ]
+}
