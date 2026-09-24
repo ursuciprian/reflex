@@ -22,7 +22,7 @@
 // only for a fresh Jev answer that clears the policy's allow gate.
 import {appendFileSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync,
         openSync, readSync, writeSync, closeSync, rmSync, readdirSync, fstatSync} from "node:fs";
-import {createHash} from "node:crypto";
+import {createHash, randomUUID} from "node:crypto";
 import {execFileSync, spawn, spawnSync} from "node:child_process";
 import {homedir, platform, tmpdir} from "node:os";
 import {dirname, join, resolve} from "node:path";
@@ -664,16 +664,17 @@ export async function judge({command, cwd, env = envContext(cwd), session = {}, 
 // do now: "pass" (no opinion, the agent's own permissions decide), "allow" (run it without the
 // agent's prompt), "ask" (a human confirms) or "deny" (block, show the reason).
 // In shadow mode only deterministic rules are effective; Jev's decision is logged, never applied.
-// A call with `subgoal` (the task a subagent is about to get) instead of `command` is checked for
-// duplicates, see subgoalJudge().
+// A call with `subgoal` (the task a subagent is about to get), or `subgoals` (a batch of them), and
+// no `command` is checked for duplicates, see subgoalJudge(); a batch where only some items repeat
+// earlier work also gets `drop`, the indexes to leave out. A command is always judged as a command.
 export async function decide(call, {background = false, asker} = {}) {
-  if (CONFIG.mode === "off" || !(call.command || call.subgoal)) return {effective: "pass", decision: "pass", reason: "reflex off", source: "off"};
-  if (call.subgoal) {
+  const subgoals = call.command ? [] : [call.subgoals ?? call.subgoal].flat().filter(s => typeof s === "string" && s.trim());
+  if (CONFIG.mode === "off" || !(call.command || subgoals.length)) return {effective: "pass", decision: "pass", reason: "reflex off", source: "off"};
+  if (subgoals.length) {
     if (CONFIG.mode !== "enforce" && !background) return inBackground(call);
-    const j = await subgoalJudge(call, asker);
+    const {j, drop} = await subgoalJudge({...call, subgoals}, asker);
     const effective = CONFIG.mode === "enforce" ? j.outcome : "pass";
-    trace(j, {...call, command: `[subgoal] ${call.subgoal.slice(0, 2000)}`}, effective);
-    return view(j, effective);
+    return {...view(j, effective), ...(CONFIG.mode === "enforce" && j.outcome === "pass" && drop.length && {drop})};
   }
   const env = envContext(call.cwd);
   const quick = background ? null : precheck(call.command, call.cwd, env);
@@ -701,46 +702,89 @@ function inBackground(call) {
 }
 
 // Subgoal dedup. Agents re-launch subagents for work they already delegated, and pay for it twice.
-// The new subgoal is compared with those launched earlier in the same session (subgoals.jsonl) by
+// Each new subgoal is compared with those launched earlier in the same session (subgoals.jsonl) by
 // one Jev choice question whose options are the earlier subgoals plus "none". A confident duplicate
-// is denied with a reason naming the earlier one, so the agent reuses its result; anything else is
-// recorded and passes. It saves work, it does not guard safety: a Jev error passes.
-// ponytail: whole-file read per spawn and no lock (parallel spawns do not see each other); a
-// per-session file when sessions get long.
+// is denied with a reason naming the earlier one, so the agent reuses its result; anything else
+// passes. It saves work, it does not guard safety: a Jev error or an internal error passes.
+//
+// Parallel spawns (several in one message, or a batch) must see each other, so every subgoal is
+// written first, as pending, and then compared with the rows before it in the file: of two
+// identical spawns racing, the one appended first is the original. An earlier row counts when its
+// spawn ran (a PostToolUse / tool_result record), or while it is pending (no record yet, younger
+// than pendingSeconds). A spawn that was denied (by Reflex, the user or another hook) or failed has
+// no result to reuse: Reflex marks its own denials dropped, the others show up in feedback.
+// ponytail: the files' last 2 MB are read per spawn, no lock (appends are atomic lines).
 const SUBGOALS = () => join(CONFIG.data, "subgoals.jsonl");
+const TAIL_BYTES = 2 * 1024 * 1024;
+function readTail(path, bytes = TAIL_BYTES) {
+  if (!path || !existsSync(path)) return "";
+  const size = statSync(path).size, len = Math.min(size, bytes), buf = Buffer.alloc(len);
+  const fd = openSync(path, "r");
+  try { readSync(fd, buf, 0, len, size - len); } finally { closeSync(fd); }
+  return buf.toString("utf8");
+}
+// A torn or cut line is skipped, not fatal.
+const jsonLines = text => text.split("\n").flatMap(l => { try { return l ? [JSON.parse(l)] : []; } catch { return []; } });
 async function subgoalJudge(call, asker = ask) {
   const spec = load("subgoals.json");
-  const text = redact(call.subgoal).slice(0, 2000);
-  // Only subgoals whose spawn actually ran count (a PostToolUse record): a spawn the user rejected,
-  // another hook blocked or that failed has no result to reuse. A torn line is skipped, not fatal.
-  const lines = f => (readText(f) ?? "").split("\n").flatMap(l => { try { return l ? [JSON.parse(l)] : []; } catch { return []; } });
-  const ran = new Set(lines(FEEDBACK()).filter(r => r.event === "ran" && r.call_id).map(r => r.call_id));
-  const earlier = lines(SUBGOALS()).filter(r => r.session_id === (call.session_id ?? null) && r.agent === (call.agent ?? null) &&
-    ran.has(r.call_id)).slice(-spec.keep);
+  const now = Date.now(), pendingMs = (spec.pendingSeconds ?? 300) * 1000, tag = randomUUID().slice(0, 8);
+  const who = {agent: call.agent ?? null, session_id: call.session_id ?? null, call_id: call.call_id ?? null};
+  const mine = call.subgoals.map((s, item) => ({ts: new Date(now).toISOString(), id: `${tag}#${item}`, ...who, item,
+                                                subgoal: redact(s).slice(0, 2000)}));
+  // One write for the whole batch keeps its items in order and together.
+  if (call.session_id) append(SUBGOALS(), mine);
+  const rows = jsonLines(readTail(SUBGOALS())), fb = jsonLines(readTail(FEEDBACK()));
+  const ran = new Set(fb.filter(r => r.event === "ran" && r.call_id).map(r => r.call_id));
+  const gone = new Set(fb.filter(r => ["denied", "failed"].includes(r.event) && r.call_id).map(r => r.call_id));
+  const dropped = new Set(rows.filter(r => r.dropped).map(r => r.id));
+  const live = r => r.subgoal && r.session_id === who.session_id && r.agent === who.agent && !dropped.has(r.id) &&
+    !gone.has(r.call_id) && (ran.has(r.call_id) || now - Date.parse(r.ts) < pendingMs);
   // Long subgoals that share a preamble differ at the end: an option keeps both.
   const clip = s => s.length > 600 ? `${s.slice(0, 400)} … ${s.slice(-200)}` : s;
   const base = {qset: spec.version, policy_version: spec.version, tag: "subgoal"};
-  let j = {...base, outcome: "pass", rule: "first subgoal in this session", source: "subgoal"};
-  if (earlier.length && call.session_id) {
+  // the shared context line of a batch task (omp, Hermes) is background, not the task
+  const norm = s => s.split("\n").filter(l => !/^context: /.test(l)).join(" ").replace(/\s+/g, " ").trim().toLowerCase();
+  const dupRule = (dup, p) => `duplicates a subgoal ${dup.call_id === who.call_id ? "earlier in this batch" : ran.has(dup.call_id) ? "already launched in this session"
+    : "launched in parallel in this session"} at ${dup.ts.slice(11, 16)} UTC (p ${p.toFixed(2)}): "${dup.subgoal.slice(0, 160)}". Reuse that result instead of starting it again`;
+  const judged = await Promise.all(mine.map(async m => {
+    const at = rows.findIndex(r => r.id === m.id);
+    const earlier = (at < 0 ? [] : rows.slice(0, at)).filter(live).slice(-spec.keep);
+    if (!earlier.length || !call.session_id) return {...base, outcome: "pass", rule: "first subgoal in this session", source: "subgoal"};
+    // The same text again is a duplicate without asking: Jev reads an option identical to the new
+    // subgoal as the new subgoal itself (p 0.2-0.3 on identical pairs, 0.7 on paraphrases).
+    const same = earlier.findLast(r => norm(r.subgoal) === norm(m.subgoal));
+    if (same) return {...base, outcome: "deny", source: "subgoal", dup: same, p: 1, rule: dupRule(same, 1)};
     const criteria = Object.fromEntries(earlier.map((r, i) => [`s${i + 1}`, clip(r.subgoal)]));
     criteria.none = "None of them: new work, a follow-up, a different part, or a review of earlier work.";
     const questions = {duplicate: {type: "choice", instructions: spec.instructions, criteria}};
-    const state = {subgoal: {text, cwd: call.cwd}, [spec.context_key]: spec.context};
-    const res = await asker(state, questions);
+    const res = await asker({subgoal: {text: m.subgoal, cwd: call.cwd}, [spec.context_key]: spec.context}, questions);
     const a = res.answers?.duplicate, i = /^s(\d+)$/.exec(a?.choice ?? "")?.[1];
     const p = a?.probabilities?.[a.choice] ?? a?.confidence ?? 0;   // how likely that option is
     const dup = !res.error && i && earlier[i - 1] && p >= spec.duplicateAt ? earlier[i - 1] : null;
-    j = {...base, ...res, state, questions,
-         outcome: dup ? "deny" : "pass", source: res.error ? "fallback" : "jev",
-         rule: res.error ? `jev unavailable (${res.error.slice(0, 80)}), subgoal not checked`
-           : dup ? `duplicates a subgoal already launched in this session at ${dup.ts.slice(11, 16)} UTC ` +
-                   `(p ${p.toFixed(2)}): "${dup.subgoal.slice(0, 160)}". Reuse that result instead of starting it again`
-           : "new subgoal"};
-  }
-  // A duplicate is never recorded, even when it runs anyway (shadow): the original stays the reference.
-  if (j.outcome !== "deny") append(SUBGOALS(), {ts: new Date().toISOString(), agent: call.agent ?? null,
-    session_id: call.session_id ?? null, call_id: call.call_id ?? null, subgoal: text});
-  return j;
+    return {...base, ...res, dup, p, options: earlier.length,
+      outcome: dup ? "deny" : "pass", source: res.error ? "fallback" : "jev",
+      rule: res.error ? `jev unavailable (${res.error.slice(0, 80)}), subgoal not checked` : dup ? dupRule(dup, p) : "new subgoal"};
+  }));
+  // A duplicate is dropped at once, even when it runs anyway (shadow): the original stays the reference.
+  // An adapter that cannot trim a batch (`whole`) denies all of it, so all of it is dropped: the
+  // rest must not count as launched when the agent sends it again.
+  const drop = judged.flatMap((j, i) => j.outcome === "deny" ? [i] : []);
+  const all = drop.length === judged.length || (drop.length > 0 && call.whole === true);
+  if (drop.length && call.session_id) append(SUBGOALS(), (all ? mine.map((_, i) => i) : drop).map(i => ({ts: new Date().toISOString(), id: mine[i].id, dropped: true})));
+  // The trace keeps what was decided, not the prompts: a short redacted title and a hash, never the
+  // earlier subgoals offered as options (subgoals.jsonl already holds each once).
+  judged.forEach((j, i) => {
+    const title = `[subgoal${mine.length > 1 ? ` ${i + 1}/${mine.length}` : ""}] ${mine[i].subgoal.slice(0, 120)}`;
+    trace({...j, state: {subgoal: {title, sha: sha(mine[i].subgoal), chars: mine[i].subgoal.length, cwd: call.cwd}},
+           questions: j.options ? {duplicate: {type: "choice", options: j.options + 1}} : {}},
+          {...call, command: title}, CONFIG.mode === "enforce" ? j.outcome : "pass");
+  });
+  const list = drop.map(i => `${mine.length > 1 ? `task ${i + 1}: ` : ""}${judged[i].rule}`).join("; ");
+  const again = all && drop.length < judged.length ? `. Start the others again without task${drop.length > 1 ? "s" : ""} ${drop.map(i => i + 1).join(", ")}` : "";
+  const j = drop.length ? {...base, outcome: all ? "deny" : "pass", source: judged[drop[0]].source,
+                           rule: (mine.length > 1 ? `${drop.length} of ${mine.length} subgoals repeat earlier work: ${list}` : list) + again}
+    : judged.find(x => x.source === "fallback") ?? judged[0];
+  return {j, drop: all ? [] : drop};
 }
 
 // Any internal error is a decision too: the policy fallback when enforcing, logged either way.
@@ -785,7 +829,7 @@ export function record(ev) {
 function append(path, obj) {
   mkdirSync(CONFIG.data, {recursive: true});
   if (existsSync(path) && statSync(path).size > ROTATE_BYTES) renameSync(path, path.replace(/\.jsonl$/, `.${Date.now()}.jsonl`));
-  appendFileSync(path, JSON.stringify(obj) + "\n");
+  appendFileSync(path, [obj].flat().map(o => JSON.stringify(o) + "\n").join(""));   // one write: a batch stays together
 }
 
 function trace(j, call, effective) {
@@ -840,11 +884,25 @@ function claudePost(input) {
 // the agent to get the user's confirmation; the user can then run the command or approve it.
 // It cannot plain-allow either (an "allow" is not honoured and falls through), so allow is silent,
 // like pass, and Codex's own approval policy decides.
+// spawn_agent (Codex 0.155+, multi-agent v1 and v2; matcher alias Agent) runs PreToolUse like any
+// function tool and a deny blocks it, so subgoal dedup hooks it: its message (or text items), task
+// name and agent type are the subgoal. SubagentStart cannot be used: its input has no task text and
+// its output only adds context.
+function codexCall(input) {
+  const t = input.tool_input ?? {};
+  if (input.tool_name === "Bash") return {agent: "codex", command: t.command, cwd: input.cwd, session_id: input.session_id, call_id: input.tool_use_id};
+  if (input.tool_name !== "spawn_agent") return null;
+  const text = typeof t.message === "string" && t.message.trim() ? t.message
+    : (Array.isArray(t.items) ? t.items : []).map(i => typeof i?.text === "string" ? i.text : "").filter(Boolean).join("\n");
+  if (!text) return null;
+  // A subagent's spawns are its own, as in Claude Code.
+  return {agent: "codex", subgoal: [t.agent_type && `agent: ${t.agent_type}`, t.task_name, text].filter(Boolean).join("\n"), cwd: input.cwd,
+          session_id: input.agent_id ? `${input.session_id}/${input.agent_id}` : input.session_id, call_id: input.tool_use_id};
+}
 async function codexPre(input) {
-  if (input.tool_name !== "Bash") return;
-  const d = await decideSafe({agent: "codex", command: input.tool_input?.command, cwd: input.cwd,
-                              session_id: input.session_id, call_id: input.tool_use_id});
-  const out = codexOut(d);
+  const call = codexCall(input);
+  if (!call) return;
+  const out = codexOut(await decideSafe(call));
   if (out) process.stdout.write(JSON.stringify(out));
 }
 function codexOut(d) {
@@ -854,14 +912,32 @@ function codexOut(d) {
   return {hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason}};
 }
 function codexPost(input) {
-  if (input.tool_name !== "Bash") return;
+  if (!["Bash", "spawn_agent"].includes(input.tool_name)) return;
   record({agent: "codex", event: "ran", session_id: input.session_id, call_id: input.tool_use_id});
 }
 
 // Hermes Agent adapter: config.yaml `hooks: pre_tool_call` shell hook on the terminal tool.
 // "approve" routes through Hermes' own approval prompt; rule_key is per command, so approving one
 // command "for the session" never pre-approves a different one.
+// delegate_task spawns subagents: {tasks: [{goal, context?}]} or the legacy {goal, context?}, each
+// task a subgoal; other actions (list, steer, stop) control running children and are not checked.
+// A batch where only some tasks repeat earlier work is blocked with the list, not trimmed: a
+// "modify" hook could drop them, but nothing would tell the model which ones went, and it would
+// launch them again.
+export function hermesSubgoals(t = {}) {
+  if (t.action && t.action !== "spawn") return [];
+  const items = Array.isArray(t.tasks) && t.tasks.length ? t.tasks : [t];
+  const text = x => typeof x?.goal === "string" && x.goal.trim()
+    ? [x.goal, typeof x.context === "string" && x.context.trim() && `context: ${x.context.slice(0, 300)}`].filter(Boolean).join("\n") : "";
+  return items.map(text).filter(Boolean);
+}
 async function hermesPre(input) {
+  if (input.tool_name === "delegate_task") {
+    const subgoals = hermesSubgoals(input.tool_input ?? {});
+    if (!subgoals.length) return process.stdout.write("{}");
+    const d = await decideSafe({agent: "hermes", subgoals, whole: true, cwd: input.cwd, session_id: input.session_id, call_id: input.extra?.tool_call_id});
+    return process.stdout.write(JSON.stringify(d.effective === "deny" ? {action: "block", message: d.reason} : {}));
+  }
   if (input.tool_name !== "terminal") return process.stdout.write("{}");
   const command = input.tool_input?.command;
   const d = await decideSafe({agent: "hermes", command, cwd: input.tool_input?.workdir ?? input.cwd,
@@ -871,9 +947,13 @@ async function hermesPre(input) {
 // Hermes has no allow verdict for a hook: pass and allow are both {}, and its own approvals decide.
 const hermesOut = (d, command) => d.effective === "deny" ? {action: "block", message: d.reason}
   : d.effective === "ask" ? {action: "approve", message: d.reason, rule_key: `reflex:${sha(command ?? "")}`} : {};
+// post_tool_call also fires for a call a hook or guardrail blocked (status "blocked"): that one did
+// not run, and neither did a cancelled one.
 function hermesPost(input) {
-  if (input.tool_name !== "terminal") return;
-  record({agent: "hermes", event: "ran", session_id: input.session_id, call_id: input.extra?.tool_call_id});
+  if (!["terminal", "delegate_task"].includes(input.tool_name)) return;
+  const st = input.extra?.status;
+  record({agent: "hermes", event: st === "blocked" ? "denied" : st === "cancelled" ? "failed" : "ran",
+          session_id: input.session_id, call_id: input.extra?.tool_call_id});
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1201,10 +1281,15 @@ async function selfcheck() {
       if (ran && d.effective === "pass") record({agent: "claude-code", event: "ran", session_id, call_id: subgoal.slice(0, 20)});
       return d;
     };
-    await G("Refactor the retry loop", pick("none"), "S0", {}, false);
+    const SG = join(scratch, "subgoals.jsonl"), old10 = new Date(Date.now() - 600e3).toISOString();
+    mkdirSync(scratch, {recursive: true});
+    appendFileSync(SG, JSON.stringify({ts: old10, id: "x#0", agent: "claude-code", session_id: "S0", call_id: "old", item: 0, subgoal: "Refactor the retry loop"}) + "\n");
     asked = [];
-    ok((await G("Refactor the retry loop again", pick("s1"), "S0")).effective === "pass" && asked.length === 0, "subgoal: a spawn that never ran is not offered");
-    appendFileSync(join(scratch, "subgoals.jsonl"), "{torn\n");
+    ok((await G("Refactor the retry loop again", pick("s1"), "S0")).effective === "pass" && asked.length === 0, "subgoal: a spawn that never ran is not offered after pendingSeconds");
+    record({agent: "claude-code", event: "denied", session_id: "S0", call_id: "Refactor the retry l"});
+    asked = [];
+    ok((await G("Refactor the retry loop once more", pick("s1"), "S0")).effective === "pass" && asked.length === 0, "subgoal: a spawn the user or another hook denied is not offered");
+    appendFileSync(SG, "{torn\n");
     const first = await G("Find every caller of parseConfig", pick("none"));
     ok(first.effective === "pass" && asked.length === 0, "subgoal: the first in a session passes without asking Jev; a torn line is skipped");
     ok((await G("Write tests for the retry loop", pick("none"))).effective === "pass" && Object.keys(asked[0]).join() === "s1,none", "subgoal: earlier ones are the options, plus none");
@@ -1219,11 +1304,52 @@ async function selfcheck() {
     const sh = await G("Find every caller of parseConfig", pick("s1"), "S1", {background: true});
     ok(sh.effective === "pass" && sh.decision === "deny", "subgoal shadow: logged as deny, effective pass");
     CONFIG.mode = "enforce";
-    const sg = readText(join(scratch, "subgoals.jsonl")).trim().split("\n").filter(l => l !== "{torn").map(l => JSON.parse(l));
-    ok(sg.filter(r => r.session_id === "S1").length === 5 && !sg.some(r => r.subgoal.startsWith("Locate")), "subgoal: passes are recorded, duplicates never");
+    const sg = jsonLines(readText(SG)), gone = new Set(sg.filter(r => r.dropped).map(r => r.id));
+    ok(sg.filter(r => r.session_id === "S1" && r.subgoal && !gone.has(r.id)).length === 5 &&
+       sg.filter(r => r.subgoal?.startsWith("Locate")).every(r => gone.has(r.id)), "subgoal: passes are recorded, duplicates dropped");
     await G(`Deploy with token ghp_${"a".repeat(36)}`, pick("none"));
-    ok(!readText(join(scratch, "subgoals.jsonl")).includes("ghp_aaaa"), "subgoal: recorded redacted");
+    ok(!readText(SG).includes("ghp_aaaa"), "subgoal: recorded redacted");
     ok((await decideSafe({agent: "x", subgoal: "y", session_id: "S1"}, {asker: async () => { throw new Error("boom"); }})).effective === "pass", "subgoal: an internal error passes");
+    // review fixes: parallel spawns, batches, prompts in the trace, a command beside a subgoal
+    const judgeBy = rule => async state => { asked.push(state.subgoal.text);
+      return {answers: {duplicate: {type: "choice", choice: rule(state.subgoal.text), confidence: 0.95}}, usage: {}, error: null, latency_s: 0}; };
+    const same = judgeBy(() => "s1");
+    const par = await Promise.all(["Audit the auth module", "Audit the auth module for bugs"].map((s, i) =>
+      decide({agent: "claude-code", subgoal: s, session_id: "P1", call_id: `p${i}`, cwd: "/w"}, {asker: same})));
+    ok(par.filter(d => d.effective === "deny").length === 1 && /in parallel/.test(par.find(d => d.effective === "deny").reason),
+       "subgoal: two parallel spawns of the same work: the first passes, the second is denied");
+    asked = [];
+    const twin = await decide({agent: "claude-code", subgoal: "audit the auth   module", session_id: "P1", call_id: "p9", cwd: "/w"}, {asker: judgeBy(() => "none")});
+    ok(twin.effective === "deny" && asked.length === 0 && /p 1\.00/.test(twin.reason), "subgoal: the same text again is a duplicate without asking Jev");
+    const B = (subgoals, asker, call_id, opts = {}) => decide({agent: "omp", subgoals, session_id: "B1", call_id, cwd: "/w"}, {asker, ...opts});
+    await B(["Map the billing service"], judgeBy(() => "none"), "b0");
+    record({agent: "omp", event: "ran", session_id: "B1", call_id: "b0"});
+    const part = await B(["Write the migration", "Map the billing service again", "Update the docs"], judgeBy(t => /billing/.test(t) ? "s1" : "none"), "b1");
+    ok(part.effective === "pass" && part.drop?.join() === "1" && /1 of 3 subgoals/.test(part.reason), "subgoal batch: only the duplicate item is dropped, with the reason");
+    const inBatch = await B(["Profile the importer", "Profile the importer once more"], judgeBy(t => /once more/.test(t) ? "s4" : "none"), "b2");
+    ok(inBatch.drop?.join() === "1" && /earlier in this batch/.test(inBatch.reason), "subgoal batch: an item repeating one earlier in the same batch is dropped");
+    const allDup = await B(["Map the billing service", "Write the migration"], judgeBy(() => "s1"), "b3");
+    ok(allDup.effective === "deny" && !allDup.drop, "subgoal batch: every item a duplicate denies the call");
+    CONFIG.mode = "shadow";
+    ok(!(await B(["Map the billing service", "New work"], judgeBy(t => /billing/.test(t) ? "s1" : "none"), "b4", {background: true})).drop,
+       "subgoal batch shadow: nothing is dropped");
+    CONFIG.mode = "enforce";
+    await decide({agent: "claude-code", subgoal: `Review the parser. ${"Long context. ".repeat(40)}SECRET-TAIL`, session_id: "S1", call_id: "long", cwd: "/w"}, {asker: judgeBy(() => "none")});
+    const tr = jsonLines(readText(TRACE())).filter(r => r.tag === "subgoal");
+    ok(!/criteria|SECRET-TAIL/.test(JSON.stringify(tr)) && tr.every(r => !r.state.subgoal.text && r.state.call === undefined && r.state.subgoal.title.length <= 140) &&
+       tr.some(r => r.state.subgoal.title.startsWith("[subgoal 2/3]")), "subgoal: the trace keeps a short title and a hash, not the prompts or the options");
+    ok((await decide({agent: "x", command: "rm -rf ~", subgoal: "harmless", session_id: "S1"}, {asker: same})).effective === "deny", "subgoal: a command beside a subgoal is still judged as a command");
+    // Hermes cannot trim a batch: a partial duplicate denies the call and drops every item, so resending the rest passes
+    const H = (subgoals, asker, call_id) => decide({agent: "hermes", subgoals, whole: true, session_id: "H1", call_id, cwd: "/w"}, {asker});
+    await H(["Index the docs"], judgeBy(() => "none"), "h0");
+    record({agent: "hermes", event: "ran", session_id: "H1", call_id: "h0"});
+    const hp = await H(["Index the docs", "Fix the flaky test"], judgeBy(t => /Index/.test(t) ? "s1" : "none"), "h1");
+    ok(hp.effective === "deny" && !hp.drop && /without task 1/.test(hp.reason), "subgoal whole batch: a partial duplicate denies with the list");
+    let offered;
+    const peek = async (state, q) => { offered = Object.values(q.duplicate.criteria);
+      return {answers: {duplicate: {type: "choice", choice: "none", confidence: 0.9}}, usage: {}, error: null, latency_s: 0}; };
+    ok((await H(["Fix the flaky test"], peek, "h2")).effective === "pass" && !offered.some(o => /flaky/.test(o)) && offered.some(o => /Index/.test(o)),
+       "subgoal whole batch: the items of a denied batch are not offered again");
     CONFIG.allow = "shadow";
     const w = await D("prettier --write c");
     ok(w.effective === "pass" && w.decision === "would_allow", "allow shadow: logged as would_allow, effective pass");
@@ -1256,6 +1382,13 @@ async function selfcheck() {
      claudeCall({tool_name: "Bash", tool_input: {command: "ls"}}).command === "ls" && claudeCall({tool_name: "Read", tool_input: {}}) === null, "claude: Agent/Task is a subgoal, Bash a command");
   ok(claudeCall({tool_name: "Agent", tool_input: {prompt: "p", resume: "a1"}}) === null &&
      claudeCall({tool_name: "Agent", tool_input: {prompt: "p"}, session_id: "s", agent_id: "a7"}).session_id === "s/a7", "claude: a resume is not checked; a subagent has its own subgoals");
+  const cx = codexCall({tool_name: "spawn_agent", tool_input: {message: "Find X", task_name: "find_x", agent_type: "explorer"}, session_id: "s", tool_use_id: "c1"});
+  ok(cx.subgoal === "agent: explorer\nfind_x\nFind X" && !cx.command &&
+     codexCall({tool_name: "spawn_agent", tool_input: {items: [{type: "text", text: "Do Y"}]}}).subgoal === "Do Y" &&
+     codexCall({tool_name: "spawn_agent", tool_input: {}}) === null && codexCall({tool_name: "Bash", tool_input: {command: "ls"}}).command === "ls" &&
+     codexCall({tool_name: "apply_patch", tool_input: {}}) === null, "codex: spawn_agent is a subgoal, Bash a command");
+  ok(hermesSubgoals({tasks: [{goal: "A", context: "ctx"}, {goal: "B"}]}).join("|") === "A\ncontext: ctx|B" && hermesSubgoals({goal: "L"})[0] === "L" &&
+     hermesSubgoals({action: "list"}).length === 0 && hermesSubgoals({action: "steer", message: "m"}).length === 0, "hermes: each delegated task is a subgoal; control actions are not");
   const dA = {effective: "allow", reason: "r"};
   ok(claudeOut(dA)?.hookSpecificOutput.permissionDecision === "allow" && claudeOut({effective: "pass"}) === null, "claude: allow skips its prompt, pass is silent");
   ok(codexOut(dA) === null && codexOut({effective: "ask", reason: "r"}).hookSpecificOutput.permissionDecision === "deny", "codex: allow is silent, ask blocks");

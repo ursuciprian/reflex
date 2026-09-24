@@ -38,29 +38,35 @@ function lastAssistantText(ctx: any): string | undefined {
   }
 }
 
-// omp's task tool spawns subagents: {task, agent?, context?} or a batch {context?, tasks: [{task, agent?}]}.
-// The whole call is one subgoal, tasks first and the shared context (cut short) last, so a long
-// context never hides what differs. ponytail: a batch is judged as a whole; per item if batches
-// turn out to repeat work. pi has no subagents, so this never fires there.
-function subgoalOf(input: any): string | undefined {
-  const items = Array.isArray(input?.tasks) ? input.tasks : [input];
-  const parts = items.filter((t: any) => typeof t?.task === "string" && t.task.trim())
-    .map((t: any) => [t.agent && `agent: ${t.agent}`, t.task].filter(Boolean).join("\n"));
-  const context = typeof input?.context === "string" && input.context.trim() ? `context: ${input.context.slice(0, 200)}` : "";
-  return parts.length ? [...parts, context].filter(Boolean).join("\n\n") : undefined;
+// omp's task tool spawns subagents: {task, agent?} or a batch {context, tasks: [{task, agent?}]}.
+// Each task is its own subgoal (the batch's shared context, cut short, goes with each), so a batch
+// that repeats one earlier task loses only that task: the tool runs with the rest (a tool_call
+// handler may replace the input) and its result says which were left out and why. pi has no
+// subagents, so this never fires there.
+function subgoalsOf(input: any): string[] {
+  const batch = Array.isArray(input?.tasks);
+  const context = batch && typeof input.context === "string" && input.context.trim() ? `context: ${input.context.slice(0, 200)}` : "";
+  return (batch ? input.tasks : [input]).map((t: any) => typeof t?.task === "string" && t.task.trim()
+    ? [t.agent && `agent: ${t.agent}`, t.task, context].filter(Boolean).join("\n") : "");
 }
+const dropped = new Map<string, string>();   // toolCallId -> why some batch tasks were left out
 
 export default function (pi: any) {
   pi.on("tool_call", async (event: any, ctx: any) => {
     if (event.toolName === "task") {
-      const subgoal = subgoalOf(event.input);
-      if (!subgoal) return;
-      let d: Decision;
+      const subgoals = subgoalsOf(event.input), batch = Array.isArray(event.input?.tasks);
+      if (!subgoals.length || subgoals.some(s => !s)) return;   // malformed: omp's own validation answers
+      let d: Decision & {drop?: number[]};
       try {
-        d = JSON.parse(await gate("--decide", {agent: AGENT, subgoal, cwd: ctx.cwd, call_id: event.toolCallId,
-                                               session_id: ctx.sessionManager?.getSessionId?.()}, ctx.signal));
+        d = JSON.parse(await gate("--decide", {agent: AGENT, ...(batch ? {subgoals} : {subgoal: subgoals[0]}), cwd: ctx.cwd,
+                                               call_id: event.toolCallId, session_id: ctx.sessionManager?.getSessionId?.()}, ctx.signal));
       } catch { return; }   // dedup saves work; it never blocks when the gate cannot run
-      return d.effective === "deny" ? {block: true, reason: d.reason} : undefined;
+      if (d.effective === "deny") return {block: true, reason: d.reason};
+      if (batch && d.drop?.length) {
+        dropped.set(event.toolCallId, d.reason ?? "");
+        return {input: {...event.input, tasks: event.input.tasks.filter((_: any, i: number) => !d.drop!.includes(i))}};
+      }
+      return;
     }
     if (event.toolName !== "bash" || !event.input?.command) return;
     let d: Decision;
@@ -82,9 +88,14 @@ export default function (pi: any) {
   });
 
   pi.on("tool_result", async (event: any, ctx: any) => {
-    // A task that ran is a launched subgoal: dedup offers only those.
-    if (event.toolName === "task" && !event.isError)
-      return void gate("--record", {agent: AGENT, event: "ran", call_id: event.toolCallId, session_id: ctx?.sessionManager?.getSessionId?.()});
+    // A task that ran is a launched subgoal; one that failed or was blocked is not.
+    if (event.toolName === "task") {
+      gate("--record", {agent: AGENT, event: event.isError ? "failed" : "ran", call_id: event.toolCallId, session_id: ctx?.sessionManager?.getSessionId?.()});
+      const note = dropped.get(event.toolCallId);
+      if (!note) return;
+      dropped.delete(event.toolCallId);
+      return {content: [...(event.content ?? []), {type: "text", text: `\n[reflex] Some tasks were not started: ${note}`}]};
+    }
     if (event.toolName !== "bash") return;
     const text = (event.content ?? []).map((c: any) => c.text ?? "").join("");
     const exit = typeof event.details?.exitCode === "number" ? event.details.exitCode            // omp
