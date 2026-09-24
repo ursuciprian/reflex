@@ -11,7 +11,7 @@
   },
   "require_same_guardrails": true,
   "require_same_limits": true,
-  "require_same_note": "LiteLLM applies model-level guardrails (litellm_params.guardrails) and the key's per-model rpm / tpm limits and budget for the requested model before this hook runs, and not again for the model it picks. true: a model whose guardrails (or limits) differ from the requested model's is never chosen; the log lists it under excluded. The requested model itself is always allowed.",
+  "require_same_note": "LiteLLM applies model-level guardrails (litellm_params.guardrails), the key's per-model rpm / tpm limits and the per-model budgets of the key, the internal user and the end user (model_max_budget, user_model_max_budget, end_user_model_max_budget; LiteLLM 1.100.1) for the requested model before this hook runs, and not again for the model it picks. A team's model_max_budget is not enforced per request in 1.100.1 and is not compared. true: a model whose guardrails (or limits) differ from the requested model's is never chosen; the log lists it under excluded. The requested model itself is always allowed.",
   "paths_to_jev": "shape_outside_repo",
   "paths_to_jev_note": "full: every path as written. shape_outside_repo: paths inside the agent's working directory as repo-relative paths, others as their file name plus [outside repo, sensitive] flags. shape: every path as file name plus flags. restricted_paths are always matched on the full path, locally.",
   "fallback": {

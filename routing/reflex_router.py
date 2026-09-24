@@ -27,6 +27,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from pathlib import Path
 
 try:
@@ -367,11 +368,37 @@ def controls(model, key):
         guards.update(x if isinstance(x, str) else repr(x) for x in ([g] if isinstance(g, str) else g or []))
     limits = None
     if key is not None:
-        limits = tuple(json.dumps(v, sort_keys=True, default=str) for v in (
-            (get_key_model_rpm_limit(key, model_name=model) or {}).get(model),
-            (get_key_model_tpm_limit(key, model_name=model) or {}).get(model),
-            (getattr(key, "model_max_budget", None) or {}).get(model)))
+        limits = limits_of(key, model, (get_key_model_rpm_limit(key, model_name=model) or {}).get(model),
+                           (get_key_model_tpm_limit(key, model_name=model) or {}).get(model))
     return {"guardrails": sorted(guards), "limits": limits}
+
+
+# Where LiteLLM 1.100.1 keeps the per-model budgets it enforces for a request, on UserAPIKeyAuth:
+# model_max_budget (the key's own, else its budget table's), user_model_max_budget (the internal
+# user's, LiteLLM_UserTable) and end_user_model_max_budget (the end user's budget table). The
+# team's model_max_budget (LiteLLM_TeamTable) is stored but not enforced per request in 1.100.1
+# (the limiter's scopes are key, user and end user), so it is not compared; neither is a team
+# member's budget table, which only carries max_budget / tpm / rpm for the whole team.
+BUDGET_SCOPES = ("model_max_budget", "user_model_max_budget", "end_user_model_max_budget")
+
+
+def budget_entry(mmb, model):
+    """The model_max_budget entry LiteLLM applies to `model`: its own resolution (provider prefix
+    stripped, Bedrock base model) when available, else the exact name."""
+    if not isinstance(mmb, Mapping) or not mmb:
+        return None
+    try:
+        from litellm.proxy.hooks.model_max_budget_limiter import resolve_model_budget
+    except ImportError:
+        return mmb.get(model)
+    r = resolve_model_budget(model, mmb)
+    return r.budget_config.model_dump() if r else None
+
+
+def limits_of(key, model, rpm=None, tpm=None):
+    """The key's per-model rpm / tpm and every scope's budget entry for `model`, comparable."""
+    return tuple(json.dumps(v, sort_keys=True, default=str) for v in
+                 (rpm, tpm, *(budget_entry(getattr(key, s, None), model) for s in BUDGET_SCOPES)))
 
 
 class ReflexRouter(CustomLogger):
@@ -564,6 +591,19 @@ def selfcheck():
     for c in redaction()[2]:
         ok(redact(c["in"]) == c["out"], f"redact corpus: {c['in'][:40]!r} -> {redact(c['in'])!r}")
     ok(has_secret("key AKIAABCDEFGHIJKLMNOP") and not has_secret("max_tokens: 100, password field"), "secret shapes only")
+
+    # require_same_limits: key, internal-user and end-user per-model budgets all count; the team's is not enforced.
+    # Entries carry budget_duration: LiteLLM 1.100.1 ignores (and never enforces) one without it.
+    b = {"max_budget": 5, "budget_duration": "1d"}
+    k = SimpleNamespace(model_max_budget={"a": b, "b": b}, user_model_max_budget={"a": {"max_budget": 1, "budget_duration": "1d"}},
+                        end_user_model_max_budget=None, team_model_max_budget={"b": {"max_budget": 9, "budget_duration": "1d"}})
+    ok(limits_of(k, "a") != limits_of(k, "b"), "limits: an internal-user budget on one model only differs")
+    k.user_model_max_budget = {"a": {"max_budget": 1, "budget_duration": "1d"}, "b": {"max_budget": 1, "budget_duration": "1d"}}
+    ok(limits_of(k, "a") == limits_of(k, "b"), "limits: same key and user budgets are the same limits; team budget ignored")
+    k.end_user_model_max_budget = {"b": {"max_budget": 2, "budget_duration": "7d"}}
+    ok(limits_of(k, "a") != limits_of(k, "b"), "limits: an end-user budget on one model only differs")
+    ok(limits_of(k, "a", rpm=10) != limits_of(k, "a", rpm=20), "limits: key rpm counts")
+    ok(limits_of(SimpleNamespace(), "a") == limits_of(SimpleNamespace(model_max_budget={}), "b"), "limits: no budgets anywhere are equal")
 
     # the three request shapes
     chat = {"model": "claude-opus-5", "messages": [
