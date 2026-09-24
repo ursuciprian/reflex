@@ -260,7 +260,7 @@ export function precheck(command, cwd, env) {
   // The checkout itself is protected wherever it was cloned, not only under a directory named reflex.
   const inRepo = cwd && (cwd + "/").startsWith(HERE + "/");
   if (command.includes(HERE) || command.includes(CONFIG.data) ||
-      (inRepo && /\b(gate|policy|install|eval|report)\.mjs\b|\bsetup\/|\bbin\/reflex-sh\b|\badapters\/|\.git\/hooks/.test(command)))
+      (inRepo && /\b(gate|policy|install|eval|report)\.mjs\b|\bsetup\/|\brouter\/|\bbin\/reflex-sh\b|\badapters\/|\.git\/hooks/.test(command)))
     return ruled({outcome: "ask", rule: "touches the Reflex gate, its setup or its logs", id: "tamper"});
   const hit = checkRules(haystack, {rules: rules.rules.filter(r => !r.before_read_only)});
   if (hit) return ruled(hit);
@@ -622,6 +622,8 @@ async function selfcheck() {
   ok((await judge({command: `sed -i '' s/deny/pass/ ${join(HERE, "setup/tool-gate/policy.json")}`, cwd: "/w", env: {}})).outcome === "ask", "judge: tamper by path");
   ok((await judge({command: "sed -i '' s/deny/pass/ setup/tool-gate/policy.json", cwd: HERE, env: {}})).outcome === "ask", "judge: tamper by cwd");
   ok((await judge({command: "go test ./...", cwd: HERE, env: {}})).source === "fast-lane", "judge: normal work in the repo");
+  // the router's command templates and server list decide what it executes: same protection as setup/
+  ok((await judge({command: "sed -i '' s/rg/sh/ router/commands.json", cwd: HERE, env: {}})).outcome === "ask", "judge: tamper with the router");
   console.log(process.exitCode ? "gate selfcheck FAILED" : "gate selfcheck OK");
 }
 
