@@ -91,7 +91,7 @@ week, `node report.mjs` shows the decisions, and `node install.mjs --mode enforc
 | `setup/tool-gate/` | `rules.json`, `questions.json`, `policy.json`, `golden.json` — all behaviour lives here |
 | `eval.mjs` | Runs the golden set through the real gate; exits 1 on any missed risk |
 | `report.mjs` | Summary, replay under a candidate policy, Prometheus Pushgateway export |
-| `install.mjs` | Adds / removes Reflex in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`; `--context` adds the pi / omp context layer) |
+| `install.mjs` | Adds / removes Reflex in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`; `--context` / `--no-context` adds / removes the pi / omp context layer) |
 | `dashboards/reflex.json` | Grafana dashboard for the pushed metrics |
 
 Node 18+, no dependencies.

@@ -35,6 +35,7 @@ function lastText(ctx: any, role: string): string | undefined {
 
 export default function (pi: any) {
   const states = new Map<string, any>();   // per session: the current view, see assemble() in context.mjs
+  load().then(c => c.pruneChunks()).catch(() => { /* pruning is housekeeping, never fatal */ });
 
   pi.on("tool_result", async (event: any, ctx: any) => {
     const content = event.content ?? [];

@@ -8,6 +8,7 @@
   "scripts": {
     "test": "node policy.mjs && node gate.mjs --selfcheck && node context.mjs --selfcheck",
     "eval": "node eval.mjs",
+    "eval-context": "node context.mjs --eval-context",
     "report": "node report.mjs",
     "install-hook": "node install.mjs"
   }

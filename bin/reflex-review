@@ -27,8 +27,8 @@ const t0 = Date.now();
 const r = spawnSync("/bin/sh", ["-c", reviewer], {cwd: b.cwd, input: reviewPrompt(b), encoding: "utf8",
   maxBuffer: 64 << 20, timeout: 30 * 60_000, stdio: ["pipe", "pipe", "inherit"]});
 const out = opt("--out") ?? join(CONFIG.data, "reviews", `${Date.now()}.md`);
-mkdirSync(dirname(out), {recursive: true});
-writeFileSync(out, r.stdout ?? "");
+mkdirSync(dirname(out), {recursive: true, mode: 0o700});
+writeFileSync(out, r.stdout ?? "", {mode: 0o600});
 log({kind: "review", reviewer: reviewer.split(" ")[0], changed: b.changed.length, context: b.context.length,
      status: r.status, error: r.error ? String(r.error) : null, wall_s: (Date.now() - t0) / 1000, out});
 console.error(`reflex-review: ${r.status === 0 ? "review" : `reviewer exited ${r.status}; output`} in ${out}`);

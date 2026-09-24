@@ -79,8 +79,9 @@ absolute path of the Node that ran `install.mjs`; pass `--node /path/to/node` to
 | Hermes | prints a `hooks:` block (Hermes config is YAML, so you paste it) | add it to each profile's `config.yaml`, then `hermes hooks list` to accept it |
 
 **Optional, pi and oh-my-pi only: the context layer.** `node install.mjs --agent pi,omp --context` also
-writes `~/.{pi,omp}/agent/extensions/reflex-context.ts` (see the GUIDE's *Context layer*). It sends
-redacted excerpts of tool output to TypeSafe, so turn it on deliberately. To try it for one session
+writes `~/.{pi,omp}/agent/extensions/reflex-context.ts` (see the GUIDE's *Context layer*);
+`--no-context` removes it, and a plain re-install keeps it only where it is already installed. It
+sends redacted excerpts of tool output to TypeSafe, so turn it on deliberately. To try it for one session
 without installing: `pi -e /path/to/reflex/adapters/pi-context.ts` with
 `REFLEX_CONTEXT=/path/to/reflex/context.mjs` in the environment (same for `omp -e`).
 
@@ -127,7 +128,8 @@ All optional.
 | `REFLEX_DATA_DIR` | `~/.local/state/reflex` | Trace, feedback, cache, eval results |
 | `REFLEX_KEYCHAIN_SERVICE` | `typesafe-api-key` | macOS Keychain item holding the key |
 | `REFLEX_API_URL` | TypeSafe System One endpoint | Override for a proxy |
-| `REFLEX_CONTEXT_TIMEOUT_MS` | `8000` | Budget for one context-layer Jev call (up to 24 questions); on timeout the context is left as it was |
+| `REFLEX_CONTEXT_TIMEOUT_MS` | `8000` | Budget for one context-layer Jev call (up to 24 questions), capped at 25000 (omp gives a handler 30 s); on timeout the context is left as it was |
+| `REFLEX_CHUNK_DAYS` / `REFLEX_CHUNK_MB` | `7` / `200` | Context-layer chunk store: delete chunks unused for this many days, then the least recently used beyond this size |
 | `REFLEX_CACHE_READ` / `REFLEX_CACHE_WRITE` | `0.1` / `1.25` | Prompt-cache read and write price as a fraction of uncached input, for the rebuild-or-keep decision |
 | `REFLEX_CONTEXT` | set by `install.mjs` | Path to `context.mjs` for the pi / omp context extension |
 | `REFLEX_REVIEWER` | — | Reviewer command for `bin/reflex-review`, e.g. `codex exec -s read-only -` |
