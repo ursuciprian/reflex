@@ -8,6 +8,7 @@
 //   node install.mjs --agent pi | omp        pi / oh-my-pi ~/.{pi,omp}/agent/extensions/reflex.ts (tool_call)
 //   node install.mjs --agent hermes          prints the config.yaml pre_tool_call block to paste per profile
 //   node install.mjs --agent all             every agent found on this machine
+//   node install.mjs --router [--agent x]    print (never apply) the MCP registration of router/server.mjs
 //
 //   --mode shadow|enforce|off   (default shadow)   --node <path>   --uninstall
 import {copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync} from "node:fs";
@@ -127,6 +128,40 @@ const AGENTS = {
     return "printed (Hermes config is YAML; paste it rather than have a script rewrite it)";
   }},
 };
+
+// --router: print how to register router/server.mjs as an MCP server in each agent. Printed, not
+// run: `claude mcp add` and friends write global config, which stays a human's decision.
+if (argv.includes("--router")) {
+  const server = join(REPO, "router/server.mjs"), name = "reflex-router";
+  const env = process.env.REFLEX_KEYCHAIN_SERVICE ? {REFLEX_KEYCHAIN_SERVICE: process.env.REFLEX_KEYCHAIN_SERVICE} : {};
+  const envFlags = flag => Object.entries(env).map(([k, v]) => `${flag} ${k}=${v} `).join("");
+  const args = [server, "--mode", MODE];
+  const json = extra => JSON.stringify({mcpServers: {[name]: {...extra, command: NODE, args, ...(Object.keys(env).length ? {env} : {})}}}, null, 2);
+  const out = {
+    claude: `claude mcp add --scope user --transport stdio ${envFlags("--env")}${name} -- ${q(NODE)} ${args.map(q).join(" ")}\n` +
+            `# or commit it for a repo: .mcp.json\n${json({type: "stdio"})}`,
+    codex: `codex mcp add ${name} ${envFlags("--env")}-- ${q(NODE)} ${args.map(q).join(" ")}\n# or ~/.codex/config.toml:\n` +
+           `[mcp_servers.${name}]\ncommand = ${q(NODE)}\nargs = [${args.map(q).join(", ")}]\n` +
+           (Object.keys(env).length ? `\n[mcp_servers.${name}.env]\n${Object.entries(env).map(([k, v]) => `${k} = ${q(v)}`).join("\n")}\n` : ""),
+    pi: `# pi has no built-in MCP; install the pi-mcp-adapter extension (pi install npm:pi-mcp-adapter), then\n` +
+        `# ~/.pi/agent/mcp.json (or the repo's .mcp.json):\n${json({})}`,
+    omp: `# ~/.omp/agent/mcp.json (or .omp/mcp.json in a repo). omp also imports ~/.claude.json and\n` +
+         `# ~/.codex/config.toml, so register it in one place only.\n${json({type: "stdio"})}`,
+    opencode: `# ~/.config/opencode/opencode.json (or opencode.json in a repo):\n` + JSON.stringify({mcp: {[name]: {type: "local",
+      command: [NODE, ...args], ...(Object.keys(env).length ? {environment: env} : {}), enabled: true, timeout: 10000}}}, null, 2),
+    hermes: `# config.yaml of each profile. Hermes passes servers a filtered environment: put anything the\n` +
+            `# router needs (TYPESAFE_API_KEY or REFLEX_KEYCHAIN_SERVICE, REFLEX_*) under env:.\n` +
+            `mcp_servers:\n  ${name}:\n    command: ${q(NODE)}\n    args: [${args.map(q).join(", ")}]\n` +
+            (Object.keys(env).length ? `    env:\n${Object.entries(env).map(([k, v]) => `      ${k}: ${q(v)}`).join("\n")}\n` : ""),
+  };
+  const pick = opt("--agent", "all");
+  for (const a of pick === "all" ? Object.keys(out) : pick.split(",")) {
+    if (!out[a]) throw new Error(`unknown agent ${a}; one of ${Object.keys(out).join(", ")}, all`);
+    console.log(`\n## ${a}\n${out[a]}`);
+  }
+  console.log("\nNothing was changed. Downstream MCP servers go in router/config.json (REFLEX_ROUTER_CONFIG); see docs/GUIDE.md.");
+  process.exit(0);
+}
 
 const which = opt("--agent", "claude");
 const targets = which === "all" ? Object.keys(AGENTS).filter(a => has(AGENTS[a].bin)) : which.split(",");

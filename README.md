@@ -33,6 +33,13 @@ agent wants to run a command
       agent's stated intent ──► policy thresholds ──► pass / ask / deny
 ```
 
+**Tool router (optional).** `router/server.mjs` is an MCP server that puts three tools —
+`find_tools`, `describe_tool`, `run` — in front of a whole catalog: built-in read-only shell tools
+(ripgrep, git log/diff/blame, kubectl get, aws describe …) and every tool of the MCP servers you
+list in `router/config.json`. Jev picks the tool and fills its arguments from the agent's intent,
+and hands back candidates instead of guessing when it is unsure. Every shell tool it runs still goes
+through the gate. See [GUIDE → Tool router](docs/GUIDE.md#tool-router).
+
 **The gate can only tighten.** It emits `ask` or `deny`, never `allow`, so your existing
 permission rules stay authoritative and a model can never authorize anything on its own.
 
@@ -82,7 +89,12 @@ week, `node report.mjs` shows the decisions, and `node install.mjs --mode enforc
 | `setup/tool-gate/` | `rules.json`, `questions.json`, `policy.json`, `golden.json` — all behaviour lives here |
 | `eval.mjs` | Runs the golden set through the real gate; exits 1 on any missed risk |
 | `report.mjs` | Summary, replay under a candidate policy, Prometheus Pushgateway export |
-| `install.mjs` | Adds / removes Reflex in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`) |
+| `install.mjs` | Adds / removes Reflex in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`); `--router` prints how to register the tool router in each agent |
+| `router/server.mjs` | Tool router: stdio MCP server (`find_tools`, `describe_tool`, `run`), Jev tool selection and argument filling, schema validation, gated shell execution, downstream MCP proxy |
+| `router/mcp.mjs` | Newline-delimited JSON-RPC over stdio, server and client side (no SDK) |
+| `router/commands.json` | Built-in command tools: name, description, argument schema, argv template |
+| `router/config.json` | Downstream stdio MCP servers whose tools join the catalog (`mcpServers`, same shape as `.mcp.json`) |
+| `router/test/` | Fake downstream MCP server and stubbed Jev for `npm test` |
 | `dashboards/reflex.json` | Grafana dashboard for the pushed metrics |
 
 Node 18+, no dependencies.

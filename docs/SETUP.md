@@ -122,6 +122,33 @@ All optional.
 | `REFLEX_KEYCHAIN_SERVICE` | `typesafe-api-key` | macOS Keychain item holding the key |
 | `REFLEX_API_URL` | TypeSafe System One endpoint | Override for a proxy |
 
+## Optional: the tool router
+
+An MCP server that gives the agent three tools (`find_tools`, `describe_tool`, `run`) in front of
+built-in read-only shell tools and any MCP servers you list; Jev picks the tool and its arguments.
+How it works: [GUIDE → Tool router](GUIDE.md#tool-router).
+
+```sh
+node router/server.mjs --selfcheck                              # offline, also part of npm test
+node router/server.mjs --check "show the last 5 commits" --run  # one live Jev round trip
+node install.mjs --router                                       # prints the registration for every agent
+node install.mjs --router --agent codex --mode enforce          # one agent; --mode is the gate's mode for shell tools
+```
+
+`--router` only prints: registering an MCP server writes the agent's global config (`~/.claude.json`,
+`~/.codex/config.toml`, …), so you run the printed command or paste the snippet yourself. If the key
+lives in the Keychain under a non-default name, run it with `REFLEX_KEYCHAIN_SERVICE` set and the
+snippets carry it in their `env`. To route other MCP servers, move their entries from the agent's
+config into `router/config.json` (`mcpServers`, `.mcp.json` shape; stdio only).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `REFLEX_ROUTER_CONFIG` | `router/config.json` | Downstream MCP servers |
+| `REFLEX_ROUTER_MIN_CONFIDENCE` | `0.5` | Below this probability for the tool or any argument, `run` returns candidates instead of running |
+| `REFLEX_ROUTER_TIMEOUT_MS` | `30000` | Per shell command and per downstream request |
+
+Selections are logged to `router.jsonl` in `REFLEX_DATA_DIR`.
+
 ## Optional: Grafana
 
 Push a snapshot of the metrics to a Prometheus Pushgateway, e.g. every five minutes from cron:

@@ -9,7 +9,8 @@
 5. [Metrics](#metrics)
 6. [Data handling](#data-handling)
 7. [Safety properties and limits](#safety-properties-and-limits)
-8. [Where this goes next](#where-this-goes-next)
+8. [Tool router](#tool-router)
+9. [Where this goes next](#where-this-goes-next)
 
 ## How a command is decided
 
@@ -214,6 +215,7 @@ and [confidence](https://docs.typesafe.ai/confidence).
   `failed` from `PostToolUse` / `PostToolUseFailure`.
 - Only shell tools are gated (`Bash`, pi/omp `bash`, opencode `bash`, Hermes `terminal`). File-edit
   tools, MCP tools, omp's `eval` and Hermes' `execute_code` go through each agent's own permissions.
+  The tool router's command tools are the exception: the router runs them through the gate itself.
 - Codex and opencode hooks cannot open a prompt, so an `ask` blocks with a reason telling the agent
   to get your confirmation. Codex passes the session directory as `cwd`, not a per-command
   `workdir`. Codex hooks must be trusted in `/hooks` before they run.
@@ -223,6 +225,121 @@ and [confidence](https://docs.typesafe.ai/confidence).
 - Jev adds ~0.7 s in enforce mode to each command that reaches it. On one engineer's heavy
   infrastructure history, about one in five commands never needed the API; the rest are mostly
   inline scripts and multi-step remote commands.
+
+## Tool router
+
+An agent that carries hundreds of tool schemas spends context on them in every turn and picks
+worse among them. The router (`router/server.mjs`) is one stdio MCP server with three tools, so
+the agent only sees what it asks for (tiered disclosure):
+
+| Tool | Tier | What it does |
+|---|---|---|
+| `find_tools(intent, limit?)` | 1 | one line per best-matching tool, with Jev's probability |
+| `describe_tool(name)` | 2 | the full description and argument schema of one tool |
+| `run(intent, tool?, args?)` | — | picks the tool (unless given), fills its arguments (unless given), validates, runs |
+
+**The catalog** is the built-in command tools in `router/commands.json` whose binary is on `PATH`
+(`rg_search`, `grep_search`, `ast_grep`, `git_log`, `git_diff`, `git_blame`, `kubectl_get`,
+`kubectl_describe`, `aws_describe`), plus every tool of every stdio MCP server listed in
+`router/config.json` (or the file named by `REFLEX_ROUTER_CONFIG`), named `<server>.<tool>`:
+
+```json
+{"mcpServers": {
+  "github": {"command": "/usr/local/bin/github-mcp-server", "args": ["stdio"], "env": {"GITHUB_TOOLSETS": "repos,issues"}},
+  "old":    {"command": "…", "disabled": true}
+}}
+```
+
+It is the same shape as a Claude Code `.mcp.json`, so you can move servers over. Servers start the
+first time a tool is needed; a server that fails to start is skipped with a message on stderr.
+Only stdio servers are supported.
+
+**Choosing the tool.** `find_tools` and `run` ask one Jev `choice`: which tool does what
+`request.intent` asks, over every tool's description plus `none_of_these`. A choice takes 255
+options, so above 200 tools the router asks first which category (downstream server, or the
+command tool's `category`) holds it, then chooses among the tools of the categories that hold 90% of
+the probability (at most three).
+
+**Filling arguments** follows TypeSafe's
+[function-calling cookbook](https://docs.typesafe.ai/cookbooks/function_calling): Jev never writes
+free text. Each argument the agent did not pass becomes one question, all in one request:
+
+- an `enum` → a `choice` over its values;
+- a boolean → a `noul` ("does the request ask for this?");
+- a string or number → a `choice` over the words, `key=value` values and quoted strings of the
+  (redacted) intent, filtered by the argument's type and `pattern`. Optional arguments get a
+  `none_of_these` option, and choosing it leaves the tool's default in place;
+- objects and arrays are not filled: the agent passes them.
+
+A call is only as sure as its least certain judgement. When the tool's probability or any
+argument's is under `REFLEX_ROUTER_MIN_CONFIDENCE` (0.5), or `none_of_these` wins, `run` does not
+guess: it returns `choose_tool` with the top candidates, or `needs_args` with the proposed
+arguments, the missing and the weakest one, and the schema. The agent then calls `run` again with
+`tool` and `args`. Arguments the agent passes are used exactly as given. Either way the arguments are
+checked against the tool's JSON schema (`type`, `enum`, `const`, `required`, `properties`,
+`additionalProperties`, `items`, lengths, bounds, `pattern`) before anything runs. Quote exact values
+in the intent: `search for 'retry budget' in src`.
+
+**Running.** A downstream tool is proxied as `tools/call` and its result (content and
+`structuredContent`) returned unchanged, after one line naming the tool. A command tool is expanded
+from its argv template and run with `execFile` — never through a shell — **after the Reflex gate
+judges the exact command**, shell-quoted (`decideSafe`, agent `reflex-router`, with the intent as
+the stated task). `deny` returns `denied`; `ask` returns `needs_approval` and nothing runs (an MCP
+tool cannot prompt), so the agent asks you and runs it through its own, also gated, shell tool.
+The mode follows the gate's: `--mode` on the server's command line, or `REFLEX_MODE`. A string
+argument starting with `-` is refused unless its template puts it where it cannot be an option
+(`"x-allow-dash": true`, after `-e` or `--`).
+
+Adding a command tool is a JSON entry:
+
+```json
+{"name": "git_show", "category": "git", "bin": "git",
+ "description": "Show one commit: message, author and the change it made.",
+ "args": ["show", "--no-color", "--stat", "{ref}"],
+ "inputSchema": {"type": "object", "additionalProperties": false, "required": ["ref"], "properties": {
+   "ref": {"type": "string", "pattern": "^[\\w./~^@-]+$", "description": "The commit, branch or tag to show"}}}}
+```
+
+`"{x}"` is replaced by argument `x`; `"{x...}"` splits an enum value on spaces (`"ec2 describe-vpcs"`);
+a nested array is a group kept only when all its placeholders have a value, and a boolean
+placeholder keeps its group when true. Write each argument's `description` as the idea, not the
+parameter name — it is what Jev matches the intent against. Add only commands you would let the
+agent run unasked; the gate still judges each call.
+
+**Logs.** Every `find_tools` and `run` appends to `router.jsonl` in the data directory: the intent
+(redacted), the chosen tool, its probability, the next four alternatives, the weakest argument and the
+outcome. Argument values are not logged. Shell runs are also in `trace.jsonl`, like any gated
+command.
+
+**Trying it.** `node router/server.mjs --check "who last changed router/mcp.mjs"` prints the
+ranking; add `--run` to run it. Registering it in an agent: `node install.mjs --router` prints the
+command or config snippet for every agent, and changes nothing:
+
+| Agent | Where the MCP server goes |
+|---|---|
+| Claude Code | `claude mcp add --scope user --transport stdio reflex-router -- <node> <repo>/router/server.mjs --mode shadow`, or `mcpServers` in a repo's `.mcp.json` |
+| Codex CLI | `codex mcp add reflex-router -- <node> …`, or `[mcp_servers.reflex-router]` (`command`, `args`, `[…env]`) in `~/.codex/config.toml` |
+| pi | no built-in MCP: the `pi-mcp-adapter` extension, then `mcpServers` in `~/.pi/agent/mcp.json` or `.mcp.json` |
+| oh-my-pi | `mcpServers` in `~/.omp/agent/mcp.json` or `.omp/mcp.json` (omp also imports Claude Code and Codex configs: register once) |
+| opencode | `"mcp": {"reflex-router": {"type": "local", "command": [<node>, …], "environment": {…}}}` in `opencode.json` |
+| Hermes | `mcp_servers:` in each profile's `config.yaml`; Hermes gives servers a filtered environment, so put `TYPESAFE_API_KEY` / `REFLEX_KEYCHAIN_SERVICE` / `REFLEX_*` under `env:` |
+
+**Limits.**
+
+- Downstream MCP tools are not gated: they are not shell commands, and the agent's own per-tool
+  MCP permissions now see only `run`. Route only servers you would allow wholesale; keep servers
+  whose calls need a human (deploys, writes to production) configured directly in the agent.
+- Only stdio downstream servers; no resources, prompts, sampling or `listChanged` from them.
+- The server speaks the `initialize`-handshake MCP revisions (2024-11-05 … 2025-11-25). A client of
+  the handshake-free 2026-07-28 revision probes with `server/discover`, gets "method not found",
+  and falls back to `initialize` as that revision specifies.
+- Values Jev can choose are the ones in the intent. A value that needs composing (a regular
+  expression written from a description, a date computed from "last Tuesday") comes back as
+  `needs_args`, and the agent writes it.
+- Two Jev requests per `run` without `tool` or `args` (three above 200 tools); input tokens grow
+  with the catalog, since every description (cut at 300 characters) is an option. The router gives
+  Jev 10 s per request unless `REFLEX_TIMEOUT_MS` is set.
+- Commands run in the server's working directory, which is where the agent launched it.
 
 ## Where this goes next
 
