@@ -8,7 +8,7 @@
       "args": ["-n", "--no-heading", "--color", "never", ["-i", "{ignore_case}"], ["-g", "{glob}"], "-e", "{pattern}", "--", "{path}"],
       "inputSchema": {"type": "object", "additionalProperties": false, "required": ["pattern"], "properties": {
         "pattern": {"type": "string", "minLength": 1, "x-allow-dash": true, "description": "The text or regular expression to look for inside files"},
-        "path": {"type": "string", "default": ".", "description": "The directory or file to search in"},
+        "path": {"type": "string", "minLength": 1, "default": ".", "description": "The directory or file to search in"},
         "glob": {"type": "string", "description": "A file-name filter such as *.go or *.tf, limiting which files are searched"},
         "ignore_case": {"type": "boolean", "description": "Match regardless of upper or lower case"}
       }}
@@ -19,7 +19,7 @@
       "args": ["-rnI", ["-i", "{ignore_case}"], ["--include", "{glob}"], "-e", "{pattern}", "--", "{path}"],
       "inputSchema": {"type": "object", "additionalProperties": false, "required": ["pattern"], "properties": {
         "pattern": {"type": "string", "minLength": 1, "x-allow-dash": true, "description": "The text or regular expression to look for inside files"},
-        "path": {"type": "string", "default": ".", "description": "The directory or file to search in"},
+        "path": {"type": "string", "minLength": 1, "default": ".", "description": "The directory or file to search in"},
         "glob": {"type": "string", "description": "A file-name filter such as *.py, limiting which files are searched"},
         "ignore_case": {"type": "boolean", "description": "Match regardless of upper or lower case"}
       }}
@@ -31,7 +31,7 @@
       "inputSchema": {"type": "object", "additionalProperties": false, "required": ["pattern"], "properties": {
         "pattern": {"type": "string", "minLength": 1, "description": "The code pattern to match, written as code with $VARS as wildcards"},
         "lang": {"type": "string", "enum": ["bash", "c", "cpp", "csharp", "css", "go", "html", "java", "javascript", "json", "kotlin", "lua", "python", "ruby", "rust", "scala", "swift", "tsx", "typescript", "yaml"], "description": "The programming language of the code being searched"},
-        "path": {"type": "string", "default": ".", "description": "The directory or file to search in"}
+        "path": {"type": "string", "minLength": 1, "default": ".", "description": "The directory or file to search in"}
       }}
     },
     {
@@ -39,7 +39,7 @@
       "description": "Show the commit history of the repository, or of one file or directory: hash and subject per commit, newest first.",
       "args": ["log", "--oneline", "--no-color", "-n", "{max_count}", ["--author", "{author}"], ["--since", "{since}"], "--", ["{path}"]],
       "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
-        "path": {"type": "string", "description": "Only commits touching this file or directory"},
+        "path": {"type": "string", "minLength": 1, "description": "Only commits touching this file or directory"},
         "max_count": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20, "description": "How many commits to show at most"},
         "author": {"type": "string", "description": "Only commits by this person (name or email)"},
         "since": {"type": "string", "description": "Only commits after this date or age, such as 2024-01-01 or 2.weeks"}
@@ -48,17 +48,17 @@
     {
       "name": "git_diff", "category": "git", "bin": "git",
       "description": "Show uncommitted changes in the working tree, or the changes between the working tree and a branch, tag or commit.",
-      "args": ["diff", "--no-color", "--no-ext-diff", ["--stat", "{stat}"], ["{ref}"], "--", ["{path}"]],
+      "args": ["diff", "--no-color", "--no-ext-diff", "--no-textconv", ["--stat", "{stat}"], ["{ref}"], "--", ["{path}"]],
       "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
         "ref": {"type": "string", "pattern": "^[\\w./~^@{}-]+$", "description": "The branch, tag or commit to compare against, such as main or HEAD~1"},
-        "path": {"type": "string", "description": "Only changes to this file or directory"},
+        "path": {"type": "string", "minLength": 1, "description": "Only changes to this file or directory"},
         "stat": {"type": "boolean", "description": "Only a summary of changed files and line counts, not the full diff"}
       }}
     },
     {
       "name": "git_blame", "category": "git", "bin": "git",
       "description": "Show who last changed each line of a file, and in which commit.",
-      "args": ["blame", ["-L", "{lines}"], "--", "{path}"],
+      "args": ["blame", "--no-textconv", ["-L", "{lines}"], "--", "{path}"],
       "inputSchema": {"type": "object", "additionalProperties": false, "required": ["path"], "properties": {
         "path": {"type": "string", "minLength": 1, "description": "The file to annotate"},
         "lines": {"type": "string", "pattern": "^\\d+,\\d+$", "description": "Only this line range, written start,end such as 10,40"}
@@ -69,7 +69,7 @@
       "description": "List Kubernetes resources (pods, deployments, services, nodes, ...) in a cluster, read-only.",
       "args": ["get", "{resource}", ["{name}"], ["-n", "{namespace}"], ["-A", "{all_namespaces}"], ["--context", "{context}"], ["-o", "{output}"]],
       "inputSchema": {"type": "object", "additionalProperties": false, "required": ["resource"], "properties": {
-        "resource": {"type": "string", "pattern": "^[a-z0-9.,/-]+$", "description": "The kind of Kubernetes resource to list, such as pods, deployments, services or nodes"},
+        "resource": {"type": "string", "pattern": "^(?!.*\\bsecrets?\\b)[a-z0-9.,/-]+$", "description": "The kind of Kubernetes resource to list (not secrets), such as pods, deployments, services or nodes"},
         "name": {"type": "string", "pattern": "^[a-z0-9.-]+$", "description": "One resource by name"},
         "namespace": {"type": "string", "pattern": "^[a-z0-9-]+$", "description": "The namespace to look in"},
         "all_namespaces": {"type": "boolean", "description": "Look across every namespace"},

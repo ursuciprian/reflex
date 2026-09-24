@@ -7,6 +7,8 @@ import {spawn} from "node:child_process";
 // to initialize, as that spec requires. Add server/discover when clients stop speaking the old era.
 export const VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
+const BASE_ENV = ["HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER", "TMPDIR", "LANG", "LC_ALL"];
+
 /** Calls onMessage(obj | Error) once per line of `stream`. */
 export function lines(stream, onMessage) {
   let buf = "";
@@ -26,7 +28,10 @@ export function lines(stream, onMessage) {
 
 /** Spawn a stdio MCP server and hold an initialized session with it. */
 export async function connect({command, args = [], env = {}, cwd}, {timeoutMs = 30000, name = command} = {}) {
-  const child = spawn(command, args, {cwd, env: {...process.env, ...env}, stdio: ["pipe", "pipe", "inherit"]});
+  // Like the MCP SDKs: a server gets a minimal environment plus its own `env`, never the caller's
+  // credentials (TYPESAFE_API_KEY, AWS_*, GITHUB_TOKEN ...).
+  const base = Object.fromEntries(BASE_ENV.filter(k => process.env[k] != null).map(k => [k, process.env[k]]));
+  const child = spawn(command, args, {cwd, env: {...base, ...env}, stdio: ["pipe", "pipe", "inherit"]});
   const pending = new Map();
   let next = 1, dead = null;
   const fail = err => { dead = err; for (const p of pending.values()) p.reject(err); pending.clear(); };
@@ -35,7 +40,7 @@ export async function connect({command, args = [], env = {}, cwd}, {timeoutMs = 
   child.stdin.on("error", () => {});   // EPIPE after the child died: the exit handler reports it
   const send = obj => child.stdin.write(JSON.stringify(obj) + "\n");
   lines(child.stdout, msg => {
-    if (msg instanceof Error) return;
+    if (msg instanceof Error || !msg || typeof msg !== "object") return;
     if (msg.method && msg.id != null)   // a request from the server (ping, roots, sampling): only ping is supported
       return send(msg.method === "ping" ? {jsonrpc: "2.0", id: msg.id, result: {}}
                                         : {jsonrpc: "2.0", id: msg.id, error: {code: -32601, message: "not supported by reflex-router"}});
@@ -53,13 +58,16 @@ export async function connect({command, args = [], env = {}, cwd}, {timeoutMs = 
   });
   const init = await request("initialize", {protocolVersion: VERSIONS[0], capabilities: {},
                                             clientInfo: {name: "reflex-router", version: "0.1.0"}});
+  if (!VERSIONS.includes(init?.protocolVersion)) { child.kill(); throw new Error(`${name}: unsupported protocol version ${init?.protocolVersion}`); }
   send({jsonrpc: "2.0", method: "notifications/initialized"});
-  const tools = [];
+  const tools = [], seen = new Set();
   let cursor;
-  do {   // tools/list is paginated
+  do {   // tools/list is paginated; a server repeating a cursor would loop forever
     const page = await request("tools/list", cursor ? {cursor} : undefined);
-    tools.push(...(page.tools ?? []));
-    cursor = page.nextCursor;
+    tools.push(...(page?.tools ?? []));
+    cursor = page?.nextCursor;
+    if (seen.has(cursor)) break;
+    seen.add(cursor);
   } while (cursor);
   return {init, tools, request, close: () => { child.stdin.end(); setTimeout(() => child.kill(), 2000).unref(); }};
 }

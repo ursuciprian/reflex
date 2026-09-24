@@ -28,7 +28,9 @@ hook (see the table in the README). Each adapter turns the agent's event into th
 2. **Rules** (`rules.json`) — regular expressions over the command plus its context
    (`cwd=`, `aws_profile=`, `kube_context=`, `tf_workspace=`, `git_branch=`). A rule fires when all
    of its patterns match. Rules are **enforced in every mode**, because they are code, not a model.
-   Shipped rules: `rm-root`, `prod-destroy`, `force-push-main` (deny); `tamper`, `destroy` (ask). Any mutating command that touches the Reflex checkout, its setup files or its logs is also an `ask`, wherever the repo was cloned.
+   Shipped rules: `rm-root`, `prod-destroy`, `force-push-main`, `push-mirror` (deny); `tamper`, `destroy`,
+   and — checked even before read-only detection — `secret-read` (the API key, secret stores) and
+   `secret-file-read` (`~/.ssh/id_*`, `~/.aws/credentials`, `.env` files, `kubectl get secret`) (ask). Any mutating command that touches the Reflex checkout, its setup files or its logs is also an `ask`, wherever the repo was cloned.
 3. **Fast lane** (`rules.json` → `pass`) — known-safe steps: builds, tests, `mkdir`, `git add/commit`,
    pushing a non-main branch. A command passes when every segment is read-only or matches a fast-lane
    pattern. → **pass**, logged.
@@ -246,6 +248,7 @@ the agent only sees what it asks for (tiered disclosure):
 ```json
 {"mcpServers": {
   "github": {"command": "/usr/local/bin/github-mcp-server", "args": ["stdio"], "env": {"GITHUB_TOOLSETS": "repos,issues"}},
+  "tickets":{"command": "…", "trusted": true},
   "old":    {"command": "…", "disabled": true}
 }}
 ```
@@ -281,7 +284,13 @@ checked against the tool's JSON schema (`type`, `enum`, `const`, `required`, `pr
 in the intent: `search for 'retry budget' in src`.
 
 **Running.** A downstream tool is proxied as `tools/call` and its result (content and
-`structuredContent`) returned unchanged, after one line naming the tool. A command tool is expanded
+`structuredContent`) returned unchanged, after one line naming the tool — but only when its server
+annotates it `readOnlyHint: true` (and not `destructiveHint`), or the server's entry in the router
+config says `"trusted": true`. Anything else returns `needs_approval` and does not run: the agent's
+per-tool MCP permissions only see `run`, so a tool that may write must not hide behind it. Keep such
+servers registered directly in the agent, or trust them explicitly. Downstream servers start with a
+minimal environment (`HOME`, `PATH`, `USER`, `SHELL`, `TERM`, `LOGNAME`, `TMPDIR`, `LANG`) plus their
+own `env`; shell tools get the router's environment without `TYPESAFE_API_KEY`. A command tool is expanded
 from its argv template and run with `execFile` — never through a shell — **after the Reflex gate
 judges the exact command**, shell-quoted (`decideSafe`, agent `reflex-router`, with the intent as
 the stated task). `deny` returns `denied`; `ask` returns `needs_approval` and nothing runs (an MCP
@@ -326,9 +335,9 @@ command or config snippet for every agent, and changes nothing:
 
 **Limits.**
 
-- Downstream MCP tools are not gated: they are not shell commands, and the agent's own per-tool
-  MCP permissions now see only `run`. Route only servers you would allow wholesale; keep servers
-  whose calls need a human (deploys, writes to production) configured directly in the agent.
+- Downstream MCP tools do not go through the gate's rules or Jev (they are not shell commands); the
+  read-only annotation or `"trusted"` is the whole check, and annotations are the server's own claim.
+  Trust only servers you would allow wholesale.
 - Only stdio downstream servers; no resources, prompts, sampling or `listChanged` from them.
 - The server speaks the `initialize`-handshake MCP revisions (2024-11-05 … 2025-11-25). A client of
   the handshake-free 2026-07-28 revision probes with `server/discover`, gets "method not found",

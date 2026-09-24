@@ -60,7 +60,9 @@ async function downstreamTools() {
       const c = await connect(spec, {name: server, timeoutMs: R.execTimeoutMs});
       clients.push(c);
       return c.tools.map(t => ({name: `${server}.${t.name}`, category: server, description: t.description ?? t.title ?? "",
-                                inputSchema: t.inputSchema ?? {type: "object"}, kind: "mcp", server, tool: t.name, client: c}));
+                                inputSchema: t.inputSchema ?? {type: "object"}, kind: "mcp", server, tool: t.name, client: c,
+                                // Runs without asking only when the server says it only reads, or the config trusts it.
+                                unattended: spec.trusted === true || (t.annotations?.readOnlyHint === true && t.annotations?.destructiveHint !== true)}));
     } catch (e) {
       console.error(`reflex-router: ${server} unavailable: ${e.message}`);   // one broken server must not take the router down
       return [];
@@ -69,7 +71,11 @@ async function downstreamTools() {
   return got.flat();
 }
 let catalogP;
-const catalog = () => catalogP ??= downstreamTools().then(ds => [...commandTools(), ...ds]);
+const catalog = () => catalogP ??= downstreamTools().then(ds => [...commandTools(), ...ds])
+  .catch(e => { catalogP = null; throw e; });   // a broken config file is retried on the next call
+// Children (shell tools, downstream servers) never see the TypeSafe key.
+const childEnv = () => Object.fromEntries(Object.entries(ENV).filter(([k]) => k !== "TYPESAFE_API_KEY"));
+const regex = p => { try { return new RegExp(p, "u"); } catch { try { return new RegExp(p); } catch { return null; } } };
 
 // ---------------------------------------------------------------------------------------------
 // Jev: which tool, then which arguments.
@@ -145,7 +151,7 @@ export async function fillArgs(intent, tool) {
       questions[`arg.${k}`] = {type: "noul", instructions: `${about} Does \`request.intent\` ask for it?`};
     } else if (["string", "number", "integer"].includes(type)) {
       let vals = type === "string" ? cands : cands.filter(c => Number.isFinite(Number(c)) && (type === "number" || Number.isInteger(Number(c))));
-      if (s.pattern) vals = vals.filter(v => new RegExp(s.pattern, "u").test(v));
+      if (s.pattern && regex(s.pattern)) vals = vals.filter(v => regex(s.pattern).test(v));
       if (!vals.length) { if (!optional) missing.push(k); continue; }
       questions[`arg.${k}`] = {type: "choice", instructions: `${about} Which of these values, taken from \`request.intent\`, is it?`,
                                criteria: {...Object.fromEntries(vals.slice(0, R.maxOptions).map(v => [v, null])), ...none}};
@@ -184,7 +190,7 @@ export function validate(schema, v, path = "args") {
   if (typeof v === "string") {
     if (schema.minLength != null && [...v].length < schema.minLength) errs.push(`${path}: shorter than ${schema.minLength}`);
     if (schema.maxLength != null && [...v].length > schema.maxLength) errs.push(`${path}: longer than ${schema.maxLength}`);
-    if (schema.pattern && !new RegExp(schema.pattern, "u").test(v)) errs.push(`${path}: does not match ${schema.pattern}`);
+    if (schema.pattern && regex(schema.pattern) && !regex(schema.pattern).test(v)) errs.push(`${path}: does not match ${schema.pattern}`);
   }
   if (typeof v === "number") {
     if (schema.minimum != null && v < schema.minimum) errs.push(`${path}: below ${schema.minimum}`);
@@ -196,9 +202,9 @@ export function validate(schema, v, path = "args") {
     if (schema.items) v.forEach((x, i) => errs.push(...validate(schema.items, x, `${path}[${i}]`)));
   }
   if (v !== null && typeof v === "object" && !Array.isArray(v)) {
-    for (const k of schema.required ?? []) if (!(k in v)) errs.push(`${path}.${k}: required`);
+    for (const k of schema.required ?? []) if (!Object.hasOwn(v, k)) errs.push(`${path}.${k}: required`);
     for (const [k, x] of Object.entries(v)) {
-      if (schema.properties?.[k]) errs.push(...validate(schema.properties[k], x, `${path}.${k}`));
+      if (schema.properties && Object.hasOwn(schema.properties, k)) errs.push(...validate(schema.properties[k], x, `${path}.${k}`));
       else if (schema.additionalProperties === false) errs.push(`${path}.${k}: not allowed`);
       else if (typeof schema.additionalProperties === "object") errs.push(...validate(schema.additionalProperties, x, `${path}.${k}`));
     }
@@ -242,9 +248,10 @@ async function runShell(tool, args, intent) {
   if (d.effective === "deny") return {status: "denied", tool: tool.name, command, reason: d.reason};
   if (d.effective !== "pass") return {status: "needs_approval", tool: tool.name, command, reason: d.reason,
     message: "Not run: this needs human approval. Ask the user to confirm, then run it through your own shell tool."};
-  const r = await new Promise(res => execFile(tool.bin, list, {cwd: process.cwd(), timeout: R.execTimeoutMs, maxBuffer: 16 << 20},
+  const r = await new Promise(res => execFile(tool.bin, list, {cwd: process.cwd(), env: childEnv(), timeout: R.execTimeoutMs, maxBuffer: 16 << 20},
     (err, stdout, stderr) => res({exit_code: err ? (typeof err.code === "number" ? err.code : 1) : 0, stdout, stderr,
-                                  error: err && typeof err.code !== "number" ? err.message : undefined})));
+                                  error: err && typeof err.code !== "number" ? err.message : undefined}))
+    .stdin?.end());   // a CLI that prompts (MFA, SSO) gets EOF instead of hanging until the timeout
   return {status: "ran", tool: tool.name, command, ...r};
 }
 
@@ -303,8 +310,12 @@ export async function run(cat, {intent, tool, args}) {
            message: "Not sure about the arguments. Call run again with this tool and explicit `args`."};
   else if (errors.length) out = {status: "invalid_args", tool: t.name, args: filled.args, errors};
   else if (t.kind === "shell") out = await runShell(t, filled.args, intent);
+  else if (!t.unattended)
+    // The agent's per-tool MCP permissions only see `run`, so a tool that may write must not hide behind it.
+    out = {status: "needs_approval", tool: t.name, args: filled.args,
+           message: `Not run: ${t.tool} is not marked read-only by its server. A human decides: call it through a server ` +
+                    `registered directly in the agent, or mark "${t.server}" as "trusted": true in the router config.`};
   else {
-    // ponytail: downstream MCP tools are not gated here (they are not shell); see GUIDE "Tool router".
     try {
       const res = await t.client.request("tools/call", {name: t.tool, arguments: filled.args});
       out = {status: "ran", tool: t.name, args: filled.args, mcp: res};
@@ -331,14 +342,17 @@ export const TOOLS = [
   {name: "find_tools", description: "Find tools for a task. Returns one line per best-matching tool out of the whole catalog (shell commands such as ripgrep, git log/diff/blame, kubectl get, aws describe, plus every tool of the configured MCP servers). Start here.",
    inputSchema: {type: "object", additionalProperties: false, required: ["intent"], properties: {
      intent: {type: "string", minLength: 1, description: "What you want to do, in one sentence. Quote exact values ('*.tf', \"TODO\")."},
-     limit: {type: "integer", minimum: 1, maximum: 20, description: "How many tools to list (default 5)"}}}},
+     limit: {type: "integer", minimum: 1, maximum: 20, description: "How many tools to list (default 5)"}}},
+   annotations: {readOnlyHint: true, openWorldHint: false}},
   {name: "describe_tool", description: "The full description and argument schema of one tool from find_tools.",
-   inputSchema: {type: "object", additionalProperties: false, required: ["name"], properties: {name: {type: "string", minLength: 1}}}},
+   inputSchema: {type: "object", additionalProperties: false, required: ["name"], properties: {name: {type: "string", minLength: 1}}},
+   annotations: {readOnlyHint: true, openWorldHint: false}},
   {name: "run", description: "Run a tool. Give the intent; the router picks the tool and fills its arguments from the intent when you leave them out, and returns candidates instead of guessing when unsure. Pass `tool` and `args` to be exact. Shell tools pass the Reflex safety gate first. Quote exact values in the intent: search for 'TODO' in src.",
    inputSchema: {type: "object", additionalProperties: false, required: ["intent"], properties: {
      intent: {type: "string", minLength: 1, description: "What you want done, in one sentence, with the exact values it needs"},
      tool: {type: "string", description: "A tool name from find_tools; leave out to let the router choose"},
-     args: {type: "object", description: "The tool's arguments, as in describe_tool; leave out to let the router fill them"}}}},
+     args: {type: "object", description: "The tool's arguments, as in describe_tool; leave out to let the router fill them"}}},
+   annotations: {readOnlyHint: false, destructiveHint: true, openWorldHint: true}},
 ];
 
 // ---------------------------------------------------------------------------------------------
@@ -354,7 +368,7 @@ async function handle(method, params = {}) {
     case "tools/list": return {tools: TOOLS};
     case "tools/call": {
       const def = TOOLS.find(t => t.name === params.name);
-      if (!def) throw new RpcError(-32602, `unknown tool: ${params.name}`);
+      if (!def) throw new RpcError(-32602, `unknown tool: ${params?.name}`);
       const a = params.arguments ?? {}, errs = validate(def.inputSchema, a);
       if (errs.length) return {isError: true, content: [{type: "text", text: `invalid arguments: ${errs.join("; ")}`}]};
       try {
@@ -373,12 +387,16 @@ async function handle(method, params = {}) {
 function serve() {
   const write = obj => process.stdout.write(JSON.stringify(obj) + "\n");
   let inflight = 0, ended = false;
-  const done = () => { for (const c of clients) c.close(); process.exit(0); };
+  // Exit only once stdout has drained: a pipe write is asynchronous, and exiting early cuts a big result.
+  const done = () => { for (const c of clients) c.close(); process.stdout.write("", () => process.exit(0)); };
   lines(process.stdin, async msg => {
     if (msg instanceof Error) return write({jsonrpc: "2.0", id: null, error: {code: -32700, message: "parse error"}});
+    // Not an object (null, a batch array): invalid; answer rather than crash or leave the client waiting.
+    if (!msg || typeof msg !== "object" || Array.isArray(msg) || (msg.id != null && typeof msg.method !== "string" && !("result" in msg) && !("error" in msg)))
+      return write({jsonrpc: "2.0", id: msg?.id ?? null, error: {code: -32600, message: "invalid request"}});
     if (!msg.method || msg.id === undefined || msg.id === null) return;   // notifications and responses need no reply
     inflight++;
-    try { write({jsonrpc: "2.0", id: msg.id, result: await handle(msg.method, msg.params)}); }
+    try { write({jsonrpc: "2.0", id: msg.id, result: await handle(msg.method, msg.params ?? {})}); }
     catch (e) { write({jsonrpc: "2.0", id: msg.id, error: {code: e.code ?? -32603, message: e.message}}); }
     if (--inflight === 0 && ended) done();
   });
@@ -466,7 +484,16 @@ async function selfcheck() {
   ok(g1.status === "denied" && /force push/.test(g1.reason) && !("stdout" in g1), "rule deny: not executed");
   const tamper = join(dirname(HERE), "router", "test", "tamper.txt");
   const g2 = await run(cat, {intent: "make a file", tool: "t_touch", args: {path: tamper}});
-  ok(g2.status === "needs_approval" && !existsSync(tamper), "gate ask: not executed");
+  ok(g2.status === "needs_approval" && !existsSync(tamper), "rule ask: not executed");
+  // enforce mode, Jev unreachable: the policy fallback (ask) holds the command back too
+  const copy = join(tmp, "copy.txt");
+  Object.assign(CONFIG, {mode: "enforce", api: "http://127.0.0.1:9/"});
+  const g6 = await run([{name: "t_cp", kind: "shell", bin: "cp", args: ["{a}", "{b}"], inputSchema: {type: "object"}}],
+                       {intent: "copy", tool: "t_cp", args: {a: marker, b: copy}});
+  Object.assign(CONFIG, {mode: "shadow"});
+  ok(g6.status === "needs_approval" && /jev unavailable/.test(g6.reason) && !existsSync(copy), "enforce + Jev down: fallback ask, not executed");
+  const g7 = await run(cat, {intent: "x", tool: "kubectl_get", args: {resource: "secrets", output: "yaml"}});
+  ok(g7.status === "invalid_args", "kubectl_get refuses secrets");
   const g3 = await run(cat, {intent: "log", tool: "git_log", args: {author: "--output=/tmp/x"}});
   ok(g3.status === "invalid_args" && /must not start with "-"/.test(g3.errors[0]), "option injection refused");
   const g5 = await run([{name: "t_spread", kind: "shell", bin: "echo", args: ["{x...}"], inputSchema: {type: "object", properties: {x: {type: "string"}}}}],
@@ -478,14 +505,14 @@ async function selfcheck() {
   ok(trace.includes("force push or delete of main") && trace.includes('"agent":"reflex-router"'), "gate decisions are traced");
   const rlog = readFileSync(R.log, "utf8").trim().split("\n").map(l => JSON.parse(l));
   ok(rlog.some(e => e.status === "choose_tool" && e.alternatives.length) && rlog.some(e => e.tool === "grep_search" && e.status === "ran"), "router.jsonl");
-  ok(!readFileSync(R.log, "utf8").includes("hunter2"), "redacted log");
 
   // protocol round trip: this server over stdio, proxying a fake downstream MCP server
-  const cfg = join(tmp, "router.json");
-  writeFileSync(cfg, JSON.stringify({mcpServers: {fake: {command: process.execPath, args: [join(HERE, "test/fake-server.mjs")]},
+  const cfg = join(tmp, "router.json"), fake = {command: process.execPath, args: [join(HERE, "test/fake-server.mjs")]};
+  writeFileSync(cfg, JSON.stringify({mcpServers: {fake, trusted: {...fake, trusted: true},
                                                   gone: {command: join(tmp, "does-not-exist")}, remote: {url: "https://x"}}}));
-  const c = await connect({command: process.execPath, args: [fileURLToPath(import.meta.url)],
-    env: {REFLEX_ROUTER_STUB: join(HERE, "test/stub-jev.mjs"), REFLEX_ROUTER_CONFIG: cfg}}, {name: "router"});
+  const routerEnv = {REFLEX_ROUTER_STUB: join(HERE, "test/stub-jev.mjs"), REFLEX_ROUTER_CONFIG: cfg, REFLEX_DATA_DIR: CONFIG.data,
+                     REFLEX_MODE: "shadow", TYPESAFE_API_KEY: "selfcheck-not-a-key"};
+  const c = await connect({command: process.execPath, args: [fileURLToPath(import.meta.url)], env: routerEnv}, {name: "router"});
   ok(c.init.protocolVersion === VERSIONS[0] && c.init.capabilities.tools && c.tools.map(t => t.name).join() === "find_tools,describe_tool,run", "initialize + tools/list");
   ok(JSON.stringify(await c.request("ping")) === "{}", "ping");
   const text = r => r.content.map(x => x.text).join("\n");
@@ -495,8 +522,13 @@ async function selfcheck() {
   ok(JSON.parse(text(dt)).inputSchema.required.join() === "a,b", "describe_tool (downstream tools/list was paginated)");
   const e1 = await c.request("tools/call", {name: "run", arguments: {intent: "echo text=hello token=hunter2"}});
   ok(!e1.isError && text(e1).includes("echo: hello") && text(e1).includes("fake.echo"), "run: selected, filled, proxied");
+  ok(text(e1).includes("key=absent"), "downstream servers do not get the TypeSafe key");
+  const logged = readFileSync(R.log, "utf8");
+  ok(!logged.includes("hunter2") && logged.includes("token=<redacted>"), "redacted log");
   const e2 = await c.request("tools/call", {name: "run", arguments: {intent: "add a=2 b=3.5"}});
-  ok(text(e2).includes("5.5") && e2.structuredContent?.sum === 5.5, "numbers filled; structured result kept");
+  ok(JSON.parse(text(e2)).status === "needs_approval", "a tool not annotated read-only is not run unattended");
+  const e6 = await c.request("tools/call", {name: "run", arguments: {intent: "add a=2 b=3.5", tool: "trusted.add"}});
+  ok(text(e6).includes("5.5") && e6.structuredContent?.sum === 5.5, "trusted server: numbers filled; structured result kept");
   const e3 = await c.request("tools/call", {name: "run", arguments: {intent: "x", tool: "fake.echo", args: {text: 5}}});
   ok(e3.isError && text(e3).includes("expected string"), "downstream schema validated before proxying");
   const e4 = await c.request("tools/call", {name: "run", arguments: {intent: "something ambiguous"}});
@@ -506,6 +538,14 @@ async function selfcheck() {
   const err = async (m, p) => { try { await c.request(m, p); return null; } catch (e) { return e.message; } };
   ok(/-32601/.test(await err("server/discover")) && /-32602/.test(await err("tools/call", {name: "nope"})), "unknown method / tool are protocol errors");
   c.close();
+  // raw lines: garbage is answered, not fatal, and the last answer is flushed before exit on EOF
+  const raw = spawnSync(process.execPath, [fileURLToPath(import.meta.url)], {env: {...ENV, ...routerEnv, REFLEX_ROUTER_CONFIG: join(tmp, "none.json")},
+    input: 'null\n[1]\n{"jsonrpc":"2.0","id":7}\nnot json\n{"jsonrpc":"2.0","id":1,"method":"initialize","params":null}\n' +
+           '{"jsonrpc":"2.0","method":"notifications/initialized"}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":' +
+           `{"name":"describe_tool","arguments":{"name":"git_log"}}}\n`, encoding: "utf8", timeout: 10000});
+  const replies = raw.stdout.trim().split("\n").map(l => JSON.parse(l));
+  ok(raw.status === 0 && replies.length === 6 && replies.slice(0, 3).every(r => r.error?.code === -32600) && replies[3].error?.code === -32700 &&
+     replies[4].result?.protocolVersion === VERSIONS[0] && replies[5].result?.content, "invalid requests answered; exits cleanly after EOF");
   console.log(process.exitCode ? "router selfcheck FAILED" : "router selfcheck OK");
 }
 

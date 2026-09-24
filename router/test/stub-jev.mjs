@@ -22,7 +22,7 @@ export default async function ask(state, questions) {
         probabilities: Object.fromEntries(options.map(o => [o, o === a ? 0.4 : o === b ? 0.35 : 0.25 / (options.length - 2)]))};
       continue;
     } else {
-      choice = options.filter(o => intent.includes(o.split(".").at(-1))).sort((x, y) => y.length - x.length)[0] ?? "none_of_these";
+      choice = options.filter(o => intent.includes(o.split(".").at(-1))).sort((x, y) => y.split(".").at(-1).length - x.split(".").at(-1).length)[0] ?? "none_of_these";
     }
     answers[id] = {choice, confidence: p, probabilities: spread(options, choice, p)};
   }
