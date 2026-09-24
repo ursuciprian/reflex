@@ -20,8 +20,10 @@ hook (see the table in the README). Each adapter turns the agent's event into th
 
 1. **Read-only** — `readOnly()` recognises commands that only read: `ls`, `grep`, `git status`,
    `kubectl get`, `terraform plan`, `aws … describe-*`, `gh pr view`, `ssh host '<read-only>'`,
-   `$(<read-only>)`, loops of reads, writes to `/dev/null` or `/tmp`, heredocs fed to `cat`. It is
-   conservative: anything it does not recognise goes on to the next step. → **pass**, not logged.
+   `$(<read-only>)`, loops of reads, output to `/dev/null`, quoted heredocs fed to `cat`. Quoted
+   text is treated as data (`jq '.a | .b'`, `grep -E 'x|y'`), except `$(…)` and backticks inside
+   double quotes, which still run. It is conservative: anything it does not recognise goes on to
+   the next step. → **pass**, not logged.
 2. **Rules** (`rules.json`) — regular expressions over the command plus its context
    (`cwd=`, `aws_profile=`, `kube_context=`, `tf_workspace=`, `git_branch=`). A rule fires when all
    of its patterns match. Rules are **enforced in every mode**, because they are code, not a model.
@@ -30,7 +32,8 @@ hook (see the table in the README). Each adapter turns the agent's event into th
    pushing a non-main branch. A command passes when every segment is read-only or matches a fast-lane
    pattern. → **pass**, logged.
 4. **Jev** — the command (secrets redacted), its working directory, the environment context and
-   the agent's last message and last five commands (from the session transcript) are sent to
+   the text the agent wrote right before this command and its last five commands (from the session
+   transcript; if the command is not in the transcript yet, no intent is sent rather than an older one) are sent to
    TypeSafe with the six questions in `questions.json`. Answers are cached for 24 h per
    (command, cwd, environment, question-set version, model).
 5. **Policy** (`policy.json`) — ordered gates over the answers; the first that fires wins,
@@ -207,6 +210,8 @@ and [confidence](https://docs.typesafe.ai/confidence).
   fail towards "ask Jev", not towards "pass", and the self-checks pin the known bypasses — but
   treat them as a strong filter, not a sandbox. Keep IAM, network controls, and least-privilege
   credentials: Reflex supplements them.
+- Claude Code does not report a Bash exit code to hooks; Reflex records `ran` (exit 0) or
+  `failed` from `PostToolUse` / `PostToolUseFailure`.
 - Only shell tools are gated (`Bash`, pi/omp `bash`, opencode `bash`, Hermes `terminal`). File-edit
   tools, MCP tools, omp's `eval` and Hermes' `execute_code` go through each agent's own permissions.
 - Codex and opencode hooks cannot open a prompt, so an `ask` blocks with a reason telling the agent

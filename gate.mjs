@@ -18,10 +18,10 @@
 // Jev's decisions are enforced only with REFLEX_MODE=enforce; in the default shadow mode Jev
 // runs in a detached background process, so the agent never waits for it.
 import {appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync,
-        openSync, readSync, writeSync, closeSync} from "node:fs";
+        openSync, readSync, writeSync, closeSync, rmSync} from "node:fs";
 import {createHash} from "node:crypto";
 import {execFileSync, spawn, spawnSync} from "node:child_process";
-import {homedir, platform} from "node:os";
+import {homedir, platform, tmpdir} from "node:os";
 import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
 import {compile} from "./policy.mjs";
@@ -60,7 +60,7 @@ const READ_ONLY = new Set(("ls cat head tail less wc grep egrep rg fd find tree 
 // Flags that make an otherwise read-only tool run a program or write a file.
 const UNSAFE_FLAGS = new RegExp([
   String.raw`\bsed\b[^|;&]*(--in-place|\s-[a-zA-Z]*i|[;'"{}\s][wWe]\s|\/[a-zA-Z0-9]*[we]\s)`,
-  String.raw`\bawk\b.*(system|getline)`, String.raw`--pre\b`, String.raw`--(upload|receive)-pack`,
+  String.raw`\bawk\b.*(system|getline)`, String.raw`\bawk\b[^']*'[^']*[|>][^']*'`, String.raw`--pre\b`, String.raw`--(upload|receive)-pack`,
   String.raw`--post-renderer`, String.raw`--compress-program`, String.raw`--output\b`, String.raw`--ext-diff`,
   String.raw`\s-f(print|printf|ls)\b`, String.raw`\s-ok(dir)?\b`, String.raw`\bfd\b.*\s-[a-zA-Z]*[xX]\b`,
   String.raw`\b(sort|tree)\b[^|;&]*\s-o\b`, String.raw`--show-token`,
@@ -85,6 +85,27 @@ const KEYWORD = /^(do|then|else|elif|if|while|until|!|\{|\()\s+/;
 const SAFE_VAR = /^([a-z_][a-z0-9_]*|[A-Z]{1,3}|AWS_PROFILE|AWS_REGION|AWS_DEFAULT_REGION|KUBECONFIG)$/;
 const assignmentOk = a => SAFE_VAR.test(a.split("=")[0]);
 
+// Blank out quoted text, keeping the quote marks. Inside double quotes `$(` and backticks still
+// expand, so they are kept. Unbalanced quotes mean the mask cannot be trusted: return the input.
+export function maskQuotes(s) {
+  let out = "", q = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (q === "'") { if (ch === "'") { q = null; out += ch; } continue; }
+    if (q === '"') {
+      if (ch === "\\") { i++; continue; }
+      if (ch === '"') { q = null; out += ch; continue; }
+      if (ch === "`") out += ch;
+      if (ch === "$" && s[i + 1] === "(") { out += "$("; i++; }
+      continue;
+    }
+    if (ch === "\\") { out += ch + (s[i + 1] ?? ""); i++; continue; }
+    if (ch === "'" || ch === '"') q = ch;
+    out += ch;
+  }
+  return q ? s : out;
+}
+
 // `extra` adds segment patterns that are safe but not read-only (rules.json "pass": builds, mkdir).
 export function readOnly(cmd, extra = [], depth = 0) {
   if (depth > 3) return false;
@@ -106,10 +127,15 @@ export function readOnly(cmd, extra = [], depth = 0) {
     if (!readOnly(m[1], extra, depth + 1)) return false;
     c = c.replace(m[0], "X");
   }
-  if (/>|`|\$\(|<\(|<<|\bsudo\b|-delete\b|-exec(dir)?\b|\btee\b|\bxargs\b|\beval\b|\bsource\b|(^|[;&|]\s*)\.\s/.test(c)) return false;
-  if (UNSAFE_FLAGS.test(c)) return false;
+  // Tool-level dangers are checked on the raw text, quotes included (conservative).
+  if (/-delete\b|-exec(dir)?\b/.test(c) || UNSAFE_FLAGS.test(c)) return false;
+  // Shell structure and command words are checked with quoted text masked: `jq '.a | .b'` or
+  // `grep -E 'x|y'` is one command, and `>` or `source` inside quotes is data. Expansions inside
+  // double quotes stay visible.
+  const m = maskQuotes(c);
+  if (/>|`|\$\(|<\(|<<|(^|[;&|]\s*)\.\s|\bsudo\b|\btee\b|\bxargs\b|\beval\b|\bsource\b/.test(m)) return false;
   // `&` (background) separates commands just like `;`.
-  return c.split(/&&|\|\||[;&|\n]/).map(s => s.trim()).filter(Boolean).every(seg => {
+  return m.split(/&&|\|\||[;&|\n]/).map(s => s.trim()).filter(Boolean).every(seg => {
     while (KEYWORD.test(seg)) seg = seg.replace(KEYWORD, "");
     if (/^(done|fi|esac|\}|\)|else|then|do)$/.test(seg)) return true;
     const assign = seg.match(/^(export\s+)?(\w+=("[^"]*"|'[^']*'|\S*))$/);
@@ -172,20 +198,25 @@ export function envContext(cwd) {
   return e;
 }
 
-// What the agent last said it was doing, and what it ran just before. Reads the transcript tail.
+// What the agent said right before this call, and what it ran just before. Reads the transcript
+// tail. The intent is the text that precedes this call's own tool_use entry. When that entry is not
+// in the transcript yet (Claude Code can write it after the hook fires), there is no intent: an
+// older message would be judged against the wrong task, which is worse than none.
 export function sessionContext(path, toolUseId) {
   if (!path || !existsSync(path)) return {};
   const size = statSync(path).size, len = Math.min(size, 512 * 1024), buf = Buffer.alloc(len);
   const fd = openSync(path, "r");
   readSync(fd, buf, 0, len, size - len);
   closeSync(fd);
-  let intent, recent = [];
+  let lastText, intent, recent = [];
   for (const line of buf.toString("utf8").split("\n")) {
     let r;
     try { r = JSON.parse(line); } catch { continue; }
+    if (r.type === "user" && r.message?.content?.some?.(c => c.type !== "tool_result")) lastText = undefined;
     if (r.type !== "assistant") continue;
     for (const c of r.message?.content ?? []) {
-      if (c.type === "text" && c.text?.trim()) intent = c.text;
+      if (c.type === "text" && c.text?.trim()) lastText = c.text;
+      if (c.type === "tool_use" && toolUseId && c.id === toolUseId) intent = lastText;
       if (c.type === "tool_use" && c.name === "Bash" && c.id !== toolUseId && c.input?.command) recent.push(c.input.command);
     }
   }
@@ -205,11 +236,22 @@ export function checkRules(haystack, rules) {
 }
 export const fastPass = (cmd, rules) => readOnly(cmd, rules.pass.map(p => new RegExp(p, "i")));
 
+// A quoted heredoc whose consumer only stores or prints text (a commit message, a PR body, a file
+// written by cat) is data, not a command: a PR body that mentions `git push --force origin main`
+// must not trip the force-push rule. Heredocs fed to a shell, an interpreter or ssh stay in.
+const DATA_CONSUMER = /(^|\s)(cat|jq|tee|git\s+(commit|tag|notes)\b[^\n]*|gh\s+(pr|issue|release|api)\b[^\n]*)\s[^\n]*$|(^|\s)cat$/;
+export function stripDataHeredocs(cmd) {
+  return cmd.replace(/([^\n]*?)<<-?\s*(['"])(\w+)\2([^\n]*)\n[\s\S]*?\n\s*\3\s*(?=\n|$)/g,
+    (all, before, _q, _tag, after) => !/\|/.test(after) &&   // `cat <<'EOF' | bash` runs the body
+      DATA_CONSUMER.test(before.replace(/.*[;&|(]\s*/, "").trimEnd() + " ") ? `${before}<<DATA${after}` : all);
+}
+
 /** Everything decided without Jev, or null when Jev has to judge. */
 export function precheck(command, cwd, env) {
   const rules = load("rules.json");
-  // Rules see the raw command: redaction could hide the very marker a rule looks for (--secret-id=prod-db).
-  const haystack = [command, `cwd=${cwd ?? ""}`, ...Object.entries(env).map(([k, v]) => `${k}=${v}`)].join(" ");
+  // Rules see the raw command (redaction could hide the very marker a rule looks for, such as
+  // --secret-id=prod-db), minus heredoc bodies that are only data.
+  const haystack = [stripDataHeredocs(command),`cwd=${cwd ?? ""}`, ...Object.entries(env).map(([k, v]) => `${k}=${v}`)].join(" ");
   const ruled = r => ({outcome: r.outcome, rule: r.rule, id: r.id, source: "rule", policy_version: rules.version});
   // Some rules must see reads too (printing an API key is a read).
   const early = checkRules(haystack, {rules: rules.rules.filter(r => r.before_read_only)});
@@ -397,8 +439,11 @@ async function claudePre(input) {
 }
 function claudePost(input) {
   if (input.tool_name && input.tool_name !== "Bash") return;
-  record({agent: "claude-code", event: input.hook_event_name === "PermissionDenied" ? "denied" : "ran",
-          session_id: input.session_id, call_id: input.tool_use_id, exit_code: input.tool_response?.exit_code});
+  // Claude's Bash result carries no exit code; PostToolUseFailure is the failure signal.
+  const ev = input.hook_event_name;
+  record({agent: "claude-code", event: ev === "PermissionDenied" ? "denied" : ev === "PostToolUseFailure" ? "failed" : "ran",
+          session_id: input.session_id, call_id: input.tool_use_id,
+          exit_code: input.tool_response?.exit_code ?? (ev === "PostToolUse" ? 0 : null)});
 }
 
 // Codex CLI adapter: hooks.json PreToolUse / PostToolUse (https://learn.chatgpt.com/docs/hooks).
@@ -486,6 +531,12 @@ async function selfcheck() {
     ["aws s3api get-object --bucket b --key k ~/.claude/settings.json", "get-object writes"],
     ["eval \"$X\"", "eval"], ["source ./x.sh", "source"], [". ./x.sh", "dot"],
   ]) ok(!readOnly(cmd), `bypass: ${why}`);
+  ok(readOnly(`jq -c '{a: .x | length, b: (.y // "z")}' ~/.local/state/reflex/trace.jsonl`), "jq filter with | and // is one command");
+  ok(readOnly(`tail -n 4 t.jsonl | jq -c '{rule,source,emitted}'`) && !readOnly("echo x | source /dev/stdin"), "command words only outside quotes");
+  ok(readOnly("grep -E 'deny|ask' f | wc -l") && readOnly(`echo "a; rm -rf x > y"`), "quoted | ; > are data");
+  ok(!readOnly(`echo "$(rm -rf x)"`) && !readOnly("echo \"`rm -rf x`\""), "expansions inside double quotes still count");
+  ok(!readOnly(`awk '{print | "sh"}' f`) && !readOnly(`awk '{print > "out"}' f`), "awk program pipes / redirects");
+  ok(!readOnly(`echo 'unbalanced ; rm -rf x`), "unbalanced quotes are not trusted");
   ok(readOnly("git branch -a") && readOnly("git remote -v") && readOnly("sed -n '1,20p' f") && readOnly("sort f | uniq -c"), "reads still pass");
   ok(readOnly("S=/tmp/x; ls $S") && readOnly("for f in a b; do cat $f; done"), "safe variables");
 
@@ -519,10 +570,18 @@ async function selfcheck() {
   ok(rule("git push origin --mirror") === "push-mirror" && !fastPass("git push origin --mirror", rules), "mirror push");
   ok(rule("git push -fu origin main") === "force-push-main" && rule("git push origin :main") === "force-push-main" &&
      rule("git push origin --delete main") === "force-push-main", "force push variants");
+  ok(rule("echo $(rm -rf ~)") === "rm-root" && rule("x=`rm -rf /`") === "rm-root" && rule("bash -c 'rm -rf ~'") === "rm-root", "rm-root inside $(), backticks, quotes");
   ok(rule("rm -rf -- /") === "rm-root" && rule('rm --recursive --force "$HOME"') === "rm-root" && rule("rm -rf ${HOME}") === "rm-root", "rm-root variants");
   ok(rule("aws s3 rm s3://b --recursive", "aws_profile=prod01") === "prod-destroy" && rule("terraform state rm x", "cwd=/envs/live") === "prod-destroy", "prod variants");
   ok(rule("kubectl --context prd scale deploy/a --replicas=0") === "prod-destroy" && rule("psql -c 'TRUNCATE users'", "cwd=/prod") === "prod-destroy", "prod scale / truncate");
   ok(rule("aws secretsmanager delete-secret --secret-id=prod-db") === "prod-destroy", "rules see the raw command");
+  const body = "gh pr create --title x --body \"$(cat <<'EOF'\nverified: git push --force origin main is denied\nEOF\n)\"";
+  const msg = "git commit -F - <<'EOF'\nfix: deny git push --force origin main\nEOF";
+  ok(rule(stripDataHeredocs(body)) === null && rule(stripDataHeredocs(msg)) === null, "PR bodies and commit messages are data");
+  ok(rule(stripDataHeredocs("bash <<'EOF'\ngit push --force origin main\nEOF")) === "force-push-main" &&
+     rule(stripDataHeredocs("ssh h <<'EOF'\nrm -rf ~\nEOF")) === "rm-root" &&
+     rule(stripDataHeredocs("cat <<EOF\n$(rm -rf ~)\nEOF")) === "rm-root" &&
+     rule(stripDataHeredocs("cat <<'EOF' | bash\nrm -rf ~\nEOF")) === "rm-root", "heredocs that run, or expand, still count");
   ok(rule("aws s3 ls", "cwd=/liveness") === null && rule("gcloud compute instances list", "cwd=/prod") === null, "no false prod");
   ok(fastPass("go test ./...", rules) && fastPass("npm run smoke", rules), "fast lane");
   ok(fastPass("mkdir -p out && go test ./... 2>&1 | tail -5", rules), "fast lane mixes with reads");
@@ -544,6 +603,16 @@ async function selfcheck() {
   ok(p.decide(A(0.8, 1.0, "local", 0.1, 0.9, {on_task: {noul: 0.1}})).outcome === "ask", "off-task mutation asks");
   ok(p.decide(A(0.8, 1.0, "local", 0.1, 0.9, {on_task: {noul: 0.9}})).outcome === "pass", "on-task mutation passes");
   ok(p.policy.fallback === "ask", "errors, including incomplete answers, use the ask fallback");
+
+  // intent: the text right before this call's tool_use, never an older message
+  const tp = join(tmpdir(), `reflex-selfcheck-${process.pid}.jsonl`);
+  const A2 = content => JSON.stringify({type: "assistant", message: {content}});
+  writeFileSync(tp, [A2([{type: "text", text: "Old task"}]), A2([{type: "tool_use", id: "t1", name: "Bash", input: {command: "ls"}}]),
+    JSON.stringify({type: "user", message: {content: [{type: "text", text: "next"}]}}),
+    A2([{type: "text", text: "Deleting the test repo"}]), A2([{type: "tool_use", id: "t2", name: "Bash", input: {command: "gh repo delete x"}}])].join("\n"));
+  ok(sessionContext(tp, "t2").intent === "Deleting the test repo", "intent is the text before this call");
+  ok(sessionContext(tp, "t9").intent === undefined && sessionContext(tp, "t9").recent?.length === 2, "call not in transcript yet: no intent");
+  rmSync(tp, {force: true});
 
   // the whole path, without Jev
   ok((await judge({command: "ls -la", cwd: "/w", env: {}})).source === "read-only", "judge: read-only");
