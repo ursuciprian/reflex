@@ -20,6 +20,7 @@ import {execFileSync} from "node:child_process";
 import {homedir} from "node:os";
 import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
+import {USER_CONFIG, USER_CONFIG_FILE, USER_CONFIG_ERROR} from "./gate.mjs";
 
 const argv = process.argv.slice(2);
 const opt = (n, d) => {
@@ -32,19 +33,22 @@ const HOME = homedir();
 const REPO = dirname(fileURLToPath(import.meta.url));
 const GATE = join(REPO, "gate.mjs");
 const INSTRUCTIONS = join(REPO, "instructions.mjs");
-const MODE = opt("--mode", "shadow");
+const MODE = opt("--mode", process.env.REFLEX_MODE ?? USER_CONFIG.mode ?? "shadow");
 const NODE = opt("--node", process.execPath);   // absolute, so hooks work without the shell's PATH
-const ALLOW = opt("--allow", "off");
+const ALLOW = opt("--allow", process.env.REFLEX_ALLOW ?? USER_CONFIG.allow ?? "off");
+const ENGINE = opt("--engine", process.env.REFLEX_ENGINE ?? USER_CONFIG.engine ?? "jev");
 const UNINSTALL = argv.includes("--uninstall");
 const KEYCHAIN = opt("--keychain", undefined);   // macOS Keychain item holding the TypeSafe key
 const CONTEXT = argv.includes("--context") ? "on" : argv.includes("--no-context") ? "off" : "keep";
 if (argv.includes("--context") && argv.includes("--no-context")) throw new Error("--context and --no-context conflict");
+if (USER_CONFIG_ERROR && !UNINSTALL) throw new Error(USER_CONFIG_ERROR);
+if (!["local", "jev"].includes(ENGINE)) throw new Error("--engine must be local or jev");
 if (!["off", "shadow", "enforce"].includes(MODE)) throw new Error("--mode must be off, shadow or enforce");
 if (!["off", "shadow", "on"].includes(ALLOW)) throw new Error("--allow must be off, shadow or on");
 if (ALLOW === "on" && MODE !== "enforce") console.error(`note: --allow on only takes effect with --mode enforce; in ${MODE} mode allows are logged as would_allow`);
 if (Number(process.versions.node.split(".")[0]) < 18) throw new Error(`node 18+ required, found ${process.versions.node}`);
 
-const q = s => `"${s}"`;
+const q = s => `"${s.replace(/(["\\`$])/g, "\\$1")}"`;
 const cmd = (flag, script = GATE) => `${q(NODE)} ${q(script)} ${flag} --mode ${MODE}${script === GATE ? ` --allow ${ALLOW}` : ""}`;
 const isOurs = c => typeof c === "string" && (c.includes(q(GATE)) || c.includes(q(INSTRUCTIONS)));
 const readJson = f => existsSync(f) ? JSON.parse(readFileSync(f, "utf8")) : {};
@@ -96,7 +100,7 @@ const AGENTS = {
     stripOurs(s.hooks);
     // The agent must not quietly edit its own gate or its settings; a human confirms each change.
     // ~/.config/reflex holds personal instruction fragments, injected into every repo's sessions.
-    const guard = [REPO, join(HOME, ".local/state/reflex"), join(HOME, ".config/reflex")]
+    const guard = [REPO, process.env.REFLEX_DATA_DIR ?? join(process.env.XDG_STATE_HOME ?? join(HOME, ".local/state"), "reflex"), dirname(USER_CONFIG_FILE)]
       .flatMap(d => { const p = d.replace(HOME, "~"); return [`Edit(${p}/**)`, `Write(${p}/**)`]; })
       .concat(["Edit(~/.claude/settings*.json)", "Write(~/.claude/settings*.json)"]);
     s.permissions ??= {};
@@ -210,7 +214,8 @@ if (argv.includes("--selfcheck")) {
   const ok = (c, m) => { if (!c) { console.error("FAIL", m); process.exitCode = 1; } };
   const home = mkdtempSync(join(tmpdir(), "reflex-install-"));
   const data = join(home, "data");
-  const run = (...a) => { const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...a], {encoding: "utf8",
+  const run = (...a) => { const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...a,
+    ...(!a.includes("--mode") ? ["--mode", "shadow"] : []), ...(!a.includes("--allow") ? ["--allow", "off"] : [])], {encoding: "utf8",
     env: {...process.env, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), PATH: "/usr/bin:/bin"}}); ok(r.status === 0, `install ${a.join(" ")}: ${r.stderr}`); return r.stdout; };
   const read = f => existsSync(join(home, f)) ? readFileSync(join(home, f), "utf8") : null;
   const put = (f, text) => { mkdirSync(dirname(join(home, f)), {recursive: true}); writeFileSync(join(home, f), text); };
@@ -321,12 +326,23 @@ if (argv.includes("--selfcheck")) {
 }
 
 const which = opt("--agent", "claude");
-const targets = which === "all" ? Object.keys(AGENTS).filter(a => has(AGENTS[a].bin)) : which.split(",");
+const targets = which === "all" ? Object.keys(AGENTS).filter(a => has(AGENTS[a].bin) || USER_CONFIG.agents?.[a]) : [...new Set(which.split(","))];
 for (const a of targets) if (!AGENTS[a]) throw new Error(`unknown agent ${a}; one of ${Object.keys(AGENTS).join(", ")}, all`);
+if (argv.includes("--dry-run")) {
+  console.log(`Preview: ${ENGINE} engine, ${MODE} mode, allow ${ALLOW}.`);
+  console.log(`Agents: ${targets.join(", ") || "none detected (use --agents to select one)"}. Hermes requires manual configuration.`);
+  console.log(`User settings: ${USER_CONFIG_FILE}. Existing foreign hooks are preserved; changed files are backed up.`);
+  process.exit(0);
+}
+if (!targets.length) console.log("No agents detected. Select one explicitly with --agent claude,codex (or --agents with reflex setup).");
 for (const a of targets) console.log(`${a.padEnd(9)} ${UNINSTALL ? "uninstalled" : `installed (${MODE}, allow ${ALLOW})`}: ${AGENTS[a].run()}`);
-if (KEYCHAIN && !UNINSTALL) {
-  // Every Reflex process reads this, whichever agent started it; the environment still wins.
-  const {USER_CONFIG_FILE} = await import("./gate.mjs");
-  writeFile(USER_CONFIG_FILE, JSON.stringify({...readJson(USER_CONFIG_FILE), keychain: KEYCHAIN}, null, 2) + "\n");
-  console.log(`keychain  ${USER_CONFIG_FILE}: the API key is read from Keychain item "${KEYCHAIN}"`);
+const saved = {...USER_CONFIG}, agents = {...saved.agents};
+for (const a of targets) {
+  if (UNINSTALL) delete agents[a];
+  else agents[a] = {root: REPO, node: NODE, mode: MODE, allow: ALLOW, engine: ENGINE,
+    installed_at: new Date().toISOString(), manual: a === "hermes"};
+}
+if (!UNINSTALL || existsSync(USER_CONFIG_FILE)) {
+  const next = UNINSTALL ? {...saved, agents} : {...saved, agents, mode: MODE, allow: ALLOW, engine: ENGINE, ...(KEYCHAIN && {keychain: KEYCHAIN})};
+  writeFile(USER_CONFIG_FILE, JSON.stringify(next, null, 2) + "\n");
 }

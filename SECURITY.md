@@ -54,8 +54,12 @@ Two properties bound the attack surface:
 
 ## Third party
 
-Judging is done by TypeSafe's hosted Jev model, so judged data does leave the machine: exactly what
+With the Jev engine, judging is done by TypeSafe's hosted Jev model, so judged data does leave the machine: exactly what
 is sent, and what is redacted first, is listed in
 [docs/GUIDE.md → Data handling](docs/GUIDE.md#data-handling). TypeSafe's
 [data processing agreement](https://typesafe.ai/legal/data-processing) applies; Reflex has no
 control over their retention.
+
+Local mode makes no TypeSafe calls. `reflex run` executes in the human's terminal after the same
+checks; it never issues an approval token to an agent. Its terminal is not an authentication boundary
+against software that controls that terminal. Hook health records are diagnostics, not attestation.

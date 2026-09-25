@@ -1,9 +1,18 @@
 # Setup
 
-About ten minutes. You need Node 18+ and at least one supported agent: Claude Code, Codex CLI,
+You need Node 18+ on macOS or Linux (including WSL) and at least one supported agent: Claude Code, Codex CLI,
 pi, oh-my-pi (omp), opencode or Hermes.
 
-## 1. Get a TypeSafe API key
+## 1. Start locally, or enable hosted classification
+
+New `reflex setup` installations use the local engine: no account, API key, or TypeSafe requests.
+Rules and deterministic instruction matches work locally. Unknown commands ask in enforce mode;
+in shadow mode that recommendation is logged while the host's permissions apply. Hard rules still
+enforce in shadow. Subgoal classification, semantic instruction selection, model routing and
+context classification require Jev. Native Windows setup is unsupported; run both the agent and
+Reflex inside WSL.
+
+For hosted classification, choose `reflex setup --engine jev` and get a TypeSafe API key:
 
 Reflex calls TypeSafe's System One API with the Jev model. From the
 [official quick start](https://docs.typesafe.ai/introduction/quickstart):
@@ -60,15 +69,18 @@ yarn dlx @ursuciprian/reflex setup     # yarn 2+
 
 Either way `reflex setup` runs, which:
 
-- copies the package to `~/.local/share/reflex` (no sudo). Hooks point there, not into the npx /
-  pnpm / bun cache, so clearing a cache never breaks them;
-- links the `reflex` command into `~/.local/bin`;
-- offers to store your TypeSafe key in the macOS Keychain if none is found (entered hidden, passed
-  to `security` on stdin, never written to a file);
-- hooks every supported agent it finds (step 3), in shadow mode with allow off, and records the
-  Keychain item name in `~/.config/reflex/config.json` so every hook finds the key;
-- records the Node found on `PATH` (e.g. `/opt/homebrew/bin/node`, not the versioned binary behind
-  it), so a Node upgrade does not break the hooks.
+- previews the selected agents and configuration changes;
+- copies the package to `~/.local/share/reflex`, so clearing a package runner's cache cannot break hooks;
+- links `reflex` into `~/.local/bin`;
+- with `--engine jev`, offers to store a missing key in macOS Keychain (hidden input, passed on stdin);
+- hooks the selected agents, initially with local classification, shadow mode and allow off;
+- saves engine, mode, allow, installations and Keychain item name in `~/.config/reflex/config.json`;
+- seeds `~/.config/reflex/tool-gate/policy.json`, preserving any previous policy;
+- records Node's path so hooks work outside an interactive shell.
+
+Re-running setup preserves saved choices unless explicitly changed. Environment overrides still
+apply at runtime. `reflex setup --dry-run` previews changes without writing files. The curl bootstrap
+must still download the package; use a package runner or existing installation for a setup preview.
 
 The `curl` script checks Node 18+, runs `npm install` into that directory (with the npm registry
 set explicitly for `@ursuciprian`, so a stale entry in `~/.npmrc` cannot redirect it) and then runs
@@ -80,13 +92,15 @@ Options go after `bash -s --`, or after `setup`:
 |---|---|---|
 | `--agents claude,codex,…` | `all` found | which agents to hook |
 | `--mode shadow\|enforce\|off` | `shadow` | |
+| `--engine local\|jev` | saved choice, otherwise `local` | local rules or optional hosted classification |
+| `--dry-run` | | preview setup changes |
 | `--allow off\|shadow\|on` | `off` | see step 6 |
 | `--keychain NAME` | `typesafe-api-key` | Keychain item holding the key |
 | `--node PATH` | `node` on `PATH` | the Node the hooks run with |
 | `--version X` | latest | package version (`curl` only; with a runner use `@ursuciprian/reflex@X`) |
 | `--prefix DIR` | `~/.local/share/reflex` | where the package lives (`REFLEX_PREFIX` for `setup`) |
 | `--package SPEC` | | an npm spec or a local `.tgz` (`curl` only, for testing) |
-| `--uninstall` | | remove every hook, the package, the link and `config.json` (`curl` only; otherwise `reflex uninstall`) |
+| `--uninstall` | | remove hooks, package and link; preserve user settings, policy and logs (`curl` only; otherwise `reflex uninstall`) |
 
 Rerunning any install path upgrades in place; hook paths don't change.
 
@@ -149,6 +163,24 @@ it was.
 
 ## 4. Verify in a real session
 
+Run `reflex doctor` first. It checks local configuration and feeds read-only and hard-deny examples
+to installed native hooks or the shared gate without executing those commands or calling TypeSafe.
+`reflex doctor --json` and `reflex status --json` provide structured output and exit nonzero on broken
+configuration. Missing binaries, manual Hermes setup and unobserved hooks are reported explicitly.
+
+Restart the agent, complete its trust steps, and ask it to run `git status` in a repository.
+`reflex status` should show a pre-execution event observed since the latest installation. This is
+operational evidence, not a security attestation. Doctor cannot establish host trust or show a native
+approval dialog; those require a real session.
+
+When Codex or opencode blocks an `ask`, a chat confirmation cannot unblock it. The human can review
+and execute the exact command in their own terminal with `reflex run 'command' --cwd /path/to/work`.
+It always enforces, displays the command and directory, requires terminal confirmation for an ask,
+and refuses hard denies. Give the result back to the agent; do not retry or disable the blocked hook.
+
+The following classification check needs the Jev engine:
+
+
 In a new agent session ask it to run something harmless but mutating, e.g.
 `npm install left-pad` in a scratch directory. Then:
 
@@ -188,6 +220,7 @@ All optional.
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `REFLEX_ENGINE` | saved choice, otherwise `jev` for legacy direct hooks | `local` disables hosted classification; new setup saves `local` |
 | `TYPESAFE_API_KEY` | — | API key (or use the Keychain item) |
 | `REFLEX_MODE` | installed `--mode`, else `shadow` | `off` · `shadow` (rules enforce, Jev logs only) · `enforce` |
 | `REFLEX_ALLOW` | installed `--allow`, else `off` | `off` · `shadow` (log `would_allow`) · `on` (clearly safe commands skip the agent's prompt; enforce mode only) |
@@ -200,6 +233,16 @@ All optional.
 | `REFLEX_INSTRUCTIONS_THRESHOLD` | `0.5` | Jev probability at which a conditional instruction fragment is injected |
 | `REFLEX_INSTRUCTIONS_MAX_CHARS` | `6000` | Most fragment text injected per prompt; whole fragments are dropped, never cut |
 | `XDG_CONFIG_HOME` | `~/.config` | Personal fragments are read from `$XDG_CONFIG_HOME/reflex/instructions/`; they win over a repo fragment with the same id |
+
+Runtime precedence is environment, explicit hook flags, saved settings, then defaults. Direct
+`node install.mjs` retains the legacy Jev default until an engine is selected. User overrides in
+`$XDG_CONFIG_HOME/reflex/tool-gate/` (default `~/.config/reflex/tool-gate/`) win over bundled files;
+`REFLEX_SETUP_DIR` takes precedence over both. Setup seeds only `policy.json`; you can also place
+`rules.json`, `questions.json` and `subgoals.json` there. Invalid configuration asks instead of silently
+enabling hosted calls. Inspect active paths with `reflex status`.
+
+A standalone LiteLLM process reads the same engine setting at startup. If its container cannot read
+this configuration directory, set `REFLEX_ENGINE=local` there too to disable its Jev calls.
 
 ## Optional: the tool router
 
@@ -301,7 +344,7 @@ team.
 ## Uninstall
 
 ```sh
-reflex uninstall                    # every hook, the package, the link and config.json
+reflex uninstall                    # hooks, package and link; keep user settings, policy and logs
 #   or: curl -fsSL https://raw.githubusercontent.com/ursuciprian/reflex/main/install.sh | bash -s -- --uninstall
 #   or, from a checkout:  node install.mjs --agent all --uninstall
 rm -rf ~/.local/state/reflex        # optional: logs, the context layer's chunk store, bundles, reviews

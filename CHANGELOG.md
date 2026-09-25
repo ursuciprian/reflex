@@ -4,6 +4,24 @@ All notable changes to Reflex are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Local setup without a TypeSafe account or key; explicit `--engine local|jev` and a setup preview.
+- `reflex status` and `reflex doctor`, including JSON output, synthetic hook checks and separate
+  evidence of real hook events.
+- Durable user policy and settings that survive upgrades and uninstall.
+- `reflex run` for a human terminal handoff where an agent cannot display an approval dialog.
+- An isolated full-suite runner and onboarding/adapter integration checks; macOS CI coverage.
+
+### Fixed
+
+- Shadow mode descriptions now explain that deterministic rules still enforce.
+- Codex and opencode no longer suggest that chat confirmation can unblock their hooks.
+- Missing execution feedback is unknown, not rejection; pi records explicit declined approvals.
+- Invalid engine/configuration cannot silently enable hosted classification.
+
 ## [0.2.0] - 2026-09-25
 
 ### Added

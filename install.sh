@@ -33,7 +33,8 @@ while [ $# -gt 0 ]; do
     --version) VERSION="$2"; shift 2 ;;
     --prefix) PREFIX="$2"; shift 2 ;;
     --package) PACKAGE="$2"; shift 2 ;;
-    --agents|--mode|--allow|--keychain|--node) SETUP_ARGS+=("$1" "$2"); shift 2 ;;
+    --agents|--mode|--allow|--keychain|--node|--engine) SETUP_ARGS+=("$1" "$2"); shift 2 ;;
+    --dry-run) SETUP_ARGS+=("$1"); shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     -h|--help) sed -n '2,20p' "$0" 2>/dev/null || true; exit 0 ;;
     *) echo "reflex: unknown option $1" >&2; exit 2 ;;

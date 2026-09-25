@@ -9,7 +9,11 @@ npm test          # offline self-checks: no network, no API key, a few seconds
 ```
 
 `npm test` runs the self-checks of every component (`policy`, `gate`, `instructions`, `install`,
-`context`, `router`, the LiteLLM router) and is what CI runs on every PR.
+`context`, `router`, the LiteLLM router) plus the isolated onboarding journey in `test.mjs`, and is what CI runs on every PR.
+No PR may be opened before the full offline suite passes. Record the results and any live-client
+verification limits in the PR. The integration checks cover setup previews, invalid configuration,
+upgrades, durable policy, diagnostics, local privacy, native hooks, plugin approvals and uninstall.
+The pi event harness uses Node 22's built-in TypeScript stripping; CI includes Node 22 coverage.
 
 The `eval` scripts are different: they call the live Jev API and cost tokens.
 

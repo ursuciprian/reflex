@@ -60,7 +60,7 @@ export const Reflex = async ({directory}) => ({
     }
     // pass and allow both run: opencode has no prompt of its own here to skip.
     if (d.effective === "deny") throw new Error(d.reason);
-    if (d.effective === "ask") throw new Error(`${d.reason}. Needs human approval: ask the user to confirm before running it.`);
+      if (d.effective === "ask") throw new Error(`${d.reason}. This plugin cannot open an approval dialog. The user can review and run the exact command with reflex run in their own terminal (include --cwd). A chat confirmation does not unblock this plugin; do not retry or disable it.`);
   },
   "tool.execute.after": async (input, output) => {
     // A task that ran is a launched subgoal: dedup offers only those.

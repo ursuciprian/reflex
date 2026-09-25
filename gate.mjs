@@ -35,16 +35,24 @@ const flagValue = (n, d) => process.argv.includes(n) ? process.argv[process.argv
 // Machine-wide settings written by `install.mjs --keychain` (~/.config/reflex/config.json), so every
 // hook sees them whichever agent started it. The environment still wins.
 export const USER_CONFIG_FILE = join(ENV.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "reflex/config.json");
-const USER_CONFIG = (() => { try { return JSON.parse(readFileSync(USER_CONFIG_FILE, "utf8")); } catch { return {}; } })();
+export let USER_CONFIG_ERROR = null;
+export const USER_CONFIG = (() => {
+  try {
+    const value = JSON.parse(readFileSync(USER_CONFIG_FILE, "utf8"));
+    if (!value || Array.isArray(value) || typeof value !== "object") throw new Error("expected a JSON object");
+    return value;
+  } catch (e) { if (e.code !== "ENOENT") USER_CONFIG_ERROR = `invalid ${USER_CONFIG_FILE}: ${e.message}`; return {}; }
+})();
 export const CONFIG = {
   api: ENV.REFLEX_API_URL ?? "https://api.typesafe.ai/v1/systemone",
   model: ENV.REFLEX_MODEL ?? "jev-1.13.0",              // pinned so a decision can be reproduced
   // off | shadow | enforce. The environment wins, so one session can be switched for a test;
   // otherwise the --mode flag that install.mjs writes into each agent's hook command.
-  mode: ENV.REFLEX_MODE ?? flagValue("--mode", "shadow"),
+  mode: ENV.REFLEX_MODE ?? flagValue("--mode", USER_CONFIG.mode ?? "shadow"),
+  engine: ENV.REFLEX_ENGINE ?? flagValue("--engine", USER_CONFIG.engine ?? "jev"),
   // off | shadow | on: what a policy "allow" becomes. off: pass, the gate only tightens.
   // shadow: logged as would_allow, effective pass. on: effective allow, in enforce mode only.
-  allow: ENV.REFLEX_ALLOW ?? flagValue("--allow", "off"),
+  allow: ENV.REFLEX_ALLOW ?? flagValue("--allow", USER_CONFIG.allow ?? "off"),
   setup: ENV.REFLEX_SETUP_DIR ?? join(HERE, "setup/tool-gate"),
   data: ENV.REFLEX_DATA_DIR ?? join(ENV.XDG_STATE_HOME ?? join(homedir(), ".local/state"), "reflex"),
   timeoutMs: Number(ENV.REFLEX_TIMEOUT_MS ?? 3000),
@@ -57,7 +65,15 @@ const CACHE = () => join(CONFIG.data, "cache.json");
 const CACHE_TTL_MS = 24 * 3600 * 1000;
 const ROTATE_BYTES = 50 * 1024 * 1024;
 
-const load = f => JSON.parse(readFileSync(join(CONFIG.setup, f), "utf8"));
+export const policyDirectory = join(dirname(USER_CONFIG_FILE), "tool-gate");
+export const setupFile = f => !ENV.REFLEX_SETUP_DIR && CONFIG.setup === join(HERE, "setup/tool-gate") &&
+  existsSync(join(policyDirectory, f)) ? join(policyDirectory, f) : join(CONFIG.setup, f);
+export const load = f => JSON.parse(readFileSync(setupFile(f), "utf8"));
+export function configurationError() {
+  return USER_CONFIG_ERROR ?? (!["local", "jev"].includes(CONFIG.engine) ? "engine must be local or jev"
+    : !["off", "shadow", "enforce"].includes(CONFIG.mode) ? "mode must be off, shadow or enforce"
+    : !["off", "shadow", "on"].includes(CONFIG.allow) ? "allow must be off, shadow or on" : null);
+}
 export const sha = v => createHash("sha256").update(typeof v === "string" ? v : JSON.stringify(v)).digest("hex").slice(0, 12);
 export const readText = p => { try { return readFileSync(p, "utf8"); } catch { return null; } };
 
@@ -522,7 +538,8 @@ export function precheck(command, cwd, env) {
   if (readOnly(command)) return {outcome: "pass", rule: "read-only", source: "read-only"};
   // The checkout itself is protected wherever it was cloned, not only under a directory named reflex.
   const inRepo = cwd && (cwd + "/").startsWith(HERE + "/");
-  if (command.includes(HERE) || command.includes(CONFIG.data) ||
+  if (command.includes(HERE) || command.includes(CONFIG.data) || command.includes(dirname(USER_CONFIG_FILE)) ||
+      /\breflex\s+(setup|install|uninstall)\b/.test(command) ||
       (inRepo && /\b(gate|policy|install|eval|report|instructions|context)\.mjs\b|\bsetup\/|\brouter\/|\brouting\/|\bbin\/reflex-|\badapters\/|\.git\/hooks/.test(command)))
     return ruled({outcome: "ask", rule: "touches the Reflex gate, its setup or its logs", id: "tamper"});
   const on = (r, what) => (r.applies_to ?? ["command"]).includes(what);
@@ -560,6 +577,8 @@ function apiKey() {
 }
 
 export async function ask(state, questions, {timeoutMs = CONFIG.timeoutMs} = {}) {
+  const disabled = configurationError() ?? (CONFIG.engine === "local" ? "local engine: hosted classification is disabled" : null);
+  if (disabled) return {answers: {}, usage: {}, error: disabled, latency_s: 0};
   const t0 = Date.now();
   let answers = {}, usage = {}, error = null;
   for (let attempt = 0; ; attempt++) {
@@ -649,8 +668,10 @@ export async function jevJudge({command, cwd, env, session = {}, useCache = true
 
 /** The whole gate for one command, as eval.mjs and the hook see it. */
 export async function judge({command, cwd, env = envContext(cwd), session = {}, useCache = true, asker}) {
-  return precheck(command, cwd, env) ?? jevJudge({command, cwd, env, session, useCache, asker});
+  if (configurationError()) return {outcome: "ask", rule: configurationError(), source: "error"};
+  return precheck(command, cwd, env) ?? (CONFIG.engine === "local" ? localJudgment() : jevJudge({command, cwd, env, session, useCache, asker}));
 }
+const localJudgment = () => ({outcome: "ask", source: "local", rule: "not covered by local rules; a human must review it"});
 
 // ---------------------------------------------------------------------------------------------
 // The agent-neutral contract. Every adapter turns its agent's event into a call:
@@ -666,6 +687,7 @@ export async function decide(call, {background = false, asker} = {}) {
   const subgoals = call.command ? [] : [call.subgoals ?? call.subgoal].flat().filter(s => typeof s === "string" && s.trim());
   if (CONFIG.mode === "off" || !(call.command || subgoals.length)) return {effective: "pass", decision: "pass", reason: "reflex off", source: "off"};
   if (subgoals.length) {
+    if (CONFIG.engine === "local") return view({outcome: "pass", source: "local", rule: "subgoal classification is disabled"}, "pass");
     if (CONFIG.mode !== "enforce" && !background) return inBackground(call);
     const {j, drop} = await subgoalJudge({...call, subgoals}, asker);
     const effective = CONFIG.mode === "enforce" ? j.outcome : "pass";
@@ -678,6 +700,11 @@ export async function decide(call, {background = false, asker} = {}) {
     if (quick.source !== "read-only") trace(quick, call, effective);
     return view(quick, effective);
   }
+  if (CONFIG.engine === "local") {
+    const j = localJudgment(), effective = CONFIG.mode === "enforce" ? "ask" : "pass";
+    trace(j, call, effective);
+    return view(j, effective);
+  }
   // Shadow mode: nobody waits for Jev. A detached copy of this script judges and logs.
   if (CONFIG.mode !== "enforce" && !background) return inBackground(call);
   const session = sessionContext(call.transcript_path, call.call_id);
@@ -689,7 +716,7 @@ export async function decide(call, {background = false, asker} = {}) {
   return view(j, effective);
 }
 function inBackground(call) {
-  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "--bg", "--mode", CONFIG.mode, "--allow", CONFIG.allow],
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "--bg", "--mode", CONFIG.mode, "--allow", CONFIG.allow, "--engine", CONFIG.engine],
                       {detached: true, stdio: ["pipe", "ignore", "ignore"]});
   child.stdin.end(JSON.stringify(call));
   child.unref();
@@ -791,6 +818,15 @@ async function subgoalJudge(call, asker = ask) {
 // Any internal error is a decision too: the policy fallback when enforcing, logged either way.
 // Subgoal dedup saves work rather than guarding it, so its errors always pass.
 export async function decideSafe(call, opts) {
+  const error = configurationError();
+  if (error) return {effective: "ask", decision: "error", reason: `reflex: ${error}`, source: "error"};
+  // A real hook event is separate from installation and from doctor's synthetic probes.
+  if (["claude-code", "codex", "pi", "omp", "opencode", "hermes"].includes(call.agent)) try {
+    const dir = join(CONFIG.data, "health");
+    mkdirSync(dir, {recursive: true, mode: 0o700});
+    writeFileSync(join(dir, `${call.agent}.json`), JSON.stringify({at: new Date().toISOString(), gate: HERE,
+      mode: CONFIG.mode, engine: CONFIG.engine, allow: CONFIG.allow}), {mode: 0o600});
+  } catch { /* diagnostics must not change a decision */ }
   try { return await decide(call, opts); } catch (e) {
     console.error(`reflex: ${e.message}`);
     const fallback = CONFIG.mode === "enforce" && !call.subgoal ? (safeFallback() ?? "ask") : "pass";
@@ -818,7 +854,7 @@ const view = (j, effective) => ({effective: effective === "allow" && j.source !=
                                  source: j.source, policy: j.policy_version ?? null});
 
 // After the command: did it run, and how did it end. An effective "ask" followed by a record
-// means a human approved it; no record (or event "denied") means it was rejected.
+// means it ran after the prompt; only an explicit "denied" event establishes rejection.
 // Only the verdict on the run is kept, never its output.
 export function record(ev) {
   if (CONFIG.mode === "off") return;
@@ -923,7 +959,7 @@ async function codexPre(input) {
 function codexOut(d) {
   if (!["ask", "deny"].includes(d.effective)) return null;
   const reason = d.effective === "ask"
-    ? `${d.reason}. Needs human approval: ask the user to confirm before running it.` : d.reason;
+    ? `${d.reason}. This hook cannot open an approval dialog. The user can review and run the exact command with reflex run in their own terminal (include --cwd). A chat confirmation does not unblock this hook; do not retry or disable it.` : d.reason;
   return {hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason}};
 }
 function codexPost(input) {
@@ -1424,6 +1460,7 @@ async function selfcheck() {
       .concat([...Array(10)].map((_, i) => row(200 + i, 0.5, {decision: "would_allow", emitted: null, permission_mode: "acceptEdits"}))).join("\n") + "\n");
     writeFileSync(FEEDBACK(), [...Array(20)].map((_, i) => `c${i}`).concat([...Array(10)].map((_, i) => `c${200 + i}`))
       .map(call_id => JSON.stringify({event: "ran", call_id})).join("\n") + "\n");
+    append(FEEDBACK(), [...Array(6)].map((_, i) => ({event: "denied", call_id: `c${100 + i}`})));
     const rep = a => spawnSync(process.execPath, [join(HERE, "report.mjs"), ...a], {env: {...ENV, REFLEX_DATA_DIR: scratch}, encoding: "utf8"}).stdout;
     ok(/of 20 with blast <= 1 and confidence >= 0.9, you approved 100%/.test(rep([])), "report: recommends the tightest band with data");
     ok(/blast\s+ECE 0\.269/.test(rep(["--calibration"])), "report: expected calibration error");
@@ -1463,7 +1500,7 @@ const readStdin = () => JSON.parse(readFileSync(0, "utf8"));
 function confirmOnTty(command, reason) {
   try {
     const fd = openSync("/dev/tty", "r+");
-    const q = Buffer.from(`\n${reason}\n  ${redact(command).slice(0, 300)}\nrun it? [y/N] `);
+    const q = Buffer.from(`\n${reason}\nDirectory: ${JSON.stringify(process.cwd())}\nCommand (credentials masked): ${JSON.stringify(redact(command))}\nrun it? [y/N] `);
     writeSync(fd, q);
     const buf = Buffer.alloc(16), n = readSync(fd, buf, 0, 16, null);
     closeSync(fd);

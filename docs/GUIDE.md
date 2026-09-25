@@ -17,6 +17,25 @@
 11. [Context layer (pi and oh-my-pi)](#context-layer-pi-and-oh-my-pi)
 12. [Where this goes next](#where-this-goes-next)
 
+## Local and hosted operation
+
+New setup uses `--engine local`. Deterministic shell checks and path/keyword instruction matches
+run without TypeSafe. An unknown command produces `ask`: enforce requires human review, while
+shadow logs it and leaves the host's permissions in charge. Local operation does not reuse cached
+Jev answers, spawn background classifiers, classify subgoals or make semantic instruction calls.
+The shared Jev client rejects hosted requests while local; the LiteLLM callback leaves model
+selection unchanged. A separate LiteLLM container needs the same configuration or `REFLEX_ENGINE=local`.
+
+`--engine jev` enables the existing hosted behavior below. Older direct hook installations retain
+Jev until an engine is selected; `reflex setup` records the choice. Defaults are bundled, with durable
+user overrides under `~/.config/reflex/tool-gate/`; `reflex status` shows the active policy path.
+
+`reflex doctor` runs local synthetic decision checks in a disposable state directory. These probes
+do not count as live activation. `reflex status` separately reports the last real pre-execution
+hook event and whether it matches the latest installation and settings. The heartbeat is local
+operational evidence, not proof against an agent that can modify files. Native dialog behavior and
+host trust must also be checked in the agent itself.
+
 ## How a command is decided
 
 Every shell command an agent wants to run reaches `gate.mjs` through that agent's pre-execution
@@ -32,7 +51,7 @@ hook (see the table in the README). Each adapter turns the agent's event into th
    the next step. → **pass**, not logged.
 2. **Rules** (`rules.json`) — regular expressions over the command plus its context
    (`cwd=`, `aws_profile=`, `kube_context=`, `tf_workspace=`, `git_branch=`). A rule fires when all
-   of its patterns match. Rules are **enforced in every mode**, because they are code, not a model.
+   of its patterns match. Rules are **enforced in shadow and enforce modes**, with off disabling the entire gate.
    Shipped rules: `rm-root`, `prod-destroy`, `force-push-main`, `push-mirror` (deny); `tamper`, `destroy`,
    and — checked even before read-only detection — `secret-read` (the API key, secret stores) and
    `secret-file-read` (`~/.ssh/id_*` but not `.pub`, `~/.aws/credentials`, `.netrc`, `.pgpass`, `.env` / `.env.*` files but not `.env.example` and other templates, `kubectl get secret(s)`) (ask). It fires only when the file is an argument of a command that reads, copies or sends it (`cat`, `less`, `head`/`tail`, `grep`/`rg`/`ag`, `jq`, `sed`/`awk`, `cp`/`scp`/`rsync` as the source, `base64`, `xxd`, `strings`, `od`, `open`, `source`/`.`, `nc`, `tar`/`zip`, `curl -d/-F/-T/--data*`, a routed `mcp` call), at any command position — after `;`, `&&`, `|`, inside `$(…)`, backticks, `bash -c '…'`, `ssh host '…'` — or is redirected in (`< ~/.aws/credentials`). A commit message, `echo`, or `cp .env.example .env` that only names the file passes. Known over-match: a `grep` whose search *pattern* is `.env` (`grep -rn '.env' src/`) asks. Any mutating command that touches the Reflex checkout, its setup files or its logs is also an `ask`, wherever the repo was cloned.
@@ -264,18 +283,18 @@ To test enforce behaviour without switching your whole setup, start one session 
 
 ## Rolling out: shadow, tune, enforce
 
-1. **Shadow, about a week.** Nobody is slowed down.
+1. **Shadow, about a week.** Deterministic rules still enforce; other decisions are logged only.
 2. **Tune.** Try a candidate policy against everything recorded, without spending tokens:
 
    ```sh
-   cp setup/tool-gate/policy.json /tmp/candidate.json   # edit thresholds
+   cp ~/.config/reflex/tool-gate/policy.json /tmp/candidate.json   # edit thresholds
    node report.mjs --policy /tmp/candidate.json         # "N of M Jev decisions change", pass -> ask: …
    ```
 
    Keep what reduces wrong asks without adding misses, then `npm run eval`.
 3. **Enforce** with `node install.mjs --mode enforce`.
 4. **Watch the ask outcomes.** In enforce mode `report.mjs` scores each emitted ask as approved
-   (the command ran) or rejected. An ask that is nearly always approved is friction: tune it.
+   (the command ran), rejected (explicit denial feedback), pending or unknown. Missing feedback after ten minutes is unknown and excluded from calibration. An ask that is nearly always approved is friction: tune it.
    A deny someone keeps working around is a missing fast-lane pattern.
 
 ### Calibrated allow
@@ -374,7 +393,7 @@ and [confidence](https://docs.typesafe.ai/confidence).
 |---|---|
 | `reflex_decisions` | `source`, `decision`, `mode`, `user` |
 | `reflex_latency_seconds` | `quantile` (0.5, 0.95, 0.99), `user` |
-| `reflex_asks` | `resolution` (approved, rejected, pending), `user` |
+| `reflex_asks` | `resolution` (approved, rejected, pending, unknown), `user` |
 | `reflex_replay_changes` | `user` — decisions the current policy file would flip |
 | `reflex_input_tokens` | `user` |
 
@@ -447,7 +466,7 @@ and [confidence](https://docs.typesafe.ai/confidence).
   The tool router is the exception: it runs its command tools and its downstream MCP calls through
   the gate itself.
 - Codex and opencode hooks cannot open a prompt, so an `ask` blocks with a reason telling the agent
-  to get your confirmation. Codex hooks cannot allow either (an allow falls through), so `allow`
+  to hand off to the human: review and run the exact command with `reflex run` in a separate terminal. A chat confirmation alone does not unblock the hook. Codex hooks cannot allow either (an allow falls through), so `allow`
   is a silent pass there. Codex passes the session directory as `cwd`, not a per-command
   `workdir`. Codex hooks must be trusted in `/hooks` before they run.
 - Environment context comes from the agent's process environment. A command that switches
