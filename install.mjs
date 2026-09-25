@@ -82,9 +82,10 @@ const AGENTS = {
     if (s.env?.REFLEX_MODE) delete s.env.REFLEX_MODE;
     if (s.env?.REFLEX_ALLOW) delete s.env.REFLEX_ALLOW;
     if (!UNINSTALL) {
-      s.hooks.PreToolUse = [...(s.hooks.PreToolUse ?? []), group("Bash", "--claude", 10)];
+      // Task|Agent: subgoal dedup before a subagent is spawned, and its PostToolUse marks it launched
+      s.hooks.PreToolUse = [...(s.hooks.PreToolUse ?? []), group("Bash|Task|Agent", "--claude", 10)];
       for (const ev of ["PostToolUse", "PostToolUseFailure", "PermissionDenied"])
-        s.hooks[ev] = [...(s.hooks[ev] ?? []), group("Bash", "--claude-post", 5)];
+        s.hooks[ev] = [...(s.hooks[ev] ?? []), group("Bash|Task|Agent", "--claude-post", 5)];
       s.permissions.ask.push(...guard);
     }
     if (!s.permissions.ask.length) delete s.permissions.ask;
@@ -98,8 +99,9 @@ const AGENTS = {
     s.hooks ??= {};
     stripOurs(s.hooks);
     if (!UNINSTALL) {
-      s.hooks.PreToolUse = [...(s.hooks.PreToolUse ?? []), group("^Bash$", "--codex", 15)];
-      s.hooks.PostToolUse = [...(s.hooks.PostToolUse ?? []), group("^Bash$", "--codex-post", 5)];
+      // spawn_agent: subgoal dedup before a subagent is spawned, and its PostToolUse marks it launched
+      s.hooks.PreToolUse = [...(s.hooks.PreToolUse ?? []), group("^(Bash|spawn_agent)$", "--codex", 15)];
+      s.hooks.PostToolUse = [...(s.hooks.PostToolUse ?? []), group("^(Bash|spawn_agent)$", "--codex-post", 5)];
     }
     writeFile(file, JSON.stringify(s, null, 2) + "\n");
     return `${file}${UNINSTALL ? "" : " — open Codex and trust the new hooks in /hooks, or they will not run"}`;
@@ -124,8 +126,11 @@ const AGENTS = {
       `      command: '${cmd("--hermes")}'`,
       "      timeout: 15",
       "      fail_closed: true",
+      `    - matcher: "delegate_task"`,          // subgoal dedup; never fail-closed, it only saves work
+      `      command: '${cmd("--hermes")}'`,
+      "      timeout: 15",
       "  post_tool_call:",
-      `    - matcher: "terminal"`,
+      `    - matcher: "terminal|delegate_task"`,
       `      command: '${cmd("--hermes-post")}'`,
       "      timeout: 5",
       "",

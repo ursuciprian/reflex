@@ -38,14 +38,42 @@ function lastAssistantText(ctx: any): string | undefined {
   }
 }
 
+// omp's task tool spawns subagents: {task, agent?} or a batch {context, tasks: [{task, agent?}]}.
+// Each task is its own subgoal (the batch's shared context, cut short, goes with each), so a batch
+// that repeats one earlier task loses only that task: the tool runs with the rest (a tool_call
+// handler may replace the input) and its result says which were left out and why. pi has no
+// subagents, so this never fires there.
+function subgoalsOf(input: any): string[] {
+  const batch = Array.isArray(input?.tasks);
+  const context = batch && typeof input.context === "string" && input.context.trim() ? `context: ${input.context.slice(0, 200)}` : "";
+  return (batch ? input.tasks : [input]).map((t: any) => typeof t?.task === "string" && t.task.trim()
+    ? [t.agent && `agent: ${t.agent}`, t.task, context].filter(Boolean).join("\n") : "");
+}
+const dropped = new Map<string, string>();   // toolCallId -> why some batch tasks were left out
+
 export default function (pi: any) {
   pi.on("tool_call", async (event: any, ctx: any) => {
+    if (event.toolName === "task") {
+      const subgoals = subgoalsOf(event.input), batch = Array.isArray(event.input?.tasks);
+      if (!subgoals.length || subgoals.some(s => !s)) return;   // malformed: omp's own validation answers
+      let d: Decision & {drop?: number[]};
+      try {
+        d = JSON.parse(await gate("--decide", {agent: AGENT, ...(batch ? {subgoals} : {subgoal: subgoals[0]}), cwd: ctx.cwd,
+                                               call_id: event.toolCallId, session_id: ctx.sessionManager?.getSessionId?.()}, ctx.signal));
+      } catch { return; }   // dedup saves work; it never blocks when the gate cannot run
+      if (d.effective === "deny") return {block: true, reason: d.reason};
+      if (batch && d.drop?.length) {
+        dropped.set(event.toolCallId, d.reason ?? "");
+        return {input: {...event.input, tasks: event.input.tasks.filter((_: any, i: number) => !d.drop!.includes(i))}};
+      }
+      return;
+    }
     if (event.toolName !== "bash" || !event.input?.command) return;
     let d: Decision;
     try {
       d = JSON.parse(await gate("--decide", {
         agent: AGENT, command: event.input.command, cwd: event.input.cwd ?? ctx.cwd,
-        call_id: event.toolCallId, intent: lastAssistantText(ctx),
+        call_id: event.toolCallId, session_id: ctx.sessionManager?.getSessionId?.(), intent: lastAssistantText(ctx),
       }, ctx.signal));
     } catch {
       // The gate itself failed. Only block when enforcing; shadow mode must never get in the way.
@@ -59,7 +87,15 @@ export default function (pi: any) {
     }
   });
 
-  pi.on("tool_result", async (event: any) => {
+  pi.on("tool_result", async (event: any, ctx: any) => {
+    // A task that ran is a launched subgoal; one that failed or was blocked is not.
+    if (event.toolName === "task") {
+      gate("--record", {agent: AGENT, event: event.isError ? "failed" : "ran", call_id: event.toolCallId, session_id: ctx?.sessionManager?.getSessionId?.()});
+      const note = dropped.get(event.toolCallId);
+      if (!note) return;
+      dropped.delete(event.toolCallId);
+      return {content: [...(event.content ?? []), {type: "text", text: `\n[reflex] Some tasks were not started: ${note}`}]};
+    }
     if (event.toolName !== "bash") return;
     const text = (event.content ?? []).map((c: any) => c.text ?? "").join("");
     const exit = typeof event.details?.exitCode === "number" ? event.details.exitCode            // omp
