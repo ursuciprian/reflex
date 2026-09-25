@@ -1141,6 +1141,8 @@ async function selfcheck() {
   ok(rule("git push origin main") === null && rule("git push -f origin feat/x", "git_branch=feat/x") === null, "normal pushes");
   ok(rule("sed -i s/enforce/shadow/ ~/.claude/settings.json") === "tamper", "tamper settings");
   ok(rule("export REFLEX_MODE=off") === "tamper" && rule("vim ~/src/reflex/setup/tool-gate/rules.json") === "tamper", "tamper mode / repo");
+  ok(rule("cd ~/.local/state && rm -rf reflex") === "tamper" && rule("cd ~/.config; printf x > reflex/config.json") === "tamper" && rule("cd reflex && npm test") !== "tamper",
+     "tamper: clearing the taint or config from the parent directory");
   ok(rule("git push origin --mirror") === "push-mirror" && !fastPass("git push origin --mirror", rules), "mirror push");
   ok(rule("git push -fu origin main") === "force-push-main" && rule("git push origin :main") === "force-push-main" &&
      rule("git push origin --delete main") === "force-push-main", "force push variants");

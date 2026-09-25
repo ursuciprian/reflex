@@ -1,5 +1,5 @@
 {
- "version": "injection-detectors-v1",
+ "version": "injection-detectors-v2",
  "note": "Deterministic injection detectors, run by guard.mjs in both engines before Jev. Each pattern adds one hit to its signal; the policy reads the counts. Signals: override (text that cancels or replaces an AI's instructions), role (fake chat-role or system markers), to_ai (text addressed to an AI agent), shell / secrets / exfil (what the text asks for: run remote code, read credentials, send data out). Structural detectors live in guard.mjs with their limits here: invisible text (Unicode tags, zero-width and bidi controls), instructions hidden in HTML comments, hidden elements, alt / title attributes and markdown comments, markdown image or link exfiltration, and base64 blobs that decode to instructions. A hidden or decoded segment counts as `hidden` only when the phrase patterns also match inside it. Patterns are case-insensitive JavaScript regular expressions; keep them linear (bounded repeats, no nested quantifiers, and never an unbounded \\\\s* right after a newline or other alternative that can start at every line: a page of blank lines makes that quadratic). ponytail: a phrase list, not a classifier; Jev judges what the phrases miss.",
  "patterns": [
   {"signal":"override","id":"ignore-previous","pattern":"\\b(ignore|disregard|forget|override|bypass|discard)\\s+(?:(?:all|any|the|your|my|these|those|of)\\s+){0,3}(previous|prior|above|earlier|preceding|original|initial|existing|system|safety|developer)\\s+(instructions?|prompts?|directions?|guidelines?|rules|context|messages?|commands?|guardrails)"},
@@ -30,18 +30,16 @@
   {"signal":"exfil","id":"reveal-context","pattern":"\\b(reveal|print|output|repeat|send|leak|show|summari[sz]e)\\s+(your|the|all)\\s+(system\\s+prompt|hidden\\s+instructions|initial\\s+instructions|conversation\\s+history|chat\\s+history|previous\\s+messages|context\\s+window)\\b"}
  ],
  "invisible": {
-  "note": "Unicode tag characters (U+E0000-E007F) spell hidden ASCII: any run is decoded and counted as hidden text, except an emoji subdivision flag (black flag, 2-6 lowercase-letter or digit tags, cancel tag). Zero-width characters (U+200B-U+200F, U+2060-U+2064, U+FEFF after the start) and bidi controls (U+202A-U+202E, U+2066-U+2069) are counted outside emoji and joining scripts; the policy's invisibleAt says how many are a signal.",
+  "note": "Unicode tag characters (U+E0000-E007F) spell hidden ASCII: any run is decoded and counted as hidden text, except an emoji subdivision flag (black flag, 2-6 lowercase-letter or digit tags, cancel tag). A run of 4 or more variation selectors (U+FE00-FE0F, U+E0100-E01EF) is decoded as bytes the same way. Before the phrase patterns run, the text is read as a reader takes it in: invisible characters, soft hyphens and variation selectors out, look-alike Cyrillic and Greek letters, full-width, mathematical and accented letters read as Latin, JSON \\u escapes and HTML character references decoded; a phrase that needed a disguised letter counts as hidden. Zero-width characters (U+200B-U+200F, U+2060-U+2064, U+FEFF after the start) and bidi controls (U+202A-U+202E, U+2066-U+2069) are counted outside emoji and joining scripts; the policy's invisibleAt says how many are a signal.",
   "tagMinChars": 4
  },
  "hidden": {
-  "note": "HTML comments, elements hidden by CSS or the hidden attribute, alt / title / aria-label attributes and markdown comments are text a human reader of the rendered page does not see. They count as hidden only when the phrase patterns match inside them.",
-  "maxSegments": 200,
+  "note": "HTML comments, elements hidden by CSS or the hidden attribute, alt / title / aria-label attributes, markdown comments and the text of data: URLs are text a human reader of the rendered page does not see. They count as hidden only when the phrase patterns match inside them (the first maxChars characters of each). Every segment is read: a cap on their number let harmless ones hide the last.",
   "maxChars": 4000
  },
  "base64": {
-  "note": "Runs of at least minChars base64 characters are decoded; mostly printable text with the phrase patterns inside counts as hidden.",
-  "minChars": 40,
-  "maxBlobs": 50
+  "note": "Runs of at least minChars base64 characters (standard or URL-safe, also wrapped over lines) are decoded; mostly printable text with the phrase patterns inside counts as hidden. Every run is decoded.",
+  "minChars": 40
  },
  "exfil_link": {
   "note": "A markdown image (any placeholder in its URL) or link (a placeholder or data word in a query value) that an agent's rendered answer or fetch would send out. Placeholders: {x}, <x>, $x, [X_Y], %s; data words: secret, token, password, key, data, history, conversation, env, credential.",

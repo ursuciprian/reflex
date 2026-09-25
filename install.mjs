@@ -170,7 +170,7 @@ const AGENTS = {
       `    - matcher: "terminal|delegate_task"`,
       `      command: '${cmd("--hermes-post")}'`,
       "      timeout: 5",
-      `    - matcher: "terminal|web_search|web_extract|read_file|browser_.*|mcp__.*"`,   // injection guard; observe-only here
+      `    - matcher: "terminal|web_search|web_extract|read_file|x_search|feishu_doc_read|browser_(?!vault_).*|mcp__.*|connectors__.*"`,   // injection guard; observe-only here; never the password vault
       `      command: '${cmd("--hermes", GUARD)}'`,
       "      timeout: 15",
       "  pre_llm_call:",

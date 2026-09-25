@@ -93,7 +93,7 @@
         "script"
       ],
       "all": [
-        "(/reflex(/|\\s|$)|\\.claude/(settings|hooks)|\\.codex/(hooks\\.json|config\\.toml|rules)|\\.hermes/.*config\\.yaml|opencode/(plugins?|opencode\\.jsonc?)|\\.(pi|omp)/agent/(extensions|settings)|reflex_(mode|allow))"
+        "(/reflex(/|\\s|$)|(\\.local/state|\\.config|xdg_(state|config)_home)\\b[^\\n]{0,200}\\breflex\\b|\\.claude/(settings|hooks)|\\.codex/(hooks\\.json|config\\.toml|rules)|\\.hermes/.*config\\.yaml|opencode/(plugins?|opencode\\.jsonc?)|\\.(pi|omp)/agent/(extensions|settings)|reflex_(mode|allow|guard))"
       ]
     },
     {
