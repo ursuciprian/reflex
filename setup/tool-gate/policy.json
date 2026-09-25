@@ -1,6 +1,6 @@
 {
   "name": "Agent tool gate",
-  "version": "tool-gate-v4",
+  "version": "tool-gate-v5",
   "subject": "Shell commands an agent wants to run, gated by risk. The gate tightens the agent's own permissions; it loosens them only through the opt-in allow gate (REFLEX_ALLOW=on, enforce mode).",
   "fallback": "ask",
   "params": {
@@ -80,11 +80,37 @@
       "step": 0.05,
       "default": 0.5,
       "note": "A missing on-task answer (a cached one) never allows."
+    },
+    "taintAskAt": {
+      "label": "Tainted session: ask at blast",
+      "min": 0,
+      "max": 3,
+      "step": 0.1,
+      "default": 1,
+      "note": "After the agent read a suspected prompt injection (the injection guard), a lower blast threshold for asking."
+    },
+    "taintExfilAt": {
+      "label": "Tainted session: ask at exfil",
+      "min": 0,
+      "max": 1,
+      "step": 0.05,
+      "default": 0.2
+    },
+    "taintOnTask": {
+      "label": "Tainted session: ask when a mutation's on-task below",
+      "min": 0,
+      "max": 1,
+      "step": 0.05,
+      "default": 0.6
     }
   },
   "flags": {
     "prodAlwaysAsks": {
       "label": "Any production mutation asks",
+      "default": true
+    },
+    "taintStrict": {
+      "label": "Stricter after a suspected prompt injection",
       "default": true
     }
   },
@@ -143,6 +169,33 @@
       "outcome": "ask",
       "detail": "{env}, mutates {mutates}",
       "rule": "changes production"
+    },
+    {
+      "id": "tainted-exfil",
+      "label": "Tainted: any sign of data leaving?",
+      "enabled_when": "$taintStrict",
+      "test": "tainted >= 0.5 and exfil >= $taintExfilAt",
+      "outcome": "ask",
+      "detail": "tainted, exfil {exfil}",
+      "rule": "may send data out, in a session that read a suspected prompt injection"
+    },
+    {
+      "id": "tainted-blast",
+      "label": "Tainted: more than a local change?",
+      "enabled_when": "$taintStrict",
+      "test": "tainted >= 0.5 and blast >= $taintAskAt",
+      "outcome": "ask",
+      "detail": "tainted, blast {blast}",
+      "rule": "blast {blast} at or above {$taintAskAt}, in a session that read a suspected prompt injection"
+    },
+    {
+      "id": "tainted-off-task",
+      "label": "Tainted: a mutation off the stated task?",
+      "enabled_when": "$taintStrict",
+      "test": "tainted >= 0.5 and mutates >= 0.5 and on_task < $taintOnTask",
+      "outcome": "ask",
+      "detail": "tainted, on_task {on_task}",
+      "rule": "does not clearly match the stated task, in a session that read a suspected prompt injection"
     },
     {
       "id": "off-task",

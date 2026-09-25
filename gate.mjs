@@ -186,7 +186,7 @@ export function readOnly(cmd, extra = [], depth = 0) {
 // ---------------------------------------------------------------------------------------------
 // Secrets never leave the machine or land in the trace. The patterns live in setup/redact.json,
 // shared with routing/reflex_router.py; both selfchecks run its corpus.
-const REDACT = JSON.parse(readFileSync(join(HERE, "setup/redact.json"), "utf8"));
+export const REDACT = JSON.parse(readFileSync(join(HERE, "setup/redact.json"), "utf8"));
 const SECRET_PATTERNS = REDACT.shapes.map(p => new RegExp(p, "g"));
 const SECRET_CONTEXT = REDACT.context.map(c => [new RegExp(c.pattern, c.flags + "g"), c.replace]);
 export function redact(s) {
@@ -627,8 +627,9 @@ export function cachePut(key, answers) {
 }
 
 /** Jev's judgment + the policy -> {outcome, rule, source, state, answers, ...}. */
-// `asker` stands in for the API in the self-check.
-export async function jevJudge({command, cwd, env, session = {}, useCache = true, asker = ask}) {
+// `asker` stands in for the API in the self-check. `tainted`: the session read a suspected prompt
+// injection (guard.mjs), so the policy's taint gates apply and nothing is allowed.
+export async function jevJudge({command, cwd, env, session = {}, useCache = true, asker = ask, tainted = false}) {
   const spec = load("questions.json");
   const policy = compile(load("policy.json"));
   // The scripts it runs, as one {path, excerpt}; several are joined, still within the size cap.
@@ -646,6 +647,9 @@ export async function jevJudge({command, cwd, env, session = {}, useCache = true
     (res.answers?.[q]?.noul ?? res.answers?.[q]?.choice ?? res.answers?.[q]?.score) == null);
   if (!res.error && missing.length) res.error = `incomplete answer: missing ${missing.join(", ")}`;
   if (!cached && !res.error && useCache) cachePut(key, res.answers);
+  // Taint is a fact about the session, not the command: never cached, logged with the answers so
+  // report.mjs replays it.
+  if (tainted && !res.error) res.answers = {...res.answers, tainted: {noul: 1}};
   const d = res.error
     ? {outcome: policy.policy.fallback ?? "ask", rule: `jev unavailable (${res.error.slice(0, 80)})`}
     : policy.decide(res.answers, policy.values());
@@ -655,7 +659,7 @@ export async function jevJudge({command, cwd, env, session = {}, useCache = true
   // Code the command runs that Jev did not see in full (unread, cut, redacted, a make target, a
   // package fetched or installed) makes its answer one about a name. Only an allow gate allows: a
   // policy whose default outcome is allow would otherwise allow whatever no gate caught.
-  const noAllow = res.error ? "no answer" : cached ? "cached answer" : !session.intent ? "no stated intent"
+  const noAllow = res.error ? "no answer" : tainted ? "session read a suspected prompt injection" : cached ? "cached answer" : !session.intent ? "no stated intent"
     : d.path?.at(-1)?.outcome !== "yes" ? "not from an allow gate"
     : redact(command) !== command ? "redacted command"
     : scripts.some(s => s.partial) || script?.excerpt.length >= SCRIPT_BYTES ? "runs code Jev did not see in full"
@@ -695,6 +699,19 @@ export async function decide(call, {background = false, asker} = {}) {
   }
   const env = envContext(call.cwd);
   const quick = background ? null : precheck(call.command, call.cwd, env);
+  // A session whose agent read a suspected prompt injection: network egress asks, before the
+  // read-only list and the fast lane (`gh api "…?q=$SECRET"` reads, `git push` is fast lane), and
+  // Jev's policy applies its taint gates. Like Jev, enforced only in enforce mode (shadow takes the
+  // usual path, so its background trace still shows Jev's view). The ask can only tighten: with Jev,
+  // the command is judged too and a deny stands.
+  const t = tainted(call.session_id);
+  const egress = t && CONFIG.mode === "enforce" && !(quick?.source === "rule" && quick.outcome !== "pass") && taintedRule(call.command);
+  if (egress) {
+    const j = CONFIG.engine === "jev" ? await jevJudge({command: call.command, cwd: call.cwd, env, session: callSession(call), asker, tainted: true}) : null;
+    const d = j?.outcome === "deny" ? j : egress;
+    trace(d, call, d.outcome);
+    return view(d, d.outcome);
+  }
   if (quick) {
     const effective = quick.source === "rule" ? quick.outcome : "pass";
     if (quick.source !== "read-only") trace(quick, call, effective);
@@ -707,13 +724,16 @@ export async function decide(call, {background = false, asker} = {}) {
   }
   // Shadow mode: nobody waits for Jev. A detached copy of this script judges and logs.
   if (CONFIG.mode !== "enforce" && !background) return inBackground(call);
-  const session = sessionContext(call.transcript_path, call.call_id);
-  if (call.intent) session.intent = redact(call.intent).slice(-600);
-  if (call.recent?.length) session.recent = call.recent.slice(-5).map(c => redact(c).slice(0, 200));
-  const j = allowSetting(holdAllow(await jevJudge({command: call.command, cwd: call.cwd, env, session, asker}), call));
+  const j = allowSetting(holdAllow(await jevJudge({command: call.command, cwd: call.cwd, env, session: callSession(call), asker, tainted: !!t}), call));
   const effective = CONFIG.mode === "enforce" && j.outcome !== "would_allow" ? j.outcome : "pass";
   trace(j, call, effective);
   return view(j, effective);
+}
+function callSession(call) {
+  const session = sessionContext(call.transcript_path, call.call_id);
+  if (call.intent) session.intent = redact(call.intent).slice(-600);
+  if (call.recent?.length) session.recent = call.recent.slice(-5).map(c => redact(c).slice(0, 200));
+  return session;
 }
 function inBackground(call) {
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "--bg", "--mode", CONFIG.mode, "--allow", CONFIG.allow, "--engine", CONFIG.engine],
@@ -813,6 +833,31 @@ async function subgoalJudge(call, asker = ask) {
                            rule: (mine.length > 1 ? `${drop.length} of ${mine.length} subgoals repeat earlier work: ${list}` : list) + again}
     : judged.find(x => x.source === "fallback") ?? judged[0];
   return {j, drop: all ? [] : drop};
+}
+
+// Taint. guard.mjs records here that an agent session read a tool result it judged to be a prompt
+// injection (warn or block); later commands in that session get the rules in rules.json `tainted`
+// and the policy's taint gates. One small file per session, named by a hash of the session id.
+// ponytail: never expires or pruned; a session id is not reused, and a file is a few hundred bytes.
+const taintFile = s => join(CONFIG.data, "taint", `${sha(String(s))}.json`);
+export function tainted(session_id) {
+  if (!session_id) return null;
+  try { return JSON.parse(readFileSync(taintFile(session_id), "utf8")); } catch { return null; }
+}
+/** Add an event (the last 20 are kept) and/or merge fields into a session's taint record. */
+export function taint(session_id, event = null, fields = {}) {
+  if (!session_id) return;
+  const f = taintFile(session_id), prev = tainted(session_id) ?? {events: []};
+  mkdirSync(dirname(f), {recursive: true, mode: 0o700});
+  const next = {...prev, ...fields, events: event ? [...prev.events, event].slice(-20) : prev.events};
+  writeFileSync(`${f}.${process.pid}`, JSON.stringify(next), {mode: 0o600});
+  renameSync(`${f}.${process.pid}`, f);   // atomic; parallel writers can drop an event, never corrupt the file
+}
+// The command alone: a cwd like /tmp/http-client or a branch named ssh-keys is not egress.
+function taintedRule(command) {
+  const rules = load("rules.json"), bare = stripDataHeredocs(command);
+  const hit = checkRules(bare, {rules: rules.tainted ?? []}, bare);
+  return hit && {outcome: hit.outcome, rule: hit.rule, id: hit.id, source: "taint", policy_version: rules.version};
 }
 
 // Any internal error is a decision too: the policy fallback when enforcing, logged either way.
