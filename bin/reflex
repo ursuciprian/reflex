@@ -5,6 +5,7 @@
 //                                                      every agent found (what curl / npx / pnpm dlx /
 //                                                      bunx / yarn dlx run)
 //   reflex check "<cmd>" [--cwd dir] [--intent text]   judge one command
+//   reflex scan <file|-> [--rewrite]                  judge text for prompt injection (exit 0 pass, 1 warn, 2 block)
 //   reflex report [...]                                what the gate has been doing
 //   reflex install [...]                               re-wire agents (install.mjs flags)
 //   reflex uninstall                                   remove every hook, the package and its link
@@ -161,6 +162,10 @@ switch (cmd) {
   case "setup": setup(); break;
   case "uninstall": uninstall(); break;
   case "check": process.exit(run("gate.mjs", ["--check", ...args]));
+  case "scan": {
+    if (!args[0] || (args[0].startsWith("--") && args[0] !== "-")) die("usage: reflex scan <file|-> [--rewrite]");
+    process.exit(run("guard.mjs", ["--check", ...args]));
+  }
   case "status": case "doctor": process.exit(run("status.mjs", ["--" + cmd, ...args]));
   case "run": {
     if (!args[0] || args[0].startsWith("--")) die('usage: reflex run "command" [--cwd directory]');
@@ -176,6 +181,6 @@ switch (cmd) {
   case "test": process.exit(spawnSync("npm", ["test", "--silent"], {cwd: ROOT, stdio: "inherit"}).status ?? 1);
   case "version": case "--version": case "-v": console.log(version(ROOT)); break;
   default:
-    console.error("usage: reflex setup | status | doctor | check <cmd> | run <cmd> | report | install | uninstall | test | eval | version");
+    console.error("usage: reflex setup | status | doctor | check <cmd> | scan <file|-> | run <cmd> | report | install | uninstall | test | eval | version");
     process.exit(cmd ? 2 : 0);
 }

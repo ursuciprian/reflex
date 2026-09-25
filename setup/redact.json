@@ -1,5 +1,5 @@
 {
- "note": "Secret redaction shared by gate.mjs and routing/reflex_router.py. shapes: credential shapes replaced by <redacted> (also the router's secret floor). context: keyword patterns; replace uses $1 group syntax. Patterns must mean the same in JavaScript and Python (re.ASCII): no $ (use (?![\\s\\S])), no named groups, no flags besides i. corpus: both selfchecks assert these exact outputs. Known difference: \\s also matches Unicode spaces (NBSP) in JavaScript only. ponytail: a pattern list, not a DLP engine; add a pattern when a new credential shape shows up.",
+ "note": "Secret redaction shared by gate.mjs, guard.mjs and routing/reflex_router.py. names: what each shape is, in order (the injection guard names the key type when it blocks a prompt, never the key). shapes: credential shapes replaced by <redacted> (also the router's secret floor). context: keyword patterns; replace uses $1 group syntax. Patterns must mean the same in JavaScript and Python (re.ASCII): no $ (use (?![\\s\\S])), no named groups, no flags besides i. corpus: both selfchecks assert these exact outputs. Known difference: \\s also matches Unicode spaces (NBSP) in JavaScript only. ponytail: a pattern list, not a DLP engine; add a pattern when a new credential shape shows up.",
  "shapes": [
   "\\b(AKIA|ASIA)[A-Z0-9]{16}\\b",
   "\\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\\b",
@@ -12,6 +12,7 @@
   "hooks\\.slack\\.com/services/\\S+",
   "(?<![A-Za-z0-9/+])(?=[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+]))(?=[A-Za-z0-9/+]*[A-Z])(?=[A-Za-z0-9/+]*[a-z])[A-Za-z0-9/+]{40}"
  ],
+ "names": ["AWS access key id", "GitHub token", "OpenAI, Slack or GitLab token", "private key", "JSON web token", "Stripe key", "Google API key", "npm token", "Slack webhook URL", "40-character secret key (AWS secret access key shape)"],
  "context": [
   { "pattern": "(authorization:\\s*(bearer|basic|token)\\s+)\\S+", "flags": "i", "replace": "$1<redacted>"},
   { "pattern": "((cookie|x-[\\w-]*(auth|token|key)[\\w-]*):\\s*)[^'\"\\n]+", "flags": "i", "replace": "$1<redacted>"},

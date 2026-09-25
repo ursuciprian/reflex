@@ -1,7 +1,7 @@
 {
   "name": "@ursuciprian/reflex",
   "version": "0.2.0",
-  "description": "Risk gate for coding-agent shell commands: deterministic rules + TypeSafe Jev judgments + an editable policy",
+  "description": "Risk gate for coding-agent shell commands and an injection guard for what they read: deterministic rules + TypeSafe Jev judgments + an editable policy",
   "keywords": [
     "coding-agents",
     "claude-code",
@@ -12,7 +12,8 @@
     "hooks",
     "policy",
     "jev",
-    "mcp"
+    "mcp",
+    "prompt-injection"
   ],
   "license": "MIT",
   "homepage": "https://github.com/ursuciprian/reflex#readme",
@@ -50,6 +51,7 @@
     "test": "node test.mjs",
     "eval": "node eval.mjs",
     "eval-instructions": "node eval-instructions.mjs",
+    "eval-injection": "node guard.mjs --eval",
     "eval-context": "node context.mjs --eval-context",
     "eval-router": "node router/server.mjs --eval",
     "eval-routing": "python3 routing/reflex_router.py --eval",
