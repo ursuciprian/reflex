@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security report
+    url: https://github.com/ursuciprian/reflex/security/advisories/new
+    about: An exploitable weakness goes to a private advisory, not to a public issue.
+  - name: What Reflex does with my data
+    url: https://github.com/ursuciprian/reflex/blob/main/docs/GUIDE.md#data-handling
+    about: Exactly what leaves the machine, what is redacted first, and what stays local.

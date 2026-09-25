@@ -1,0 +1,38 @@
+name: publish
+
+# Publish @ursuciprian/reflex to the public npm registry when a version tag is pushed (v0.2.0 ...).
+# The tag must match package.json's version. Needs the NPM_TOKEN repository secret: an npm access
+# token (Automation or granular, publish rights on the @ursuciprian scope). npm versions cannot be
+# withdrawn after 72 hours, so tag deliberately. --provenance links the published tarball to this
+# workflow run, which npm shows on the package page.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write   # npm provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Tag matches package version
+        run: test "v$(node -p 'require("./package.json").version')" = "$GITHUB_REF_NAME"
+      - name: Offline selfchecks
+        run: npm test
+        env:
+          REFLEX_DATA_DIR: ${{ runner.temp }}/reflex
+      - name: Publish to npm
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

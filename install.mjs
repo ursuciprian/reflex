@@ -36,6 +36,7 @@ const MODE = opt("--mode", "shadow");
 const NODE = opt("--node", process.execPath);   // absolute, so hooks work without the shell's PATH
 const ALLOW = opt("--allow", "off");
 const UNINSTALL = argv.includes("--uninstall");
+const KEYCHAIN = opt("--keychain", undefined);   // macOS Keychain item holding the TypeSafe key
 const CONTEXT = argv.includes("--context") ? "on" : argv.includes("--no-context") ? "off" : "keep";
 if (argv.includes("--context") && argv.includes("--no-context")) throw new Error("--context and --no-context conflict");
 if (!["off", "shadow", "enforce"].includes(MODE)) throw new Error("--mode must be off, shadow or enforce");
@@ -210,7 +211,7 @@ if (argv.includes("--selfcheck")) {
   const home = mkdtempSync(join(tmpdir(), "reflex-install-"));
   const data = join(home, "data");
   const run = (...a) => { const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...a], {encoding: "utf8",
-    env: {...process.env, HOME: home, PATH: "/usr/bin:/bin"}}); ok(r.status === 0, `install ${a.join(" ")}: ${r.stderr}`); return r.stdout; };
+    env: {...process.env, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), PATH: "/usr/bin:/bin"}}); ok(r.status === 0, `install ${a.join(" ")}: ${r.stderr}`); return r.stdout; };
   const read = f => existsSync(join(home, f)) ? readFileSync(join(home, f), "utf8") : null;
   const put = (f, text) => { mkdirSync(dirname(join(home, f)), {recursive: true}); writeFileSync(join(home, f), text); };
   const commands = j => Object.values(JSON.parse(j).hooks ?? {}).flat().flatMap(g => g.hooks.map(h => h.command));
@@ -304,6 +305,13 @@ if (argv.includes("--selfcheck")) {
     // router registration is printed for every agent, never applied
     const ro = run("--router");
     ok(["claude", "codex", "pi", "omp", "opencode", "hermes"].every(a => ro.includes(`## ${a}`)) && /Nothing was changed/.test(ro), "router: printed for every agent");
+    // --keychain: recorded once in ~/.config/reflex/config.json and read by every gate process
+    run("--agent", "hermes", "--keychain", "dev/my-typesafe-key");
+    const seen = spawnSync(process.execPath, ["-e", `import(${JSON.stringify(GATE)}).then(g => console.log(g.CONFIG.keychain))`],
+      {encoding: "utf8", env: {PATH: "/usr/bin:/bin", HOME: home}}).stdout.trim();
+    ok(JSON.parse(read(".config/reflex/config.json")).keychain === "dev/my-typesafe-key" && seen === "dev/my-typesafe-key",
+       `keychain: written to config.json and read by the gate (${seen})`);
+    rmSync(join(home, ".config/reflex"), {recursive: true, force: true});
     const left = spawnSync("find", [home, "-type", "f", "-not", "-name", "*.bak-*", "-not", "-path", `${data}/*`], {encoding: "utf8"}).stdout.trim().split("\n").sort();
     ok(left.join() === [".config/opencode/plugins/other.js", ".omp/agent/extensions/other.ts", ".pi/agent/extensions/other.ts",
        ".claude/settings.json", ".codex/hooks.json"].map(f => join(home, f)).sort().join(), `nothing but foreign files and the emptied settings remain: ${left.join(" ")}`);
@@ -316,3 +324,9 @@ const which = opt("--agent", "claude");
 const targets = which === "all" ? Object.keys(AGENTS).filter(a => has(AGENTS[a].bin)) : which.split(",");
 for (const a of targets) if (!AGENTS[a]) throw new Error(`unknown agent ${a}; one of ${Object.keys(AGENTS).join(", ")}, all`);
 for (const a of targets) console.log(`${a.padEnd(9)} ${UNINSTALL ? "uninstalled" : `installed (${MODE}, allow ${ALLOW})`}: ${AGENTS[a].run()}`);
+if (KEYCHAIN && !UNINSTALL) {
+  // Every Reflex process reads this, whichever agent started it; the environment still wins.
+  const {USER_CONFIG_FILE} = await import("./gate.mjs");
+  writeFile(USER_CONFIG_FILE, JSON.stringify({...readJson(USER_CONFIG_FILE), keychain: KEYCHAIN}, null, 2) + "\n");
+  console.log(`keychain  ${USER_CONFIG_FILE}: the API key is read from Keychain item "${KEYCHAIN}"`);
+}

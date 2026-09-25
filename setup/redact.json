@@ -37,7 +37,7 @@
   {"in": "café AKIAABCDEFGHIJKLMNOP naïve_token=é1", "out": "café <redacted> naïve_token=<redacted>"},
   {"in": "postgres://admin:Sup3r@db.internal:5432/app", "out": "postgres://admin:<redacted>@db.internal:5432/app"},
   {"in": "éAKIAABCDEFGHIJKLMNOP and ghp_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZé", "out": "é<redacted> and <redacted>é"},
-  {"in": "REFLEX_KEYCHAIN_SERVICE=dev/typesafe-ai-api-key npm run eval", "out": "REFLEX_KEYCHAIN_SERVICE=dev/typesafe-ai-api-key npm run eval"},
+  {"in": "REFLEX_KEYCHAIN_SERVICE=dev/my-typesafe-key npm run eval", "out": "REFLEX_KEYCHAIN_SERVICE=dev/my-typesafe-key npm run eval"},
   {"in": "tool --api-key abc123 -token t0k", "out": "tool --api-key <redacted> -token <redacted>"}
  ]
 }

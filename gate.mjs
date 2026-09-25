@@ -32,6 +32,10 @@ import {compile} from "./policy.mjs";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ENV = process.env;
 const flagValue = (n, d) => process.argv.includes(n) ? process.argv[process.argv.indexOf(n) + 1] : d;
+// Machine-wide settings written by `install.mjs --keychain` (~/.config/reflex/config.json), so every
+// hook sees them whichever agent started it. The environment still wins.
+export const USER_CONFIG_FILE = join(ENV.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "reflex/config.json");
+const USER_CONFIG = (() => { try { return JSON.parse(readFileSync(USER_CONFIG_FILE, "utf8")); } catch { return {}; } })();
 export const CONFIG = {
   api: ENV.REFLEX_API_URL ?? "https://api.typesafe.ai/v1/systemone",
   model: ENV.REFLEX_MODEL ?? "jev-1.13.0",              // pinned so a decision can be reproduced
@@ -44,7 +48,7 @@ export const CONFIG = {
   setup: ENV.REFLEX_SETUP_DIR ?? join(HERE, "setup/tool-gate"),
   data: ENV.REFLEX_DATA_DIR ?? join(ENV.XDG_STATE_HOME ?? join(homedir(), ".local/state"), "reflex"),
   timeoutMs: Number(ENV.REFLEX_TIMEOUT_MS ?? 3000),
-  keychain: ENV.REFLEX_KEYCHAIN_SERVICE ?? "typesafe-api-key",
+  keychain: ENV.REFLEX_KEYCHAIN_SERVICE ?? USER_CONFIG.keychain ?? "typesafe-api-key",
 };
 // Functions, not constants, so the self-check can point the whole gate at a scratch directory.
 const TRACE = () => join(CONFIG.data, "trace.jsonl");
@@ -1038,7 +1042,7 @@ async function selfcheck() {
   for (const x of ["hunter3", "pw9", "S3cret", "pw7", "sk_live_a", "AIzab", "T0/B0", "sid=abc123", "wJalrXUtn", "p/w@d"]) ok(!r2.includes(x), `redact ${x}`);
   ok(redact("git show 3f5e8a9b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f").includes("3f5e8a9b"), "git SHA is not a secret");
   for (const c of REDACT.corpus) ok(redact(c.in) === c.out, `redact corpus: ${c.in.slice(0, 40)}`);
-  ok(redact("REFLEX_KEYCHAIN_SERVICE=dev/typesafe-ai-api-key npm run eval").includes("npm run eval") &&
+  ok(redact("REFLEX_KEYCHAIN_SERVICE=dev/my-typesafe-key npm run eval").includes("npm run eval") &&
      !redact("tool --api-key abc123").includes("abc123"), "a flag-like word inside a name is not a flag");
 
   // deterministic rules
@@ -1513,4 +1517,4 @@ else if (flag("--check")) {
   console.log(JSON.stringify({decision: j.outcome, rule: j.rule, source: j.source, policy: j.policy_version ?? null,
                               latency_s: j.latency_s ?? 0, answers, env: j.state?.call?.env, error: j.error ?? undefined}, null, 1));
 }
-else console.error("usage: gate.mjs --check <cmd> | --decide | --record | --claude[-post] | --codex[-post] | --hermes[-post] | --selfcheck");
+else console.error("usage: gate.mjs --check <cmd> | --decide | --record | --claude[-post|-prompted] | --codex[-post] | --hermes[-post] | --sh | --bg | --selfcheck");

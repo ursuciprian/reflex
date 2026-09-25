@@ -43,20 +43,75 @@ Hooks and plugins inherit the environment the agent was started with. Either:
 
 Never put the key in `settings.json`, the repo, or shell history.
 
-## 2. Get Reflex and check it
+## 2. Install
 
 ```sh
-git clone https://github.com/ursuciprian/reflex.git ~/src/reflex
-cd ~/src/reflex
-npm test                                   # offline: policy + gate self-checks
-node gate.mjs --check "git push --force origin main"                       # a rule, no API call
-node gate.mjs --check "aws iam attach-role-policy --role-name ci --policy-arn arn:aws:iam::aws:policy/AdministratorAccess"
-npm run eval                               # the golden set through the live API
+curl -fsSL https://raw.githubusercontent.com/ursuciprian/reflex/main/install.sh | bash
 ```
 
-`--check` prints the decision, the rule that fired, where it came from (`read-only`, `rule`,
+or with any package runner (same result):
+
+```sh
+npx @ursuciprian/reflex setup
+pnpm dlx @ursuciprian/reflex setup
+bunx @ursuciprian/reflex setup
+yarn dlx @ursuciprian/reflex setup     # yarn 2+
+```
+
+Either way `reflex setup` runs, which:
+
+- copies the package to `~/.local/share/reflex` (no sudo). Hooks point there, not into the npx /
+  pnpm / bun cache, so clearing a cache never breaks them;
+- links the `reflex` command into `~/.local/bin`;
+- offers to store your TypeSafe key in the macOS Keychain if none is found (entered hidden, passed
+  to `security` on stdin, never written to a file);
+- hooks every supported agent it finds (step 3), in shadow mode with allow off, and records the
+  Keychain item name in `~/.config/reflex/config.json` so every hook finds the key;
+- records the Node found on `PATH` (e.g. `/opt/homebrew/bin/node`, not the versioned binary behind
+  it), so a Node upgrade does not break the hooks.
+
+The `curl` script checks Node 18+, runs `npm install` into that directory (with the npm registry
+set explicitly for `@ursuciprian`, so a stale entry in `~/.npmrc` cannot redirect it) and then runs
+`reflex setup`.
+
+Options go after `bash -s --`, or after `setup`:
+
+| Option | Default | |
+|---|---|---|
+| `--agents claude,codex,…` | `all` found | which agents to hook |
+| `--mode shadow\|enforce\|off` | `shadow` | |
+| `--allow off\|shadow\|on` | `off` | see step 6 |
+| `--keychain NAME` | `typesafe-api-key` | Keychain item holding the key |
+| `--node PATH` | `node` on `PATH` | the Node the hooks run with |
+| `--version X` | latest | package version (`curl` only; with a runner use `@ursuciprian/reflex@X`) |
+| `--prefix DIR` | `~/.local/share/reflex` | where the package lives (`REFLEX_PREFIX` for `setup`) |
+| `--package SPEC` | | an npm spec or a local `.tgz` (`curl` only, for testing) |
+| `--uninstall` | | remove every hook, the package, the link and `config.json` (`curl` only; otherwise `reflex uninstall`) |
+
+Rerunning any install path upgrades in place; hook paths don't change.
+
+Check it:
+
+```sh
+reflex check "git push --force origin main"          # a rule, no API call
+reflex check "aws iam attach-role-policy --role-name ci --policy-arn arn:aws:iam::aws:policy/AdministratorAccess"
+```
+
+`reflex check` prints the decision, the rule that fired, where it came from (`read-only`, `rule`,
 `fast-lane`, `jev`, `fallback`) and Jev's raw answers. If a Jev call fails it prints the error and
-the policy's fallback decision (`ask`).
+the policy's fallback decision (`ask`). Other commands: `reflex report`, `reflex install`,
+`reflex uninstall`, `reflex test`, `reflex eval`, `reflex version`.
+
+To work on Reflex itself, clone the repo, run `npm test`, and install that checkout with
+`node install.mjs --agent all` instead.
+
+### Publishing a release (maintainers)
+
+Once: add the `NPM_TOKEN` repository secret (an npm access token with publish rights on the
+`@ursuciprian` scope). Then per release: bump `version` in `package.json` and `CHANGELOG.md`, merge,
+and tag: `git tag vX.Y.Z && git push origin vX.Y.Z`. `.github/workflows/publish.yml` checks the tag
+matches `package.json`, runs the self-checks and runs `npm publish --access public --provenance`.
+npm versions cannot be withdrawn after 72 hours, so tag deliberately.
 
 ## 3. Install the hooks (shadow mode)
 
@@ -71,8 +126,8 @@ absolute path of the Node that ran `install.mjs`; pass `--node /path/to/node` to
 
 | Agent | What `install.mjs` does | After installing |
 |---|---|---|
-| Claude Code | `~/.claude/settings.json`: `PreToolUse` hook on `Bash` (`gate.mjs --claude`), `PostToolUse` / `PostToolUseFailure` / `PermissionDenied` hooks (`--claude-post`), a `UserPromptSubmit` hook for conditional instructions (`instructions.mjs --claude`), and permission rules that make Claude Code ask before editing the Reflex checkout, its logs, your personal instruction fragments (`~/.config/reflex`) or its own settings | restart sessions |
-| Codex CLI | `~/.codex/hooks.json`: `PreToolUse` + `PostToolUse` on `^Bash$`, and `UserPromptSubmit` (`instructions.mjs --codex`) | open Codex, run `/hooks` and **trust** the Reflex hooks — untrusted hooks do not run |
+| Claude Code | `~/.claude/settings.json`: `PreToolUse` hook on `Bash\|Task\|Agent` (`gate.mjs --claude`; `Task\|Agent` is subgoal dedup), `PostToolUse` / `PostToolUseFailure` / `PermissionDenied` hooks on the same tools (`--claude-post`), a `PermissionRequest` hook on the same tools (`--claude-prompted`, which only records that Claude Code showed its own dialog — it never answers it), a `UserPromptSubmit` hook for conditional instructions (`instructions.mjs --claude`), and permission rules that make Claude Code ask before editing the Reflex checkout, its logs, your personal instruction fragments (`~/.config/reflex`) or its own settings | restart sessions |
+| Codex CLI | `~/.codex/hooks.json`: `PreToolUse` + `PostToolUse` on `^(Bash\|spawn_agent)$` (`spawn_agent` is subgoal dedup), and `UserPromptSubmit` (`instructions.mjs --codex`) | open Codex, run `/hooks` and **trust** the Reflex hooks — untrusted hooks do not run |
 | pi | `~/.pi/agent/extensions/reflex.ts` (gate on `tool_call`, instructions on `before_agent_start`) | restart pi |
 | oh-my-pi | `~/.omp/agent/extensions/reflex.ts` (same file) | restart omp |
 | opencode | `~/.config/opencode/plugins/reflex.js` (gate on `tool.execute.before`, instructions on `chat.message` + `experimental.chat.system.transform`) | restart opencode |
@@ -87,12 +142,6 @@ writes `~/.{pi,omp}/agent/extensions/reflex-context.ts` (see the GUIDE's *Contex
 sends redacted excerpts of tool output to TypeSafe, so turn it on deliberately. To try it for one session
 without installing: `pi -e /path/to/reflex/adapters/pi-context.ts` with
 `REFLEX_CONTEXT=/path/to/reflex/context.mjs` in the environment (same for `omp -e`).
-| Claude Code | `~/.claude/settings.json`: `PreToolUse` hook on `Bash\|Task\|Agent` (`gate.mjs --claude`; `Task\|Agent` is subgoal dedup), `PostToolUse` / `PostToolUseFailure` / `PermissionDenied` hooks on the same tools (`--claude-post`), and permission rules that make Claude Code ask before editing the Reflex checkout, its logs or its own settings | restart sessions |
-| Codex CLI | `~/.codex/hooks.json`: `PreToolUse` + `PostToolUse` on `^(Bash\|spawn_agent)$` (`spawn_agent` is subgoal dedup) | open Codex, run `/hooks` and **trust** the Reflex hooks — untrusted hooks do not run |
-| pi | `~/.pi/agent/extensions/reflex.ts` | restart pi |
-| oh-my-pi | `~/.omp/agent/extensions/reflex.ts` | restart omp |
-| opencode | `~/.config/opencode/plugins/reflex.js` | restart opencode |
-| Hermes | prints a `hooks:` block (Hermes config is YAML, so you paste it) | add it to each profile's `config.yaml`, then `hermes hooks list` to accept it |
 
 For an agent with no hook system, point its shell setting at `bin/reflex-sh`: it behaves like
 `bash`, but judges every `-c` command first. Set `REFLEX_AGENT=<name>` so the logs say which agent
@@ -222,6 +271,15 @@ for TLS on Python builds without a CA bundle.
 | `REFLEX_DATA_DIR` | `~/.local/state/reflex` | Where `routing.jsonl` is written (inside Docker, mount a volume) |
 | `TYPESAFE_API_KEY` / `REFLEX_KEYCHAIN_SERVICE` | — / `typesafe-api-key` | Same key lookup as the gate; the Keychain is not reachable from a container, so use the variable there |
 | `REFLEX_MODEL`, `REFLEX_API_URL` | as the gate | Jev model and endpoint |
+
+## Optional: context layer (pi and oh-my-pi)
+
+Installed with `node install.mjs --agent pi,omp --context` (see step 3). What it does, and what it
+sends to TypeSafe, is in [GUIDE → Context layer](GUIDE.md#context-layer-pi-and-oh-my-pi). Its
+variables:
+
+| Variable | Default | Meaning |
+|---|---|---|
 | `REFLEX_CONTEXT_TIMEOUT_MS` | `8000` | Budget for one context-layer Jev call (up to 24 questions), capped at 25000 (omp gives a handler 30 s); on timeout the context is left as it was |
 | `REFLEX_CHUNK_DAYS` / `REFLEX_CHUNK_MB` | `7` / `200` | Context-layer chunk store: delete chunks unused for this many days, then the least recently used beyond this size |
 | `REFLEX_CACHE_READ` / `REFLEX_CACHE_WRITE` | `0.1` / `1.25` | Prompt-cache read and write price as a fraction of uncached input, for the rebuild-or-keep decision |
@@ -233,7 +291,7 @@ for TLS on Python builds without a CA bundle.
 Push a snapshot of the metrics to a Prometheus Pushgateway, e.g. every five minutes from cron:
 
 ```sh
-*/5 * * * * cd ~/src/reflex && /usr/local/bin/node report.mjs --push http://localhost:9091 >/dev/null
+*/5 * * * * cd /path/to/reflex && /usr/local/bin/node report.mjs --push http://localhost:9091 >/dev/null
 ```
 
 Import `dashboards/reflex.json` into Grafana (it asks for the Prometheus data source) or drop it
@@ -243,6 +301,8 @@ team.
 ## Uninstall
 
 ```sh
-node install.mjs --agent all --uninstall
+reflex uninstall                    # every hook, the package, the link and config.json
+#   or: curl -fsSL https://raw.githubusercontent.com/ursuciprian/reflex/main/install.sh | bash -s -- --uninstall
+#   or, from a checkout:  node install.mjs --agent all --uninstall
 rm -rf ~/.local/state/reflex        # optional: logs, the context layer's chunk store, bundles, reviews
 ```

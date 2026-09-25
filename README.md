@@ -1,5 +1,9 @@
 # Reflex
 
+[![ci](https://github.com/ursuciprian/reflex/actions/workflows/ci.yml/badge.svg)](https://github.com/ursuciprian/reflex/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/@ursuciprian/reflex)](https://www.npmjs.com/package/@ursuciprian/reflex)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A fast, auditable risk gate for the shell commands a coding agent wants to run.
 
 Coding agents run hundreds of shell commands a day. Most are harmless; a few can delete a
@@ -28,12 +32,14 @@ judges how sensitive the conversation is and how hard the task is; `routing/poli
 restricted content (secrets, env and infra config, credentials, proprietary research) on first-party
 frontier models, sends easy public work to the cheapest model, and keeps a conversation on its model
 when switching would cost more than it saves. Shadow by default. See [docs/GUIDE.md](docs/GUIDE.md#model-routing).
+
 **Context layer (pi and oh-my-pi, opt-in, experimental).** The same Jev client also decides what the
 model *sees*: a large tool output is cut, per request, to the chunks that matter (hide / short / long /
 full; the full text is kept and returned by an `expand_chunk` tool); earlier outputs are re-levelled
 when the request changes, but only when that beats keeping the provider's prompt cache; `/fresh <goal>`
 restarts with only the relevant old context; and one retrieval pass over a git change feeds read-only
 background tasks such as `bin/reflex-review`. See [docs/GUIDE.md](docs/GUIDE.md#context-layer-pi-and-oh-my-pi).
+
 **Subgoal dedup.** Agents sometimes spawn a subagent for work they already delegated earlier in
 the session, and pay for it twice. Before Claude Code's `Agent` (`Task`) tool, Codex's
 `spawn_agent`, the `task` tool of oh-my-pi or opencode, or Hermes' `delegate_task`, Reflex asks
@@ -59,9 +65,6 @@ list in `router/config.json`. Jev picks the tool and fills its arguments from th
 and hands back candidates instead of guessing when it is unsure. Every call it makes, shell or
 downstream MCP, goes through the gate first (unless you mark a server `"trusted"`). See [GUIDE → Tool router](docs/GUIDE.md#tool-router).
 
-**The gate can only tighten.** It emits `ask` or `deny`, never `allow`, so your existing
-permission rules stay authoritative and a model can never authorize anything on its own.
-
 **Conditional instructions.** Reflex can also load agent instructions only when they apply. Put
 fragments in `.reflex/instructions/*.md`, each with a `when:` condition such as *"the task touches
 billing"* and optional `paths:` / `keywords:`. On every prompt, Reflex checks the paths and keywords
@@ -69,6 +72,7 @@ first, then asks Jev one yes/no question per remaining fragment, all in a single
 The fragments that apply are injected into that turn. The instructions that apply are added again
 on every prompt, so compaction cannot drop them, and the rest stay out of the context. See
 [GUIDE: conditional instructions](docs/GUIDE.md#conditional-instructions) and `examples/instructions/`.
+
 **By default the gate can only tighten.** It emits `ask` or `deny`, never `allow`, so your existing
 permission rules stay authoritative and a model can never authorize anything on its own.
 
@@ -98,24 +102,51 @@ leave the machine*, *ask when a mutating command does not match the stated task*
 
 ## Quick start
 
+One command installs `@ursuciprian/reflex` from npm and hooks it into every supported agent on the
+machine, in shadow mode:
+
 ```sh
-git clone https://github.com/ursuciprian/reflex.git && cd reflex
-export TYPESAFE_API_KEY=...          # from https://console.typesafe.ai/keys — see docs/SETUP.md
-npm test                             # offline self-checks, no API calls
-node gate.mjs --check "terraform apply -auto-approve" --cwd ~/infra/envs/prod
-npm run eval                         # 63 labelled commands through the real gate (~31k tokens)
-npm run eval                         # 65 labelled commands through the real gate (~47k tokens)
-node install.mjs --agent all         # hook into every supported agent found here, shadow mode
+curl -fsSL https://raw.githubusercontent.com/ursuciprian/reflex/main/install.sh | bash
+```
+
+or with any package runner (same result):
+
+```sh
+npx @ursuciprian/reflex setup
+pnpm dlx @ursuciprian/reflex setup
+bunx @ursuciprian/reflex setup
+yarn dlx @ursuciprian/reflex setup     # yarn 2+
+```
+
+It needs Node 18+ and a TypeSafe API key, which it offers to store in the macOS Keychain. No
+account or login. Options follow `bash -s --` (or `setup`), e.g.
+`| bash -s -- --agents claude,codex --mode enforce`. See [docs/SETUP.md](docs/SETUP.md).
+
+```sh
+reflex check "terraform apply -auto-approve" --cwd ~/infra/envs/prod   # judge one command
+reflex report                                                          # after a few days of use
 ```
 
 Shadow mode changes nothing the agent does: deterministic rules still apply, and Jev judges
 every other mutating command in the background and logs what it *would* have done. After a
-week, `node report.mjs` shows the decisions, and `node install.mjs --mode enforce` turns them on.
+week, `reflex report` shows the decisions; run `reflex setup --mode enforce` to apply them.
+
+Working on Reflex itself:
+
+```sh
+git clone https://github.com/ursuciprian/reflex.git && cd reflex
+npm test                             # offline self-checks, no API calls
+npm run eval                         # 90 labelled commands through the real gate (~50k tokens)
+node install.mjs --agent all         # hook this checkout into every agent found here
+```
 
 ## Documentation
 
 - [docs/SETUP.md](docs/SETUP.md) — TypeSafe account and key, install, verify, configure, uninstall
 - [docs/GUIDE.md](docs/GUIDE.md) — how it works, testing, tuning, rollout, metrics, data handling, limits
+- [SECURITY.md](SECURITY.md) — what counts as a vulnerability here, and which limits are not bugs
+- [CONTRIBUTING.md](CONTRIBUTING.md) — offline tests, which live eval to run, the invariants a review holds you to
+- [CHANGELOG.md](CHANGELOG.md) — releases
 
 ## Files
 
@@ -125,28 +156,26 @@ week, `node report.mjs` shows the decisions, and `node install.mjs --mode enforc
 | `instructions.mjs` | Conditional instructions: fragment discovery, path / keyword matching, one Jev request per prompt, and the Claude Code / Codex / Hermes prompt hooks |
 | `eval-instructions.mjs` | Scores fragment selection against `examples/instructions/golden.json` with the live API |
 | `examples/instructions/` | Example fragments (front end, billing, Terraform) in a fixture repo, and the golden set |
-| `adapters/` | `pi.ts` (pi and oh-my-pi extension), `opencode.js` (opencode plugin); both carry the gate and the instructions |
 | `adapters/` | `pi.ts` (pi and oh-my-pi extension), `pi-context.ts` (pi / oh-my-pi context layer), `opencode.js` (opencode plugin) |
 | `context.mjs` | Context layer core: visibility ladder, chunk store, per-request assembly and cache decision, `/fresh` recall, retrieval bundles |
+| `bin/reflex` | The CLI: `setup` (what `curl` / `npx` / `pnpm dlx` / `bunx` run), `check`, `report`, `install`, `uninstall`, `test`, `eval`, `version` |
 | `bin/reflex-sh` | Drop-in `bash -c` for agents without hooks |
 | `bin/reflex-review` | Background cross-model review that consumes a retrieval bundle |
 | `policy.mjs` | Policy evaluator: ordered gates over answers, no `eval`, no domain knowledge |
 | `setup/tool-gate/` | `rules.json`, `questions.json`, `policy.json`, `golden.json`, `subgoals.json` — all behaviour lives here; `fixtures/` holds the scripts the golden set runs |
+| `setup/redact.json` | The credential shapes and `KEY=` / `--password` patterns redacted before anything is judged or logged; shared by the gate and the model router, with a corpus both self-checks assert |
 | `eval.mjs` | Runs the golden set through the real gate; exits 1 on any missed risk |
-| `report.mjs` | Summary, replay under a candidate policy, Prometheus Pushgateway export |
-| `install.mjs` | Adds / removes Reflex (gate and instructions) in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`) |
-| `install.mjs` | Adds / removes Reflex in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`); `--router` prints how to register the tool router in each agent |
 | `router/server.mjs` | Tool router: stdio MCP server (`find_tools`, `describe_tool`, `run`), Jev tool selection and argument filling, schema validation, gated shell execution, downstream MCP proxy |
 | `router/mcp.mjs` | Newline-delimited JSON-RPC over stdio, server and client side (no SDK) |
 | `router/commands.json` | Built-in command tools: name, description, argument schema, argv template |
 | `router/config.json` | Downstream stdio MCP servers whose tools join the catalog (`mcpServers`, same shape as `.mcp.json`) |
 | `router/golden.json` | Labelled intents for `npm run eval-router` (tool and arguments chosen by real Jev; nothing runs) |
 | `router/test/` | Fake downstream MCP server and stubbed Jev for `npm test` |
-| `install.mjs` | Adds / removes Reflex in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`; `--context` / `--no-context` adds / removes the pi / omp context layer) |
+| `install.mjs` | Adds / removes Reflex in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`; `--mode`, `--allow`, `--keychain`; `--context` / `--no-context` adds / removes the pi / omp context layer; `--router` prints how to register the tool router in each agent) |
+| `install.sh` | The `curl` installer: fetches the package from npm and runs `reflex setup` |
 | `report.mjs` | Summary, replay under a candidate policy, allow calibration from your approvals, Prometheus Pushgateway export |
-| `install.mjs` | Adds / removes Reflex in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`) |
 | `dashboards/reflex.json` | Grafana dashboard for the pushed metrics |
-| `routing/` | LiteLLM pre-call hook for security- and cost-aware model routing (`reflex_router.py`, `questions.json`, `policy.json`, an example LiteLLM config) |
+| `routing/` | LiteLLM pre-call hook for security- and cost-aware model routing (`reflex_router.py`, `questions.json`, `policy.json`, `golden.json`, an example LiteLLM config) |
 
 Node 18+, no dependencies. The router needs Python 3.9+ (stdlib) inside a LiteLLM proxy.
 
