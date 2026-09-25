@@ -1,7 +1,6 @@
 # Reflex
 
 [![ci](https://github.com/ursuciprian/reflex/actions/workflows/ci.yml/badge.svg)](https://github.com/ursuciprian/reflex/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/@ursuciprian/reflex)](https://www.npmjs.com/package/@ursuciprian/reflex)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A fast, auditable risk gate for the shell commands a coding agent wants to run.
@@ -102,16 +101,19 @@ leave the machine*, *ask when a mutating command does not match the stated task*
 
 ## Quick start
 
-One command installs the package from the public npm registry and hooks it into every supported
-agent on the machine, in shadow mode:
+One command installs the package and hooks it into every supported agent on the machine, in shadow
+mode. While the repository is private, fetch the installer with the GitHub CLI:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ursuciprian/reflex/main/install.sh | bash
+gh auth refresh -s read:packages     # once
+gh api repos/ursuciprian/reflex/contents/install.sh -H 'Accept: application/vnd.github.raw' | bash
 ```
 
-It needs Node 18+ and a TypeSafe API key, which it offers to store in the macOS Keychain. No GitHub
-login is needed; `--registry gh` installs the same package from GitHub Packages instead, and that
-registry does need a token. Options follow `bash -s --`, e.g.
+If the repository and the npm package are made public, `curl -fsSL
+https://raw.githubusercontent.com/ursuciprian/reflex/main/install.sh | bash` works without any login.
+The installer tries the public npm registry first and falls back to GitHub Packages (which always
+needs a token) when the package is not there. It needs Node 18+ and a TypeSafe API key, which it
+offers to store in the macOS Keychain. Options follow `bash -s --`, e.g.
 `| bash -s -- --agents claude,codex --mode enforce`. See [docs/SETUP.md](docs/SETUP.md).
 
 ```sh
@@ -164,7 +166,7 @@ node install.mjs --agent all         # hook this checkout into every agent found
 | `router/golden.json` | Labelled intents for `npm run eval-router` (tool and arguments chosen by real Jev; nothing runs) |
 | `router/test/` | Fake downstream MCP server and stubbed Jev for `npm test` |
 | `install.mjs` | Adds / removes Reflex in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`; `--mode`, `--allow`, `--keychain`; `--context` / `--no-context` adds / removes the pi / omp context layer; `--router` prints how to register the tool router in each agent) |
-| `install.sh` | The one-line installer: fetches the package from npmjs (`--registry gh` for GitHub Packages) and runs `install.mjs` |
+| `install.sh` | The one-line installer: fetches the package (public npm first, then GitHub Packages) and runs `install.mjs` |
 | `report.mjs` | Summary, replay under a candidate policy, allow calibration from your approvals, Prometheus Pushgateway export |
 | `dashboards/reflex.json` | Grafana dashboard for the pushed metrics |
 | `routing/` | LiteLLM pre-call hook for security- and cost-aware model routing (`reflex_router.py`, `questions.json`, `policy.json`, `golden.json`, an example LiteLLM config) |

@@ -46,16 +46,21 @@ Never put the key in `settings.json`, the repo, or shell history.
 ## 2. Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ursuciprian/reflex/main/install.sh | bash
+gh auth refresh -s read:packages     # once: GitHub Packages needs a token even to read
+gh api repos/ursuciprian/reflex/contents/install.sh -H 'Accept: application/vnd.github.raw' | bash
 ```
+
+If the repository and the npm package are public, `curl -fsSL
+https://raw.githubusercontent.com/ursuciprian/reflex/main/install.sh | bash` does the same with no
+login.
 
 The installer:
 
 - checks Node 18+ and npm;
-- installs `@ursuciprian/reflex` from the public npm registry into `~/.local/share/reflex` (no sudo,
-  no login); `--registry gh` uses GitHub Packages instead, which always needs a token — the
-  installer then uses `GITHUB_TOKEN` or your `gh` login through a temporary npmrc that is deleted on
-  exit, and writes nothing to `~/.npmrc`;
+- installs `@ursuciprian/reflex` into `~/.local/share/reflex` (no sudo): from the public npm
+  registry when it is published there (no login), otherwise from GitHub Packages, which always needs
+  a token — `GITHUB_TOKEN` or your `gh` login, through a temporary npmrc deleted on exit; nothing
+  is written to `~/.npmrc`, and a stale `@ursuciprian` line in it cannot redirect the install;
 - links the `reflex` command into `~/.local/bin`;
 - offers to store your TypeSafe key in the macOS Keychain if none is found;
 - hooks every supported agent it finds (step 3), in shadow mode with allow off, and records the
@@ -68,7 +73,7 @@ Options go after `bash -s --`:
 | `--agents claude,codex,…` | `all` found | which agents to hook |
 | `--mode shadow\|enforce\|off` | `shadow` | |
 | `--allow off\|shadow\|on` | `off` | see step 6 |
-| `--registry npm\|gh` | `npm` | npmjs needs no token; GitHub Packages always does |
+| `--registry auto\|npm\|gh` | `auto` | `auto`: npmjs, then GitHub Packages if not found there. npmjs needs no token; GitHub Packages always does |
 | `--version X` | latest | package version |
 | `--prefix DIR` | `~/.local/share/reflex` | where the package is installed |
 | `--keychain NAME` | `typesafe-api-key` | Keychain item holding the key |
@@ -95,10 +100,11 @@ To work on Reflex itself, clone the repo, run `npm test`, and install that check
 ### Publishing a release (maintainers)
 
 Bump `version` in `package.json`, merge, then tag: `git tag v0.2.0 && git push origin v0.2.0`.
-`.github/workflows/publish.yml` runs the self-checks and publishes `@ursuciprian/reflex` to both
-registries: npmjs (needs the `NPM_TOKEN` repository secret — an npm access token for the
-`ursuciprian` account) and GitHub Packages (the workflow's own `GITHUB_TOKEN`). The same tarball
-lands on both, so nobody needs a GitHub login to install Reflex.
+`.github/workflows/publish.yml` runs the self-checks and publishes `@ursuciprian/reflex` to GitHub
+Packages with the workflow's own `GITHUB_TOKEN`; the package inherits the repository's visibility.
+It also publishes the same tarball to npmjs **only if** the `NPM_TOKEN` repository secret exists
+(an npm access token for the `ursuciprian` account). Adding that secret is the decision to publish
+Reflex publicly: npm versions cannot be withdrawn after 72 hours.
 
 ## 3. Install the hooks (shadow mode)
 
@@ -288,7 +294,7 @@ team.
 ## Uninstall
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ursuciprian/reflex/main/install.sh | bash -s -- --uninstall
+gh api repos/ursuciprian/reflex/contents/install.sh -H 'Accept: application/vnd.github.raw' | bash -s -- --uninstall
 #   or, from a checkout:  node install.mjs --agent all --uninstall
 rm -rf ~/.local/state/reflex        # optional: logs, the context layer's chunk store, bundles, reviews
 ```

@@ -2,13 +2,14 @@
 # Reflex installer: fetch the package and hook it into every coding agent found on this machine,
 # in shadow mode by default.
 #
-#   curl -fsSL https://raw.githubusercontent.com/ursuciprian/reflex/main/install.sh | bash
+#   gh api repos/ursuciprian/reflex/contents/install.sh -H 'Accept: application/vnd.github.raw' | bash
+#   curl -fsSL https://raw.githubusercontent.com/ursuciprian/reflex/main/install.sh | bash   (public repo)
 #   ... | bash -s -- --mode enforce --agents claude,codex --version 0.2.0
 #   ... | bash -s -- --uninstall
 #
 # Options (or the matching environment variables):
 #   --version X      package version            REFLEX_VERSION   (default: latest)
-#   --registry R     npm | gh                   REFLEX_REGISTRY  (default: npm — see the note below)
+#   --registry R     auto | npm | gh            REFLEX_REGISTRY  (default: auto — see the note below)
 #   --agents LIST    claude,codex,pi,omp,...    REFLEX_AGENTS    (default: all agents found)
 #   --mode M         shadow | enforce | off     REFLEX_MODE      (default: shadow)
 #   --allow A        off | shadow | on          REFLEX_ALLOW     (default: off)
@@ -17,17 +18,17 @@
 #   --package SPEC   npm spec or local .tgz     REFLEX_PACKAGE   (testing: install from `npm pack`)
 #   --uninstall      remove the hooks and the package (logs in ~/.local/state/reflex are kept)
 #
-# The package is published to two registries. The public npm registry needs no token, so it is the
-# default. GitHub Packages always needs a token, even to read a public package: --registry gh uses
-# GITHUB_TOKEN if set, otherwise your `gh` login (scope read:packages), through a temporary npmrc
-# that is deleted on exit. Nothing is written to ~/.npmrc.
+# Registries: npm is the public npm registry (no token). gh is GitHub Packages, which always needs a
+# token, even to read: GITHUB_TOKEN if set, otherwise your `gh` login (scope read:packages), through a
+# temporary npmrc that is deleted on exit. Nothing is written to ~/.npmrc. auto tries npm first and
+# falls back to gh when the package is not published there.
 set -euo pipefail
 
 SCOPE="@ursuciprian"
 NAME="$SCOPE/reflex"
 NPM_REGISTRY="https://registry.npmjs.org"
 GH_REGISTRY="https://npm.pkg.github.com"
-REGISTRY="${REFLEX_REGISTRY:-npm}"
+REGISTRY="${REFLEX_REGISTRY:-auto}"
 VERSION="${REFLEX_VERSION:-latest}"
 AGENTS="${REFLEX_AGENTS:-all}"
 MODE="${REFLEX_MODE:-shadow}"
@@ -47,7 +48,7 @@ while [ $# -gt 0 ]; do
     --keychain) REFLEX_KEYCHAIN_SERVICE="$2"; shift 2 ;;
     --package) PACKAGE="$2"; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
-    -h|--help) sed -n '2,23p' "$0" 2>/dev/null || true; exit 0 ;;
+    -h|--help) sed -n '2,24p' "$0" 2>/dev/null || true; exit 0 ;;
     *) echo "reflex: unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -62,7 +63,7 @@ major="$("$NODE" -p 'process.versions.node.split(".")[0]')"
 [ "$major" -ge 18 ] || die "Node.js 18+ is required, found $("$NODE" --version)"
 case "$MODE" in shadow|enforce|off) ;; *) die "--mode must be shadow, enforce or off" ;; esac
 case "$ALLOW" in off|shadow|on) ;; *) die "--allow must be off, shadow or on" ;; esac
-case "$REGISTRY" in npm|gh) ;; *) die "--registry must be npm (public, no token) or gh (GitHub Packages, token required)" ;; esac
+case "$REGISTRY" in auto|npm|gh) ;; *) die "--registry must be auto, npm (public, no token) or gh (GitHub Packages, token required)" ;; esac
 
 PKG_DIR="$PREFIX/lib/node_modules/$NAME"
 
@@ -78,34 +79,48 @@ fi
 # --- fetch the package -------------------------------------------------------------------------
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-if [ -n "$PACKAGE" ]; then
-  SPEC="$PACKAGE"
-  NPM_ARGS=()
-elif [ "$REGISTRY" = gh ]; then
-  TOKEN="${GITHUB_TOKEN:-}"
-  if [ -z "$TOKEN" ] && command -v gh >/dev/null; then
-    TOKEN="$(gh auth token 2>/dev/null || true)"
-  fi
-  [ -n "$TOKEN" ] || die "GitHub Packages needs a token: run 'gh auth login', or set GITHUB_TOKEN with read:packages, or drop --registry gh to install from npmjs"
+FRESH=0; [ -e "$PREFIX" ] || FRESH=1   # a failed first install leaves nothing behind
+npm_install() {
+  npm install --global --prefix "$PREFIX" --no-audit --no-fund --loglevel=error "$@" 2> "$TMP/npm.err"
+}
+# npm resolves a scoped package's registry from an `@scope:registry` setting before `--registry`, so
+# each path sets the scoped registry itself; a stale @ursuciprian line in ~/.npmrc cannot redirect it.
+from_npm() {
+  say "installing $NAME@$VERSION from npmjs into $PREFIX"
+  npm_install "--$SCOPE:registry=$NPM_REGISTRY" "$NAME@$VERSION"
+}
+from_gh() {
+  local token="${GITHUB_TOKEN:-}"
+  if [ -z "$token" ] && command -v gh >/dev/null; then token="$(gh auth token 2>/dev/null || true)"; fi
+  [ -n "$token" ] || die "GitHub Packages needs a token: run 'gh auth login', or set GITHUB_TOKEN with read:packages"
   # The token only ever lives in this temporary npmrc.
-  umask 077
-  printf '%s:registry=%s\n//npm.pkg.github.com/:_authToken=%s\n' "$SCOPE" "$GH_REGISTRY" "$TOKEN" > "$TMP/npmrc"
-  SPEC="$NAME@$VERSION"
-  NPM_ARGS=(--userconfig "$TMP/npmrc")
-else
-  # The public npm registry needs no token. It is pinned on the command line so a stale
-  # @ursuciprian entry in someone's own ~/.npmrc cannot send this install to GitHub Packages.
-  SPEC="$NAME@$VERSION"
-  NPM_ARGS=(--registry "$NPM_REGISTRY")
-fi
-
-say "installing $SPEC into $PREFIX"
-if ! npm install --global --prefix "$PREFIX" --no-audit --no-fund --loglevel=error "${NPM_ARGS[@]}" "$SPEC" 2> "$TMP/npm.err"; then
+  (umask 077; printf '%s:registry=%s\n//npm.pkg.github.com/:_authToken=%s\n' "$SCOPE" "$GH_REGISTRY" "$token" > "$TMP/npmrc")
+  say "installing $NAME@$VERSION from GitHub Packages into $PREFIX"
+  npm_install --userconfig "$TMP/npmrc" "$NAME@$VERSION"
+}
+failed() {
+  [ "$FRESH" = 1 ] && rm -rf "$PREFIX"
   if grep -qE 'E401|E403|permission_denied|read:packages' "$TMP/npm.err"; then
-    die "the registry refused the token. For GitHub Packages, grant it once with:  gh auth refresh -s read:packages   then rerun; or install from npmjs with:  --registry npm"
+    die "GitHub Packages refused the token. Grant it once with:  gh auth refresh -s read:packages   then rerun."
+  fi
+  if grep -q 'npm.pkg.github.com.*404\|404.*npm.pkg.github.com\|does not exist under owner' "$TMP/npm.err"; then
+    die "$NAME@$VERSION was not found on GitHub Packages: either no release is published yet, or your token lacks read:packages / read access to ursuciprian/reflex (gh auth refresh -s read:packages)"
   fi
   cat "$TMP/npm.err" >&2
   die "npm install failed"
+}
+
+if [ -n "$PACKAGE" ]; then
+  say "installing $PACKAGE into $PREFIX"
+  npm_install "$PACKAGE" || failed
+elif [ "$REGISTRY" = npm ]; then
+  from_npm || failed
+elif [ "$REGISTRY" = gh ]; then
+  from_gh || failed
+elif ! from_npm; then
+  grep -qE 'E404|404 Not Found' "$TMP/npm.err" || failed
+  say "not published on npmjs; trying GitHub Packages"
+  from_gh || failed
 fi
 [ -f "$PKG_DIR/install.mjs" ] || die "package installed but $PKG_DIR/install.mjs is missing"
 
