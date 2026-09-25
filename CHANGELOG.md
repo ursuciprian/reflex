@@ -6,6 +6,12 @@ All notable changes to Reflex are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A fresh install through the `curl` installer now starts with the local engine like `npx` / `pnpm dlx`
+  / `bunx`; it used Jev (and asked for a key) because the package was already in place. Settings
+  from 0.2.0 still keep Jev.
+
 ## [0.3.0] - 2026-09-25
 
 ### Added

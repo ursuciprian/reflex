@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Run every existing selfcheck and the onboarding journey without the user's configuration or keys.
 import assert from "node:assert/strict";
-import {existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync} from "node:fs";
+import {cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync} from "node:fs";
 import {spawnSync} from "node:child_process";
 import {tmpdir} from "node:os";
 import {dirname, join} from "node:path";
@@ -36,6 +36,16 @@ try {
   const packageRoot = join(env.REFLEX_PREFIX, "lib/node_modules/@ursuciprian/reflex");
   const cli = (args, extra) => invoke("bin/reflex", args, extra);
   const picks = "claude,codex,pi,omp,opencode,hermes";
+  // The curl installer puts the package in place first, then runs its setup: still a fresh install.
+  cpSync(root, packageRoot, {recursive: true, filter: s => ![".git", "node_modules", ".serena"].some(d => s === join(root, d))});
+  const installed = args => spawnSync(process.execPath, [join(packageRoot, "bin/reflex"), ...args], {cwd: scratch, encoding: "utf8", timeout: 30000, env});
+  assert.match(success(installed(["setup", "--agents", "claude", "--dry-run"])), /local engine/, "curl path: fresh install is local");
+  // Settings written by 0.2.0 (a Keychain item, no engine) mean Jev was already in use.
+  mkdirSync(dirname(settings), {recursive: true});
+  writeFileSync(settings, JSON.stringify({keychain: "dev/example-key"}));
+  assert.match(success(installed(["setup", "--agents", "claude", "--dry-run"])), /jev engine/, "0.2.0 settings keep Jev");
+  rmSync(dirname(settings), {recursive: true, force: true});
+  rmSync(env.REFLEX_PREFIX, {recursive: true, force: true});
   const preview = success(cli(["setup", "--agents", picks, "--dry-run"]));
   assert.match(preview, /local engine/);
   assert.ok(!existsSync(env.REFLEX_PREFIX) && !existsSync(settings) && !existsSync(policy), "preview must not write");
