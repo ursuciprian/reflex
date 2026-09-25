@@ -71,3 +71,32 @@ When you change rules, questions, policy or redaction:
   `npm run eval-context` breaks if it stops existing.
 - Keep the working tree free of generated state: logs, cache, chunk stores and bundles go under
   `~/.local/state/reflex` (`REFLEX_DATA_DIR`), never in the repo.
+
+## Repository layout
+
+| File | What it is |
+|---|---|
+| `gate.mjs` | The decision core and CLI: read-only detection, rules, redaction, Jev client, cache, logs, and the Claude Code / Codex / Hermes hook adapters |
+| `instructions.mjs` | Conditional instructions: fragment discovery, path / keyword matching, one Jev request per prompt, and the Claude Code / Codex / Hermes prompt hooks |
+| `eval-instructions.mjs` | Scores fragment selection against `examples/instructions/golden.json` with the live API |
+| `examples/instructions/` | Example fragments (front end, billing, Terraform) in a fixture repo, and the golden set |
+| `adapters/` | `pi.ts` (pi and oh-my-pi extension), `pi-context.ts` (pi / oh-my-pi context layer), `opencode.js` (opencode plugin) |
+| `context.mjs` | Context layer core: visibility ladder, chunk store, per-request assembly and cache decision, `/fresh` recall, retrieval bundles |
+| `bin/reflex` | The CLI: `setup` (what `curl` / `npx` / `pnpm dlx` / `bunx` run), `check`, `report`, `install`, `uninstall`, `test`, `eval`, `version` |
+| `bin/reflex-sh` | Drop-in `bash -c` for agents without hooks |
+| `bin/reflex-review` | Background cross-model review that consumes a retrieval bundle |
+| `policy.mjs` | Policy evaluator: ordered gates over answers, no `eval`, no domain knowledge |
+| `setup/tool-gate/` | `rules.json`, `questions.json`, `policy.json`, `golden.json`, `subgoals.json`: all behaviour lives here; `fixtures/` holds the scripts the golden set runs |
+| `setup/redact.json` | The credential shapes and `KEY=` / `--password` patterns redacted before anything is judged or logged; shared by the gate and the model router, with a corpus both self-checks assert |
+| `eval.mjs` | Runs the golden set through the real gate; exits 1 on any missed risk |
+| `router/server.mjs` | Tool router: stdio MCP server (`find_tools`, `describe_tool`, `run`), Jev tool selection and argument filling, schema validation, gated shell execution, downstream MCP proxy |
+| `router/mcp.mjs` | Newline-delimited JSON-RPC over stdio, server and client side (no SDK) |
+| `router/commands.json` | Built-in command tools: name, description, argument schema, argv template |
+| `router/config.json` | Downstream stdio MCP servers whose tools join the catalog (`mcpServers`, same shape as `.mcp.json`) |
+| `router/golden.json` | Labelled intents for `npm run eval-router` (tool and arguments chosen by real Jev; nothing runs) |
+| `router/test/` | Fake downstream MCP server and stubbed Jev for `npm test` |
+| `install.mjs` | Adds / removes Reflex in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`; `--mode`, `--allow`, `--keychain`; `--context` / `--no-context` adds / removes the pi / omp context layer; `--router` prints how to register the tool router in each agent) |
+| `install.sh` | The `curl` installer: fetches the package from npm and runs `reflex setup` |
+| `report.mjs` | Summary, replay under a candidate policy, allow calibration from your approvals, Prometheus Pushgateway export |
+| `dashboards/reflex.json` | Grafana dashboard for the pushed metrics |
+| `routing/` | LiteLLM pre-call hook for security- and cost-aware model routing (`reflex_router.py`, `questions.json`, `policy.json`, `golden.json`, an example LiteLLM config) |
