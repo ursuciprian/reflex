@@ -1,6 +1,6 @@
 {
   "name": "@ursuciprian/reflex",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Risk gate for coding-agent shell commands and an injection guard for what they read: deterministic rules + TypeSafe Jev judgments + an editable policy",
   "keywords": [
     "coding-agents",
