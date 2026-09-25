@@ -33,6 +33,8 @@ second, and a policy file you can edit turns those answers into a decision.
 - Shadow mode by default: deterministic rules enforce; other decisions are logged only.
 - Local engine by default for new setups: no API key and no hosted classification.
 - `reflex doctor` checks installation; `reflex status` shows configuration and observed hook events.
+- Autonomous profile: uncertain commands go to a stronger model (System 2) before a human, and a
+  human decides asynchronously through an approval queue, with task envelopes and git checkpoints.
 - Optional: allow clearly safe commands without a prompt, deny duplicate subagent spawns, inject
   instructions only when they apply, route requests to models by sensitivity (LiteLLM), and trim
   large tool outputs (pi, oh-my-pi).
@@ -78,6 +80,8 @@ reflex doctor                                                          # local c
 reflex status                                                          # configured vs observed hooks
 reflex run "command" --cwd /path/to/work                                 # human terminal handoff
 reflex setup --mode enforce                                            # start enforcing
+reflex setup --profile autonomous                                      # System 2 and the approval queue
+reflex queue                                                           # what waits for a human
 reflex uninstall
 ```
 
@@ -116,6 +120,57 @@ with those versions to `~/.local/state/reflex/`.
 By default Reflex only adds friction: it emits `ask` or `deny` and leaves `pass` to the agent's own
 permission settings. In enforce mode, `--allow on` also lets it approve commands it judges clearly safe; see
 [docs/GUIDE.md](docs/GUIDE.md#calibrated-allow).
+
+## Autonomous agents
+
+By default every uncertain command becomes a question for a person, so the person is the
+bottleneck. The autonomous profile makes the human the last rung of a ladder instead of the first:
+
+```
+command
+  |-- System 1: rules, read-only list, fast lane, Jev + policy     -> resolves most commands
+  |-- would ask? System 2: a stronger model with the full context  -> approve, deny or human
+  `-- human: the always-human class and what System 2 hands up     -> the approval queue
+```
+
+```sh
+reflex setup --profile autonomous          # Jev, enforce, calibrated allow, System 2, queue, checkpoints
+reflex setup --profile autonomous --dry-run
+reflex envelope set "may modify this repo and the dev AWS account (profile dev); nothing in prod"
+reflex queue                               # list what waits; reflex queue approve <id> | deny <id>
+reflex checkpoints                         # recovery points taken before mutations
+```
+
+- **System 2** is picked at setup, and setup says which: the `claude` CLI when it is installed
+  (you are already signed in, so no extra key; it runs with its own system prompt replaced, no
+  tools, hooks, MCP servers or CLAUDE.md, and a pinned model, about 3k input tokens and a few tenths
+  of a cent a call), else the Anthropic Messages API when `ANTHROPIC_API_KEY`
+  is set, else none. `codex exec` works when you name it (`--judge cli --judge-cli codex`), and so
+  does any OpenAI-compatible endpoint (OpenAI, Ollama, vLLM, LM Studio, OpenRouter, or a LiteLLM
+  gateway): `--judge openai-compatible --judge-url URL --judge-model M`. An error, a timeout, an
+  unreadable answer or a spent budget goes to a human, never to an approval.
+- **Spend is small by design**: a case of at most 1,500 tokens (the static prompt first, so provider
+  prompt caching can apply), a JSON verdict of about 100 tokens with no extended thinking, a verdict
+  cache so a retry or the same command with another id never asks twice, optional cheaper tiers
+  before the frontier model, daily and per-session caps, and a breaker that pauses System 2 when
+  more than 30 % of the last hour's commands escalated.
+- **Always human**: production changes, IAM and permission changes, writing secrets, destructive
+  deletes, money and billing APIs, network egress after a suspected prompt injection, and anything a
+  deterministic rule decided. Neither System 1 nor System 2 can approve these.
+- **The approval queue** works with every agent: the agent gets a refusal that names a queue item
+  and moves on to other work; once you approve it, the identical command in the same directory and
+  session runs on the next try, once.
+- **Task envelopes** tell Jev and System 2 what this task may touch, so work inside it resolves
+  without escalation. A `.reflex/envelope.md` in a repository can only narrow that, never widen it.
+- **Checkpoints**: before a mutating command runs in a git repository, the tracked files are
+  recorded under `refs/reflex/checkpoints/` without touching the working tree or the index.
+  This is not a sandbox: untracked files, other directories and remote systems are not covered.
+
+`reflex report` shows human interventions per 100 commands, how often System 2 was asked and what it
+said, how often it agreed with Jev, tokens per call, cache hits, cost per 100 commands and how long
+queue items waited, and proposes fast-lane rules for commands System 2 keeps approving (you add them
+by hand). See
+[GUIDE: autonomous agents](docs/GUIDE.md#autonomous-agents).
 
 ## Supported agents
 

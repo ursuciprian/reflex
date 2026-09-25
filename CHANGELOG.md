@@ -6,6 +6,50 @@ All notable changes to Reflex are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Autonomous profile (`reflex setup --profile autonomous`; `supervised` stays the default): an
+  escalation ladder in which Jev resolves the confident majority, an uncertain decision goes to a
+  stronger model (System 2, `judge2.mjs`), and a human decides asynchronously through an approval
+  queue. Profiles are presets in `config.json`; flags beside a profile win; `--dry-run` prints the
+  effective settings.
+- System 2 backends: `cli` (the `claude` CLI already installed and signed in, run with no tools,
+  hooks, MCP servers, CLAUDE.md or Reflex; `codex exec` when named), `anthropic` (Messages API),
+  `openai-compatible` (OpenAI, Ollama, vLLM, LM Studio, OpenRouter, a LiteLLM gateway) and `none`.
+  Setup picks `claude`, else `anthropic` with `ANTHROPIC_API_KEY`, else `none`, and says which.
+  The CLI judge pins its model (`sonnet`) and adds `--bare` only with an API key; measured at about
+  3,100 input tokens a call against 36,826 for a naive `claude -p`. Verdicts: the first JSON object in
+  the answer, validated strictly; any error, timeout, refusal, invalid answer or spent budget goes to a human.
+- Low System 2 spend: a verdict cache keyed on the command's template (ids as slots), no re-ask while
+  a command waits in the queue, optional cheaper tiers (`judge.tiers`), a case capped at 1,500 tokens
+  with the static prompt first (Anthropic `cache_control`), 100-token JSON verdicts without extended
+  thinking, per-day and per-session caps on calls and estimated cost, and a breaker that pauses
+  System 2 when more than 30 % of the last hour's commands escalated.
+- Always-human class (`setup/tool-gate/escalation.json`, `escalation-v1`): rule outcomes, the `prod`,
+  `prod-destroy`, `exfil` and `tainted-exfil` gates, and patterns for production mutations, IAM and
+  permission changes, secrets writes, destructive deletes and money APIs; tainted egress needs a human
+  to approve. Neither System 1 nor System 2 can approve them.
+- `reflex queue` (list, show, approve, deny, clear) with an optional notification command; an approval
+  matches the identical command, cwd and session, once, within its TTL.
+- `reflex envelope` (set, show, list, clear): a task envelope per directory or session, fed to Jev
+  (`in_envelope`, questions `tool-gate-q7`) and System 2; policy `tool-gate-v6` gains the
+  `repo-envelope`, `off-envelope` and `in-envelope` gates. `.reflex/envelope.md` in a repository can
+  only narrow (`repo_forbids`).
+- `reflex checkpoints` (list, restore): recovery points under `refs/reflex/checkpoints/` before a
+  mutating command in a git repository, without touching the working tree or the index.
+- `reflex report`: human interventions per 100 commands, System 2's escalation rate, verdicts,
+  agreement with Jev, tokens per call, cache hits, cost per 100 commands, queue waits, fast-lane
+  candidates from repeated System 2 approvals (never added automatically); System 2 verdicts become
+  calibration labels. `reflex status` shows the profile, System 2's reachability without a paid
+  call, the budget, the breaker and the queue.
+- `npm run eval-ladder`: 33 commands labelled with their expected resolver, Jev live and an
+  approve-everything stub System 2; fails on an unsafe approval or an oversized case.
+
+### Fixed
+
+- Claude Code: the installer wrote `Write(path)` permission rules, which Claude Code ignores (and
+  warns about); only `Edit(path)` rules are written now, and old `Write(...)` entries are removed.
+
 ## [0.4.0] - 2026-09-25
 
 ### Fixed
@@ -45,6 +89,14 @@ All notable changes to Reflex are documented here. The format follows
 - Durable user policy and settings that survive upgrades and uninstall.
 - `reflex run` for a human terminal handoff where an agent cannot display an approval dialog.
 - An isolated full-suite runner and onboarding/adapter integration checks; macOS CI coverage.
+
+### Changed
+
+- With System 2 on, the gate hooks get the judge's timeout plus 30 s (Claude Code, Codex, Hermes,
+  opencode; pi and oh-my-pi up to 29 s), since a hook timeout lets the command through.
+- Rules `rules-v11`: `reflex queue approve|deny|clear`, `reflex envelope set|clear` and
+  `reflex checkpoints restore` are tamper; `reflex status`, `queue list|show`, `envelope show` and
+  `checkpoints list` are fast lane.
 
 ### Fixed
 

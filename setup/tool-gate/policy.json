@@ -1,6 +1,6 @@
 {
   "name": "Agent tool gate",
-  "version": "tool-gate-v5",
+  "version": "tool-gate-v6",
   "subject": "Shell commands an agent wants to run, gated by risk. The gate tightens the agent's own permissions; it loosens them only through the opt-in allow gate (REFLEX_ALLOW=on, enforce mode).",
   "fallback": "ask",
   "params": {
@@ -102,6 +102,22 @@
       "max": 1,
       "step": 0.05,
       "default": 0.6
+    },
+    "envelopeAt": {
+      "label": "Inside the task envelope at least",
+      "min": 0,
+      "max": 1,
+      "step": 0.05,
+      "default": 0.8,
+      "note": "How sure Jev must be that a non-production command is inside the user's task envelope (reflex envelope) for it to pass without escalation."
+    },
+    "envelopeFloor": {
+      "label": "Outside the task envelope below",
+      "min": 0,
+      "max": 1,
+      "step": 0.05,
+      "default": 0.3,
+      "note": "A mutation Jev places outside the user's task envelope asks (System 2 in the autonomous profile)."
     }
   },
   "flags": {
@@ -111,6 +127,10 @@
     },
     "taintStrict": {
       "label": "Stricter after a suspected prompt injection",
+      "default": true
+    },
+    "envelope": {
+      "label": "Use the task envelope",
       "default": true
     }
   },
@@ -196,6 +216,33 @@
       "outcome": "ask",
       "detail": "tainted, on_task {on_task}",
       "rule": "does not clearly match the stated task, in a session that read a suspected prompt injection"
+    },
+    {
+      "id": "repo-envelope",
+      "label": "Ruled out by the repository?",
+      "enabled_when": "$envelope",
+      "test": "repo_envelope >= 0.5 and repo_forbids >= 0.5",
+      "outcome": "ask",
+      "detail": "repo_forbids {repo_forbids}",
+      "rule": "the repository's envelope (.reflex/envelope.md) rules this out"
+    },
+    {
+      "id": "off-envelope",
+      "label": "Outside the task envelope?",
+      "enabled_when": "$envelope",
+      "test": "envelope >= 0.5 and mutates >= 0.5 and in_envelope < $envelopeFloor",
+      "outcome": "ask",
+      "detail": "in_envelope {in_envelope}",
+      "rule": "outside the task envelope"
+    },
+    {
+      "id": "in-envelope",
+      "label": "Non-production work inside the task envelope?",
+      "enabled_when": "$envelope",
+      "test": "envelope >= 0.5 and in_envelope >= $envelopeAt and env == 'nonprod' and exfil < $exfilAt and blast < $denyAt",
+      "outcome": "pass",
+      "detail": "in_envelope {in_envelope}, {env}, blast {blast}",
+      "rule": "inside the task envelope: {env}, blast {blast}"
     },
     {
       "id": "off-task",

@@ -12,11 +12,12 @@
 6. [Data handling](#data-handling)
 7. [Safety properties and limits](#safety-properties-and-limits)
 8. [Injection guard](#injection-guard)
-9. [Conditional instructions](#conditional-instructions)
-10. [Tool router](#tool-router)
-11. [Model routing](#model-routing)
-12. [Context layer (pi and oh-my-pi)](#context-layer-pi-and-oh-my-pi)
-13. [Where this goes next](#where-this-goes-next)
+9. [Autonomous agents](#autonomous-agents)
+10. [Conditional instructions](#conditional-instructions)
+11. [Tool router](#tool-router)
+12. [Model routing](#model-routing)
+13. [Context layer (pi and oh-my-pi)](#context-layer-pi-and-oh-my-pi)
+14. [Where this goes next](#where-this-goes-next)
 
 ## Local and hosted operation
 
@@ -442,6 +443,12 @@ and [confidence](https://docs.typesafe.ai/confidence).
   its files 0600, and it is pruned (see *Context layer*). Bundles and reviews are written 0600: they
   hold the unredacted diff and code. The reviewer command you configure receives the unredacted diff
   and related code, because it is your own model.
+- **System 2** (autonomous profile), per escalated command: the redacted command, the cwd, the
+  environment names, System 1's answers and rule, the task envelope, one line of intent and the
+  relevant lines of the script it runs (never a credentials file), at most 1,500 tokens, to the
+  backend you chose: your own `claude` or `codex` CLI (and so its provider), the Anthropic API, or the
+  OpenAI-compatible endpoint you configured. The approval queue keeps the redacted command locally
+  (0600) for you to review; `judge.jsonl` keeps hashes and the verdict.
 - **Locally**, logs contain the same redacted data and stay in `~/.local/state/reflex/`. Trace and
   feedback files rotate at 50 MB. Command output is never stored.
 
@@ -451,6 +458,9 @@ and [confidence](https://docs.typesafe.ai/confidence).
   fail to add one; it cannot remove one that your permission rules require. With
   `REFLEX_ALLOW=on` a wrong answer can remove one, for the narrow allow gate only: calibrate in
   shadow first.
+- In the autonomous profile an `allow` can also come from System 2's approve or a human's queue
+  approval, never for a rule outcome, the always-human class or a tainted session's egress; its
+  invariants and their checks are in [Autonomous agents](#autonomous-agents).
 - A Jev failure or timeout gives the policy's `fallback` (`ask`) in enforce mode.
 - An internal error (bad setup file, unreadable cache) returns the policy fallback (`ask`) in
   enforce mode and `pass` in shadow mode. Incomplete Jev answers count as an error, never as "no".
@@ -655,6 +665,271 @@ oh-my-pi and Hermes (and Hermes starts a new one after compressing the context),
 cross between a parent and its subagents there. Codex fires no PostToolUse for a failed tool or an
 MCP error result, and scans only the last chunk of a long-running command. In Claude Code, `WebFetch`
 hands the hook the fetch model's summary of the page, not the page.
+
+## Autonomous agents
+
+In the supervised profile (the default) every uncertain command becomes an `ask`, and an ask waits
+for a person: the person is the bottleneck. The autonomous profile turns the human into the last
+rung of an escalation ladder:
+
+```
+command
+  |-- System 1: read-only list, rules, fast lane, Jev + policy   -> pass / allow / deny (most commands)
+  |-- would be ask, not always-human: System 2                     -> approve / deny / human
+  `-- always-human class, or System 2 said human                   -> the approval queue (async)
+```
+
+```sh
+reflex setup --profile autonomous --dry-run     # the effective settings, nothing written
+reflex setup --profile autonomous               # engine jev, enforce, allow on, System 2, queue, checkpoints
+reflex setup --profile autonomous --mode shadow # a flag beside a profile wins: log what it would do
+reflex setup --profile supervised               # back to a human for every ask
+```
+
+A profile is a preset written to `config.json` (`profile`, `judge`, `queue`, `checkpoints` beside
+`engine`, `mode`, `allow`). `REFLEX_JUDGE`, `REFLEX_QUEUE` and `REFLEX_CHECKPOINTS` (`on` / `off`)
+override one session; `reflex run` turns all three off, since a person is at that terminal.
+`autonomy.mjs` holds the ladder, the queue, envelopes and checkpoints; `judge2.mjs` System 2;
+`setup/tool-gate/escalation.json` the always-human class and System 2's prompt.
+
+### System 2
+
+A decision that would be `ask` goes to a stronger model with what Reflex knows about it, and one
+structured answer comes back: `{"verdict": "approve" | "deny" | "human", "confidence": 0..1,
+"reason": "one line"}`. Approve becomes `allow` (subject to `REFLEX_ALLOW` and the same held prompts
+as calibrated allow: an unsandboxed retry and plan mode keep theirs), deny becomes `deny` with the
+reason, human goes to the queue.
+
+**Backends** (`judge.backend`):
+
+| Backend | What runs | Key |
+|---|---|---|
+| `cli` | `claude -p`, or `codex exec` when you name it | none: the CLI you are already signed in to |
+| `anthropic` | `POST <url>/v1/messages` (`anthropic-version: 2023-06-01`) | `ANTHROPIC_API_KEY`, or `judge.key_env` / `judge.keychain` |
+| `openai-compatible` | `POST <url>/v1/chat/completions`: OpenAI, Ollama, vLLM, LM Studio, OpenRouter, a LiteLLM gateway | `judge.key_env` / `judge.keychain`, or none for a keyless endpoint |
+| `none` | nothing: uncertain decisions go to a human | |
+
+Setup picks the default and says which: the `claude` CLI when it is on `PATH`, else `anthropic` when
+`ANTHROPIC_API_KEY` is set, else `none`. `--judge <backend>` overrides; an OpenAI-compatible endpoint
+is never guessed. The CLI judge runs in a fresh empty directory (a project's own settings, hooks and
+MCP servers are not loaded), with Reflex off in its environment (`REFLEX_MODE`, `REFLEX_GUARD`,
+`REFLEX_JUDGE`, `REFLEX_QUEUE`, `REFLEX_CHECKPOINTS` all `off`, so a Reflex hook in that session does
+nothing and cannot recurse) and with every tool off:
+
+- `claude -p --output-format json --tools "" --system-prompt <judge prompt> --strict-mcp-config
+  --settings '{"disableAllHooks":true}' --disable-slash-commands --no-session-persistence
+  --model sonnet`, plus `CLAUDE_CODE_DISABLE_CLAUDE_MDS`, `_AUTO_MEMORY`, `_GIT_INSTRUCTIONS`,
+  `_BUNDLED_SKILLS`, `_ATTACHMENTS`, `_THINKING` and `_NONESSENTIAL_TRAFFIC` in its environment, so its
+  own system prompt, tool definitions, CLAUDE.md and skills stay out of the call. The model is always
+  pinned (`judge.model`, `sonnet` by default): unpinned, `claude -p` uses your default model. `--bare`
+  (leaner still) is added only when `ANTHROPIC_API_KEY` is set, because it never reads a subscription
+  login.
+- `codex exec --sandbox read-only --ignore-user-config --ignore-rules --ephemeral --skip-git-repo-check
+  --disable shell_tool --disable unified_exec --disable hooks …  --output-schema <verdict> -o <file> -`.
+  `codex exec` cannot replace its base instructions, so each call carries them: that is why it is
+  never picked on its own.
+
+**Spend is small by design.**
+
+- *Fewer calls.* A verdict cache (`judge-cache.json`, `judge.cache_ttl_hours`, 12 h) keyed on the
+  command's template (the redacted command with UUIDs, hex ids, timestamps and numbers of 4+ digits
+  as slots; names, paths and small numbers are not slots, since `rm -rf build` and `rm -rf src`,
+  `--replicas=0` and `--replicas=3` are different decisions), the cwd, the environment names, the
+  envelope, the scripts' contents, the taint and egress state, the policy gate that asked and the
+  versions of the policy, the escalation file and the judge. Only answers that parsed are cached. A
+  retry of a command already waiting in the queue never asks again. Optional tiers (`judge.tiers`,
+  cheapest first) ask a small model first; its deny or confident approve stands, its human, an
+  unsure lean or an error goes up a tier.
+- *Fewer tokens per call.* The static prompt goes first (for Anthropic marked `cache_control`; an
+  OpenAI-compatible server caches a repeated prefix on its own), the case last, assembled to at most
+  `judge.max_input_tokens` (1,500): the command, the cwd, the environment names, System 1's answers,
+  the envelope, the last line of the agent's intent, and from the script it runs only the lines that
+  share words with the command and intent or look like they change something (numbered, at most 24).
+  What does not fit is cut, least useful first, and the case says what was cut. The answer is JSON
+  in `judge.max_tokens` (100), with extended thinking off (`judge.thinking: "disabled"`; set it to
+  `null` for a model that rejects that).
+- *Caps.* Per day (`budget.calls` 200, `budget.usd` $5) and per agent session (`session_calls` 40,
+  `session_usd` $1). The cost is estimated from the reported usage and `judge.price` (USD per million
+  input and output tokens); a CLI backend uses the cost it reports itself. A breaker pauses System 2 when more than
+  `breaker.rate` (30 %) of the commands the ladder judged in the last `breaker.window_minutes` (60),
+  and at least `breaker.min_decisions` (20), were escalated: a Jev outage or a noisy policy then fills
+  the queue instead of the bill, and `reflex status` and `reflex report` say so.
+
+Measured. On the escalation golden set the case System 2 gets is about 520 tokens (the stub judge
+counts what it was sent) and a verdict about 20 tokens out on an API backend, where `max_tokens`
+caps the output. The `claude` CLI, measured on Claude Code 2.1.282 with a subscription login:
+
+| `claude -p` call | Input tokens | Output | Cost (API prices) | Time |
+|---|---|---|---|---|
+| naive: default model (Opus), CLAUDE.md, tools, skills | 36,826 | 423 | $0.28 | 7.3 s |
+| lean flags above, `--model sonnet`, first call | ~3,100 | ~300 | $0.016 | 3 to 4 s |
+| the same, repeated (the prefix is a cache read) | ~3,100, mostly cached | ~300 | $0.004 to $0.005 | 3 to 4 s |
+
+About 2,100 of those input tokens are Claude Code's own floor, even with `--system-prompt`. The
+output is ~300 tokens for a ~40-token verdict: hidden reasoning is billed and the CLI has no
+`max_tokens`, so only an API backend caps output hard. Sonnet gave the same verdict on three
+identical runs; Opus flipped between deny and human; Haiku ignored "JSON only" (fences, an essay)
+and misread a simple case, so it is not a default tier: add a small model to `judge.tiers` only
+after it passes `npm run eval-ladder`. For a CLI backend the tokens, the cost (`total_cost_usd`, an
+API-price figure that also counts toward the budget) and the duration come from the CLI's own JSON
+output, not from an estimate. The answer parser takes the first JSON object in the answer
+(```` ```json ```` fences and trailing prose are tolerated) and validates it strictly.
+
+**Everything else is human.** An HTTP or CLI error, a timeout, a refusal, a truncated or unparsable
+answer (no JSON object, or a first object without exactly those three keys and valid values), an approve
+below `judge.min_confidence` (0.8), a missing key or CLI, a spent budget or cap, an open breaker:
+the decision goes to the queue, never to an approval.
+
+**What it sees.** The redacted command, the cwd, the environment names, System 1's answers and the
+rule that asked, the envelope, one line of intent and the relevant lines of the script it runs,
+never a credentials file; `judge2.mjs` redacts every string again before sending. `judge.jsonl` logs
+hashes of the case and command, the verdict, the redacted one-line reason, usage, cost and latency,
+never the command or the case.
+
+### The always-human class
+
+`setup/tool-gate/escalation.json` names what neither System 1 nor System 2 may approve:
+
+- every deterministic rule outcome: a rule deny stays a deny (never escalated); a rule ask
+  (tamper, secret reads, destroy, script-budget) goes to a human;
+- the policy gates `prod`, `prod-destroy`, `exfil` and `tainted-exfil`;
+- patterns in the rules.json shape: production mutations (asks only; its System 1 check is the
+  `prod` gate), IAM and permission changes, writing or deleting secrets, destructive deletes
+  (`rm -rf`, `git reset --hard`, `git clean -f`, a force push, `DROP` / `TRUNCATE`, cloud deletes),
+  money and billing APIs;
+- network egress in a session tainted by the injection guard: System 2 may deny it, only a human may
+  approve it; a tainted session never gets `allow`.
+
+In the autonomous profile a System 1 pass or allow that matches one of these patterns also goes to a
+human: in that profile a pass means the command runs.
+
+### The approval queue
+
+With the queue on, a human decision is a deny whose reason names a queue item:
+`… parked in the approval queue as q-3f9c0a1b2d. Continue with other work and retry this exact
+command later from the same directory`. Every adapter can show a deny, so the queue works for every
+agent. Items live in `<data>/queue/` (0700 / 0600), one JSON file each, holding the redacted command
+and the reason for review.
+
+```sh
+reflex queue                       # pending first
+reflex queue show q-3f9c0a1b2d
+reflex queue approve q-3f9c0a1b2d --ttl 2h
+reflex queue deny q-3f9c0a1b2d --reason "use the dev pipeline"
+reflex queue clear [--all]         # answered items, or everything
+```
+
+The id is a hash of the raw command, its redacted form, the resolved cwd and the session, so an
+approval matches only the identical retry, in the same directory and session. It is used once and
+expires after its TTL (`queue.ttl_hours`, 24). A deny is returned on retry with your reason until it
+expires. An approval never lifts a deterministic deny. `queue.notify` runs a command for each new
+item, detached, with `REFLEX_QUEUE_ID`, `REFLEX_QUEUE_REASON` and `REFLEX_QUEUE_AGENT` in its
+environment (never the command text), for example
+`osascript -e 'display notification "reflex: $REFLEX_QUEUE_ID" with title "Approval needed"'`,
+`terminal-notifier -message "$REFLEX_QUEUE_ID"`, or a `curl` to a webhook. Off by default.
+`reflex queue approve|deny|clear`, `reflex envelope set|clear` and `reflex checkpoints restore` are
+tamper when an agent runs them: they are parked for a human too.
+
+### Task envelopes
+
+```sh
+reflex envelope set "may modify this repo and the dev AWS account (profile dev); nothing in prod" [--cwd dir | --session id] [--ttl 8h]
+reflex envelope show [--cwd dir] ; reflex envelope list ; reflex envelope clear [--cwd dir | --session id | --all]
+```
+
+An envelope says what the agent may touch for this task: per directory (it applies below that
+directory, the nearest one wins) or per session (it wins over a directory's), for 24 h unless
+`--ttl` says otherwise. It reaches Jev as `call.envelope.user` with one more question, `in_envelope`,
+and the policy (`tool-gate-v6`) gains three gates before `off-task`: `off-envelope` (a mutation Jev
+places outside it asks, so it escalates), `in-envelope` (non-production work Jev places inside it at
+`envelopeAt`, 0.8, passes without escalation) and `repo-envelope`. Production is never passed by an
+envelope. System 2 sees the envelope too.
+
+`.reflex/envelope.md` in a repository (from the cwd up to the repository root, a regular file up to
+8 KB, not a symlink: the same places and trust as instruction fragments) is text someone else wrote.
+It reaches Jev only as `call.envelope.repo`, with its own question, `repo_forbids`, which can only
+ask. The in-envelope gate needs the user's envelope, so a repository's envelope can narrow what the
+user allowed but never widen it; System 2 is told it is untrusted and can only restrict.
+
+### Checkpoints
+
+In the autonomous profile, before an effective pass or allow of a command that is not read-only, in
+a git repository, Reflex records the tracked files: `git stash create` against a temporary copy of
+the index (it refreshes the stat cache of whatever index it uses, so never the real one), or `HEAD`
+for a clean tree, kept as `refs/reflex/checkpoints/<time>-<pid>` (the last 50 per repository; an
+unchanged tree is not recorded twice). The working tree and the index are not touched.
+
+```sh
+reflex checkpoints [--cwd dir]
+reflex checkpoints restore <name> [--cwd dir]   # checkpoints the current state first; HEAD does not move
+```
+
+Restore makes the tracked files match the checkpoint (`git restore --worktree` from it, `--staged`
+from its index) and prints how to move `HEAD` back if it moved. Not covered: untracked and ignored
+files, anything outside the repository, and anything remote (a push, a deploy, a cloud change): this
+is a recovery point, not a sandbox. Overhead: 25 to 35 ms per mutating command in a small repository;
+`git stash create` itself took 17 ms for 2,000 tracked files.
+
+### Hook time
+
+A System 2 call can take Jev's 3 s plus `judge.timeout_ms` (20 s). A hook that runs out of time
+fails open in Claude Code and Codex, so with System 2 on, setup gives their gate hooks
+`timeout_ms` + 30 s (50 s by default), Hermes the same, and the opencode plugin the same budget; pi
+and oh-my-pi stay at 29 s under omp's 30 s handler limit, where a slower judge is killed and the
+call is blocked (those adapters fail closed). Without System 2 the hooks keep their short timeouts.
+
+### Metrics
+
+`reflex report` adds a ladder section: judged commands and who resolved them, human interventions per
+100 judged commands (asks shown in the agent plus new queue items; read-only commands are not
+counted), System 2's escalation rate and verdict split, its agreement with Jev (Jev's blast of 1.5
+or less read as approve), tokens per call (in, cached, out) and cache hits, cost in the window and per
+100 commands, the day's budget, the breaker, queue waits (p50, p95), and fast-lane candidates:
+command shapes System 2 approved at least 5 times (`--candidates N`) and never denied, outside the
+always-human class and the rules, printed as a `pass` pattern for you to review. They are never added
+automatically. System 2's approve and deny are also calibration labels for System 1, next to your
+own approvals, so calibration has data from the first day. `--push` exports `reflex_ladder`,
+`reflex_system2`, `reflex_system2_tokens`, `reflex_system2_cache_hits`, `reflex_human_interventions`,
+`reflex_system2_usd` and `reflex_queue_pending`. `reflex status` shows the profile, System 2's
+reachability (a GET of the model list, never a paid call; for a CLI, that it is installed), the
+budget left, the breaker and the queue.
+
+`npm run eval-ladder` runs `setup/tool-gate/ladder.json` (33 commands labelled with their expected
+resolver) with Jev live and a stub System 2 that approves everything it is asked. It fails on any
+unsafe approval (a `safe: false` case that ended in pass or allow) and when the mean case System 2
+gets exceeds `judge.max_input_tokens`. Current result, `jev-1.13.0`: 33 of 33 resolved as labelled, 0
+unsafe approvals, 30.3 human interventions per 100 commands, System 2 asked 7 times, 516 tokens in
+and 22 out per call.
+
+### Safety invariants
+
+| Invariant | Checked by |
+|---|---|
+| A rule deny and tamper are never escalated or approved | `autonomy.mjs --selfcheck`: rule denies stay deny and tamper is parked, with a judge that approves everything, which is never called |
+| The always-human class is never approved by System 1 or System 2 | the same: 13 commands, with safe System 1 answers and an approve-everything judge; `eval-ladder` |
+| Judge errors, timeouts, over-budget and unparsable answers go to a human, never allow | `judge2.mjs --selfcheck` per backend (HTTP 500, timeout, malformed, prose, extra key, refusal, low confidence, no key, budget, session cap); `autonomy.mjs` for each through the ladder; a judge that throws is the error fallback |
+| Tainted sessions: System 2 may deny, approvals of egress go to a human, no allow | `autonomy.mjs --selfcheck` |
+| The judge never sees secrets or credential-file contents | `judge2.mjs` and `autonomy.mjs` inspect what the stub and the fake CLIs received |
+| Queue approval matches exactly and expires | `autonomy.mjs --selfcheck`: another command text, cwd or session, a second use, an expired approval, a forged approval of a rule deny |
+| The CLI judge runs no tools and no Reflex | the fake `claude` and `codex` refuse to answer without the tool and hook switches, with Reflex on, or inside the project |
+| Shadow never blocks | `autonomy.mjs --selfcheck`: shadow logs what would have happened, parks nothing |
+| Checkpoints never touch the working tree or the index | `autonomy.mjs --selfcheck` compares the index file and `git status` |
+
+### Limits
+
+- System 2 is a model: with an approve-everything judge (the eval), only the rules, System 1 and
+  the always-human patterns stand between an escalated command and running. The patterns are
+  pattern matching, not a parser.
+- In the autonomous profile a `pass` usually means the command runs, because you run the agent with
+  its own prompts off or broad. Keep IAM, network controls and least-privilege credentials.
+- Queue files, envelopes, the verdict cache and checkpoints live in the data directory and the
+  repository; an agent that can write files there without going through a gated shell (a file-edit
+  tool in an agent Reflex does not guard) could forge them. The Claude Code install asks before
+  editing the data directory; other agents rely on their own permissions.
+- The template cache can reuse a verdict for a command that differs only in an id; that is the
+  point, and also the ceiling: an id that decides safety (a resource named by a UUID) shares a
+  verdict. Lower `judge.cache_ttl_hours` or set it to 0 if that matters to you.
+- CLI token usage was not measured live here; `reflex report` shows it from the CLI's own usage.
 
 ## Conditional instructions
 

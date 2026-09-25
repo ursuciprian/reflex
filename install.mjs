@@ -20,7 +20,7 @@ import {execFileSync} from "node:child_process";
 import {homedir} from "node:os";
 import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
-import {USER_CONFIG, USER_CONFIG_FILE, USER_CONFIG_ERROR} from "./gate.mjs";
+import {USER_CONFIG, USER_CONFIG_FILE, USER_CONFIG_ERROR, judgeSettings} from "./gate.mjs";
 
 const argv = process.argv.slice(2);
 const opt = (n, d) => {
@@ -59,7 +59,14 @@ function writeFile(f, text) {
   writeFileSync(f, text);
 }
 const has = bin => { try { execFileSync("which", [bin], {stdio: "ignore"}); return true; } catch { return false; } };
-const fill = src => src.replaceAll("__REFLEX_GATE__", GATE).replaceAll("__REFLEX_NODE__", NODE)
+// With System 2 on, one gate call can take Jev's 3 s plus the judge's timeout. A hook that runs out
+// of time fails open in Claude Code and Codex, so the gate hooks get that time and 30 s more; pi and
+// omp stay under omp's 30 s handler limit (a judge killed there blocks: those adapters fail closed).
+// Sized from the saved settings only (not this shell's REFLEX_JUDGE); one deadline covers every tier.
+const JUDGE = judgeSettings(USER_CONFIG.judge);
+const GATE_TIMEOUT = JUDGE.enabled ? Math.ceil(JUDGE.timeout_ms / 1000) + 30 : 0;
+const fill = src => src.replaceAll("__REFLEX_GATE_TIMEOUT_MS__", String(GATE_TIMEOUT ? Math.min(GATE_TIMEOUT * 1000, src.includes("pi.on(") ? 29_000 : 120_000) : 0))
+  .replaceAll("__REFLEX_GATE__", GATE).replaceAll("__REFLEX_NODE__", NODE)
   .replaceAll("__REFLEX_MODE__", MODE).replaceAll("__REFLEX_ALLOW__", ALLOW);
 
 // Remove only Reflex's hook entries; a matcher group left empty is dropped, other hooks stay.
@@ -105,16 +112,18 @@ const AGENTS = {
     stripOurs(s.hooks);
     // The agent must not quietly edit its own gate or its settings; a human confirms each change.
     // ~/.config/reflex holds personal instruction fragments, injected into every repo's sessions.
-    const guard = [REPO, process.env.REFLEX_DATA_DIR ?? join(process.env.XDG_STATE_HOME ?? join(HOME, ".local/state"), "reflex"), dirname(USER_CONFIG_FILE)]
-      .flatMap(d => { const p = d.replace(HOME, "~"); return [`Edit(${p}/**)`, `Write(${p}/**)`]; })
-      .concat(["Edit(~/.claude/settings*.json)", "Write(~/.claude/settings*.json)"]);
+    // Edit(path) rules cover every file-editing tool; Claude Code ignores Write(path) rules and warns
+    // about them, so earlier installs' Write(...) entries are removed here too.
+    const paths = [REPO, process.env.REFLEX_DATA_DIR ?? join(process.env.XDG_STATE_HOME ?? join(HOME, ".local/state"), "reflex"), dirname(USER_CONFIG_FILE)]
+      .map(d => `${d.replace(HOME, "~")}/**`).concat(["~/.claude/settings*.json"]);
+    const guard = paths.map(p => `Edit(${p})`), legacy = paths.map(p => `Write(${p})`);
     s.permissions ??= {};
-    s.permissions.ask = (s.permissions.ask ?? []).filter(r => !guard.includes(r));
+    s.permissions.ask = (s.permissions.ask ?? []).filter(r => !guard.includes(r) && !legacy.includes(r));
     if (s.env?.REFLEX_MODE) delete s.env.REFLEX_MODE;
     if (s.env?.REFLEX_ALLOW) delete s.env.REFLEX_ALLOW;
     if (!UNINSTALL) {
       // Task|Agent: subgoal dedup before a subagent is spawned, and its PostToolUse marks it launched
-      s.hooks.PreToolUse = [...(s.hooks.PreToolUse ?? []), group("Bash|Task|Agent", "--claude", 10)];
+      s.hooks.PreToolUse = [...(s.hooks.PreToolUse ?? []), group("Bash|Task|Agent", "--claude", GATE_TIMEOUT || 10)];
       for (const ev of ["PostToolUse", "PostToolUseFailure", "PermissionDenied"])
         s.hooks[ev] = [...(s.hooks[ev] ?? []), group("Bash|Task|Agent", "--claude-post", 5)];
       // records that Claude Code showed its own dialog (never answers it): calibration and rejected spawns
@@ -135,7 +144,7 @@ const AGENTS = {
     stripOurs(s.hooks);
     if (!UNINSTALL) {
       // spawn_agent: subgoal dedup before a subagent is spawned, and its PostToolUse marks it launched
-      s.hooks.PreToolUse = [...(s.hooks.PreToolUse ?? []), group("^(Bash|spawn_agent)$", "--codex", 15)];
+      s.hooks.PreToolUse = [...(s.hooks.PreToolUse ?? []), group("^(Bash|spawn_agent)$", "--codex", GATE_TIMEOUT || 15)];
       s.hooks.PostToolUse = [...(s.hooks.PostToolUse ?? []), group("^(Bash|spawn_agent)$", "--codex-post", 5)];
       s.hooks.PostToolUse.push(guardGroup(CODEX_GUARD, "--codex"));
       s.hooks.UserPromptSubmit = [...(s.hooks.UserPromptSubmit ?? []), promptGroup("--codex"), promptGroup("--codex-prompt", GUARD, 5)];
@@ -161,7 +170,7 @@ const AGENTS = {
       "  pre_tool_call:",
       `    - matcher: "terminal"`,
       `      command: '${cmd("--hermes")}'`,
-      "      timeout: 15",
+      `      timeout: ${GATE_TIMEOUT || 15}`,
       "      fail_closed: true",
       `    - matcher: "delegate_task"`,          // subgoal dedup; never fail-closed, it only saves work
       `      command: '${cmd("--hermes")}'`,
@@ -236,7 +245,7 @@ if (argv.includes("--selfcheck")) {
     // claude and codex: JSON hook files shared with other tools
     const foreign = {type: "command", command: "/usr/local/bin/other-hook", timeout: 3};
     const seeds = {
-      ".claude/settings.json": {model: "opus", env: {FOO: "1"}, permissions: {allow: ["Bash(ls)"], ask: ["Bash(rm *)"]},
+      ".claude/settings.json": {model: "opus", env: {FOO: "1"}, permissions: {allow: ["Bash(ls)"], ask: ["Bash(rm *)", "Write(~/.claude/settings*.json)"]},
         hooks: {PreToolUse: [{matcher: "Bash", hooks: [foreign]}], PermissionRequest: [{matcher: "*", hooks: [foreign]}],
                 UserPromptSubmit: [{hooks: [foreign]}]}},
       ".codex/hooks.json": {hooks: {PreToolUse: [{matcher: "^Bash$", hooks: [foreign]}], Stop: [{hooks: [foreign]}]}},
@@ -261,7 +270,8 @@ if (argv.includes("--selfcheck")) {
         const pre = hooks.PreToolUse.find(g => g.hooks.some(h => h.command.includes(q(GATE))));
         const s = JSON.parse(first);
         ok(pre.matcher === "Bash|Task|Agent" && s.model === "opus" && s.env.FOO === "1" && s.permissions.allow[0] === "Bash(ls)" &&
-           s.permissions.ask.includes("Bash(rm *)") && s.permissions.ask.some(r => r.startsWith("Edit(")), "claude: matcher, foreign settings and guard rules");
+           s.permissions.ask.includes("Bash(rm *)") && s.permissions.ask.some(r => r.startsWith("Edit(")) &&
+           !s.permissions.ask.some(r => r.startsWith("Write(")), "claude: matcher, foreign settings and guard rules (Edit only; an old Write rule is removed)");
       } else ok(hooks.PreToolUse.some(g => g.matcher === "^(Bash|spawn_agent)$"), "codex: Bash and spawn_agent");
       run("--agent", agent);
       ok(read(f) === first, `${agent}: reinstall is byte-identical`);
@@ -269,9 +279,12 @@ if (argv.includes("--selfcheck")) {
       ok(commands(read(f)).filter(c => c.includes(q(GATE))).every(c => c.includes("--mode enforce --allow on")) &&
          commands(read(f)).filter(c => c.includes(q(GATE))).length === commands(first).filter(c => c.includes(q(GATE))).length, `${agent}: mode and allow switch in place, no duplicates`);
       run("--agent", agent, "--uninstall");
-      ok(JSON.stringify(JSON.parse(read(f))) === JSON.stringify(JSON.parse(seed)), `${agent}: uninstall leaves exactly the foreign settings`);
+      // the seed's Write(...) rule came from an older Reflex install, so uninstall removes it too
+      const foreignOnly = JSON.parse(seed);
+      if (foreignOnly.permissions) foreignOnly.permissions.ask = foreignOnly.permissions.ask.filter(r => !r.startsWith("Write("));
+      ok(JSON.stringify(JSON.parse(read(f))) === JSON.stringify(foreignOnly), `${agent}: uninstall leaves exactly the foreign settings`);
       run("--agent", agent, "--uninstall");
-      ok(JSON.stringify(JSON.parse(read(f))) === JSON.stringify(JSON.parse(seed)), `${agent}: a second uninstall changes nothing`);
+      ok(JSON.stringify(JSON.parse(read(f))) === JSON.stringify(foreignOnly), `${agent}: a second uninstall changes nothing`);
     }
     // the installed Claude hook really runs: the force-push canary is denied, even in shadow mode
     put(".claude/settings.json", "{}\n");
