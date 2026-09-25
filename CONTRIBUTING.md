@@ -9,7 +9,7 @@ npm test          # offline self-checks: no network, no API key, a few seconds
 ```
 
 `npm test` runs the self-checks of every component (`policy`, `gate`, `instructions`, `install`,
-`context`, `router`, the LiteLLM router) plus the isolated onboarding journey in `test.mjs`, and is what CI runs on every PR.
+`guard`, `context`, `router`, the LiteLLM router) plus the isolated onboarding journey in `test.mjs`, and is what CI runs on every PR.
 No PR may be opened before the full offline suite passes. Record the results and any live-client
 verification limits in the PR. The integration checks cover setup previews, invalid configuration,
 upgrades, durable policy, diagnostics, local privacy, native hooks, plugin approvals and uninstall.
@@ -23,6 +23,7 @@ npm run eval-router       # router/golden.json: tool and argument choice, nothin
 npm run eval-routing      # routing/golden.json: model choice for 27 prompts
 npm run eval-context      # setup/context/golden.json: what the visibility ladder keeps visible
 npm run eval-instructions # examples/instructions/golden.json: which fragments load
+npm run eval-injection    # setup/injection/golden.json: 43 tool results, injection or not
 ```
 
 They need `TYPESAFE_API_KEY`, they are non-deterministic (Jev's answers vary run to run), and they
@@ -45,6 +46,8 @@ When you change rules, questions, policy or redaction:
 
 ## Invariants a reviewer will hold you to
 
+- **The guard only adds friction, never permission.** A finding can add a note, remove text, taint a
+  session or block a prompt; nothing it does makes the gate looser, and any error passes.
 - **The gate can only tighten.** Nothing new may emit `allow` outside the calibrated allow gate, and
   that gate stays as narrow as the checks in `gate.mjs` make it: unseen code, unsandboxed retries,
   plan mode, commands without a stated intent, redacted commands and code Jev did not see never
@@ -81,6 +84,8 @@ When you change rules, questions, policy or redaction:
 | File | What it is |
 |---|---|
 | `gate.mjs` | The decision core and CLI: read-only detection, rules, redaction, Jev client, cache, logs, and the Claude Code / Codex / Hermes hook adapters |
+| `guard.mjs` | Injection guard: detectors, one Jev request per tool result, the policy, rewriting, taint, credential checks on prompts, the Claude Code / Codex / Hermes hook adapters, `--scan` / `--prompt` for the plugins, `--check` (`reflex scan`) and `--eval` |
+| `setup/injection/` | `detectors.json`, `questions.json`, `policy.json` (including `sources`: which tool results are inspected), `golden.json` |
 | `instructions.mjs` | Conditional instructions: fragment discovery, path / keyword matching, one Jev request per prompt, and the Claude Code / Codex / Hermes prompt hooks |
 | `eval-instructions.mjs` | Scores fragment selection against `examples/instructions/golden.json` with the live API |
 | `examples/instructions/` | Example fragments (front end, billing, Terraform) in a fixture repo, and the golden set |

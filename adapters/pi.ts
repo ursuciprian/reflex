@@ -8,6 +8,12 @@
 // before_agent_start runs once per user prompt: instructions.mjs picks the conditional instruction
 // fragments that apply, and they are appended to that turn's system prompt, so they are back on
 // every prompt where the condition holds and never lost to compaction. Any failure adds nothing.
+//
+// Injection guard (guard.mjs): tool_result sends each result of a tool that can carry third-party
+// text to the guard; a block replaces the result's text with the neutralised text (tool_result
+// may patch content), a warn appends a note. input checks each prompt for pasted credentials; a
+// block drops it (pi: {action: "handled"}, omp: {handled: true}) and says why in a notification.
+// Any failure leaves the result or prompt as it was.
 import {spawn} from "node:child_process";
 
 const GATE = process.env.REFLEX_GATE ?? "__REFLEX_GATE__";
@@ -16,6 +22,9 @@ const MODE = process.env.REFLEX_MODE ?? "__REFLEX_MODE__";
 const ALLOW = process.env.REFLEX_ALLOW ?? "__REFLEX_ALLOW__";
 const AGENT = "__REFLEX_AGENT__";
 const INSTRUCTIONS = GATE.replace(/gate\.mjs$/, "instructions.mjs");
+const GUARD = GATE.replace(/gate\.mjs$/, "guard.mjs");
+// Tools whose results are the user's own work, never third-party text: not sent to the guard.
+const LOCAL_TOOLS = new Set(["edit", "write", "grep", "find", "ls", "task", "todo", "todo_write", "goal", "ask"]);
 
 // pass and allow both run: pi and omp have no prompt of their own for bash to skip.
 type Decision = {effective: "pass" | "allow" | "ask" | "deny"; reason?: string};
@@ -69,7 +78,39 @@ function subgoalsOf(input: any): string[] {
 }
 const dropped = new Map<string, string>();   // toolCallId -> why some batch tasks were left out
 
+// The guard's verdict on one result -> the content the model sees, or undefined to leave it.
+async function guardResult(event: any, ctx: any) {
+  if (LOCAL_TOOLS.has(event.toolName)) return;
+  const blocks: any[] = event.content ?? [];
+  const isText = (c: any) => c?.type === "text" && typeof c.text === "string";
+  const texts = blocks.filter(isText).map(c => c.text);
+  if (!texts.some(t => t.trim())) return;
+  let d: {effective?: string; texts?: string[]; note?: string};
+  try {
+    d = JSON.parse(await gate("--scan", {agent: AGENT, tool: event.toolName, input: event.input, texts, cwd: ctx?.cwd,
+      session_id: ctx?.sessionManager?.getSessionId?.(), call_id: event.toolCallId, mcp: /^mcp[_:.]/.test(event.toolName)}, ctx?.signal, GUARD));
+  } catch { return; }
+  const note = {type: "text", text: `\n${d.note}`};
+  if (d.effective === "block" && Array.isArray(d.texts)) {
+    let i = 0;
+    return {content: [...blocks.map(c => isText(c) ? {...c, text: d.texts![i++] ?? ""} : c), note]};
+  }
+  if (d.effective === "warn") return {content: [...blocks, note]};
+}
+
 export default function (pi: any) {
+  pi.on("input", async (event: any, ctx: any) => {
+    const text = event?.text ?? event?.prompt;
+    if (typeof text !== "string" || !text.trim()) return;
+    let r: {effective?: string; reason?: string};
+    try {
+      r = JSON.parse(await gate("--prompt", {agent: AGENT, prompt: text, session_id: ctx?.sessionManager?.getSessionId?.()}, ctx?.signal, GUARD));
+    } catch { return; }
+    if (r.effective !== "block") return;
+    try { ctx?.ui?.notify?.(r.reason, "error"); } catch { /* no UI: the prompt is still dropped */ }
+    return {action: "handled", handled: true};   // pi reads action, omp reads handled
+  });
+
   pi.on("before_agent_start", async (event: any, ctx: any) => {
     let r: {text?: string};
     try {
@@ -129,10 +170,12 @@ export default function (pi: any) {
       dropped.delete(event.toolCallId);
       return {content: [...(event.content ?? []), {type: "text", text: `\n[reflex] Some tasks were not started: ${note}`}]};
     }
-    if (event.toolName !== "bash") return;
-    const text = (event.content ?? []).map((c: any) => c.text ?? "").join("");
-    const exit = typeof event.details?.exitCode === "number" ? event.details.exitCode            // omp
-      : event.isError ? Number(/Command exited with code (\d+)/.exec(text)?.[1] ?? -1) : 0;      // pi
-    gate("--record", {agent: AGENT, event: "ran", call_id: event.toolCallId, exit_code: exit});
+    if (event.toolName === "bash") {
+      const text = (event.content ?? []).map((c: any) => c.text ?? "").join("");
+      const exit = typeof event.details?.exitCode === "number" ? event.details.exitCode            // omp
+        : event.isError ? Number(/Command exited with code (\d+)/.exec(text)?.[1] ?? -1) : 0;      // pi
+      gate("--record", {agent: AGENT, event: "ran", call_id: event.toolCallId, exit_code: exit});
+    }
+    return guardResult(event, ctx);
   });
 }

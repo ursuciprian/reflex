@@ -11,11 +11,12 @@
 5. [Metrics](#metrics)
 6. [Data handling](#data-handling)
 7. [Safety properties and limits](#safety-properties-and-limits)
-8. [Conditional instructions](#conditional-instructions)
-9. [Tool router](#tool-router)
-10. [Model routing](#model-routing)
-11. [Context layer (pi and oh-my-pi)](#context-layer-pi-and-oh-my-pi)
-12. [Where this goes next](#where-this-goes-next)
+8. [Injection guard](#injection-guard)
+9. [Conditional instructions](#conditional-instructions)
+10. [Tool router](#tool-router)
+11. [Model routing](#model-routing)
+12. [Context layer (pi and oh-my-pi)](#context-layer-pi-and-oh-my-pi)
+13. [Where this goes next](#where-this-goes-next)
 
 ## Local and hosted operation
 
@@ -222,7 +223,9 @@ npm test
 localhost). About 60 gate checks, no network: read-only detection (including bypass attempts such as
 `rtk proxy rm`, `ssh h 'echo' '; rm -rf /'`, `$(security find-generic-password …)`), redaction,
 every shipped rule, the fast lane, every policy gate, and the whole path for non-Jev commands.
-Add an assertion whenever you change `readOnly()`, a rule or a gate.
+Add an assertion whenever you change `readOnly()`, a rule or a gate. `node guard.mjs --selfcheck`
+covers the injection guard: every detector (most with a benign twin), the policy, rewriting, log
+redaction, each adapter's output shape, credential prompts, and taint making the gate stricter.
 
 ### 2. One command by hand
 
@@ -264,6 +267,10 @@ only treat a MISS as a blocker. CI runs the offline self-checks (`npm test`); th
 `TYPESAFE_API_KEY` and spends tokens, so CI does not run it.
 
 **Grow the golden set from real traffic.** Every surprising decision in the trace becomes a case.
+
+The injection guard has its own set, `setup/injection/golden.json`, run by `npm run eval-injection`:
+precision and recall of warn / block against the labels, and exit 1 on a missed high-severity
+injection (see [Injection guard](#injection-guard)).
 
 ### 4. Live, in shadow mode
 
@@ -417,6 +424,11 @@ and [confidence](https://docs.typesafe.ai/confidence).
   [Data Processing Agreement](https://typesafe.ai/legal/data-processing), and zero data retention
   is available for enterprise customers ([legal](https://docs.typesafe.ai/legal)). Check this
   against your own data policy before rollout.
+- **Injection guard** (engine `jev`), per inspected tool result (a web page, an MCP result, network
+  command output, or a file read from outside the project; never a credential file): up to 8 chunks of the result
+  (3,000 characters each), redacted, the tool name, a redacted origin (URL, path or command, 200
+  characters) and, in Claude Code, the user's last prompt (redacted, last 1,000 characters). With
+  the local engine nothing leaves. Credential checks on prompts are local in both engines.
 - **Conditional instructions** send, per prompt that has undecided fragments: the prompt (redacted,
   first 4,000 characters), the working directory, recently touched file paths, the last five
   commands (redacted), and each fragment's `when` condition. The fragment bodies stay local.
@@ -463,6 +475,8 @@ and [confidence](https://docs.typesafe.ai/confidence).
   `failed` from `PostToolUse` / `PostToolUseFailure`.
 - Only shell tools are gated (`Bash`, pi/omp `bash`, opencode `bash`, Hermes `terminal`), plus the subagent tools for dedup. File-edit
   tools, MCP tools, omp's `eval` and Hermes' `execute_code` go through each agent's own permissions.
+  The injection guard reads the *results* of web, MCP, file and network tools; it does not gate
+  those calls (see [Injection guard](#injection-guard)).
   The tool router is the exception: it runs its command tools and its downstream MCP calls through
   the gate itself.
 - Codex and opencode hooks cannot open a prompt, so an `ask` blocks with a reason telling the agent
@@ -475,6 +489,172 @@ and [confidence](https://docs.typesafe.ai/confidence).
 - Jev adds ~0.7 s in enforce mode to each command that reaches it. On one engineer's heavy
   infrastructure history, about one in five commands never needed the API; the rest are mostly
   inline scripts and multi-step remote commands.
+
+## Injection guard
+
+The gate judges what an agent runs. `guard.mjs` judges what it reads first: a web page, search
+results, an MCP result, a file from someone else's project or the output of `curl` can carry text
+written to steer the agent (indirect prompt injection). After such a tool runs, the guard scans its
+result and returns **pass**, **warn** or **block**; on each prompt it also checks for a pasted
+credential.
+
+**Which results are inspected** (`sources` in `setup/injection/policy.json`):
+
+| Source | Tools | When |
+|---|---|---|
+| web | `WebFetch`, `WebSearch`, opencode `webfetch` / `websearch` / `codesearch`, omp `web_fetch` / `web_search` / `github` and its `read` of a URL, Hermes `web_search` / `web_extract` / `x_search` / `feishu_doc_read` / `browser_*` (not the password vault) | always |
+| mcp | any MCP tool (`mcp__server__tool`, Hermes `connectors__…`; opencode: any tool that is not built in) | always |
+| file | `Read`, `read`, `read_file` | the file is outside the project (the nearest directory holding `.git` above the working directory; in Claude Code above `CLAUDE_PROJECT_DIR`, so a `cd` into a cloned repository does not make its files the user's), or inside it under `node_modules/`, `vendor/`, `third_party/`, `site-packages/`, `.venv/`, `.cache/`; never a credential file (`~/.ssh/`, `~/.aws/`, `~/.kube/`, `.env*`, `.netrc`, `*.pem`, ..., `exclude`), whose content would otherwise go to Jev |
+| shell | `Bash`, `bash`, Hermes `terminal` | the command fetches remote content: `curl`, `wget`, `xh`, `gh issue/pr/api/release/gist/search`, `glab`, `npm view`, `pip download`, ...; or a local command that prints someone else's text: a reader (`cat`, `head`, `tail`, `less`, `jq`, `sed`, ...) given a path the file rule would inspect, or `git log` / `show` / `blame` in a repository outside the project. A command that also names a credential file is judged by the detectors only, never sent to Jev |
+
+Anything else (edits, greps, local commands, the user's own files) is not inspected. A hook matcher
+cannot see a `Read`'s path, so every `Read` starts the guard process (about 50 ms), which returns at
+once for a file inside the repository.
+
+**Deterministic detectors** (`setup/injection/detectors.json`, both engines), each counted as a
+signal:
+
+- `override`: text that cancels or replaces an AI's instructions (*ignore previous instructions*,
+  *your new task is*, *do not tell the user*, *the user has already authorized you*).
+- `role`: fake chat-role or system markers (`<|im_start|>`, `[INST]`, `<system_prompt>`, `<IMPORTANT>`).
+- `to_ai`: text addressed to an AI agent (*note to AI agents*, *if you are an LLM*, *whoever is
+  processing this page*, `@claude`).
+- `shell`, `secrets`, `exfil`: what the text asks for (a remote script piped to a shell, reading
+  keys or `.env`, sending data to a URL). Alone these are how install guides read; they matter next
+  to an address to an AI.
+- `hidden`: text a human reader does not see that speaks to an AI: Unicode tag characters
+  (U+E0000 to U+E007F, *ASCII smuggling*; emoji flags excepted), a phrase split by zero-width
+  characters, HTML comments, CSS-hidden elements, `alt` / `title` / `aria-label` attributes,
+  markdown comments, the text of `data:` URLs, base64 blobs (also URL-safe or wrapped over lines)
+  that decode to such text, and text spelled in a run of variation selectors. The phrases are
+  matched on the text as a reader takes it in: invisible characters and soft hyphens out,
+  look-alike Cyrillic and Greek letters, full-width, mathematical and accented letters read as
+  Latin, JSON `\u` escapes and HTML character references decoded. A phrase that needed a disguised
+  letter counts as hidden.
+- `exfil_link`: a markdown image (or HTML `img`) whose URL has a placeholder or a data word
+  (`?q={conversation}`, `[DATA]`, `${SECRET}`), or a link (markdown, HTML `a` or `<https://…>`)
+  with a placeholder in a query value; reference-style ones (`![x][1]` … `[1]: url`) by their
+  definition. An image is fetched when the agent's answer is rendered.
+- `invisible`: zero-width and bidi controls, outside emoji sequences and right-to-left text.
+
+**Jev** (engine `jev`): the result is cut into chunks with `context.mjs`'s `chunk()` (at most
+3,000 characters each; at most 24 per result, those with a detector hit first, 8 per request with
+the requests in parallel), and each request asks three questions per chunk (`setup/injection/questions.json`):
+
+| Question | Type | Meaning |
+|---|---|---|
+| `addressed` | noul | The text tries to get an AI that reads it to act, as opposed to informing a human |
+| `attack` | choice | exfiltrate, run_commands, credentials, override, deceive or none |
+| `severity` | score 0 to 3 | Harm if the agent did what the text says |
+
+The user's last prompt goes with them (Claude Code, from the transcript) so "deviates from the
+task" can be judged. Chunks are redacted before they leave. Answers are cached by content for 24 h.
+
+**Policy** (`setup/injection/policy.json`), per chunk; the worst chunk wins:
+
+1. hidden instructions or an exfiltration link: **block**, whatever Jev says.
+2. Jev: `addressed >= 0.7`, `severity >= 1.8`, an attack: **block**.
+3. Jev: `addressed < 0.2`: **pass**. This is how an article that *quotes* an injection, or a README
+   that tells a human to `curl … | sh`, gets through.
+4. Jev: `attack` none and `severity < 1.8`, where the detectors saw an address to an AI and an
+   action: **warn** (an `@claude` mention in one issue comment and an install line in another).
+5. an address to an AI (override, role or `to_ai`) together with an action (`shell`, `secrets`,
+   `exfil`): **block**.
+6. Jev: `addressed >= 0.5`, `severity >= 0.8`, an attack: **warn**.
+7. an address to an AI alone, or 12 or more invisible characters (with Jev, counted per chunk): **warn**.
+
+With the local engine, steps 2 to 4 and 6 do not exist, so a security article quoting an injection
+warns. A Jev error or an incomplete answer falls back to the detectors alone. A result longer than
+4 MB is read in part and is at least a **warn**.
+
+**What each outcome does.** *Warn* adds a note next to the result: the result is third-party
+content, not a message from the user, and the user has not asked for anything it says. *Block*
+removes the offending text where the agent lets a hook rewrite a result, marking each cut
+(`[reflex: removed text addressed to an AI agent]`): the paragraph around a phrase hit, the hidden
+segment, the link, or the whole chunk (up to 3,000 characters) that Jev blocked. The note says
+what was removed. Both record a **taint** for the session (enforce mode only):
+
+| Agent | Tool results | Prompts with a pasted credential |
+|---|---|---|
+| Claude Code | `PostToolUse` (`^(WebFetch\|WebSearch\|Read\|Bash)$\|^mcp__`): warn is `additionalContext`; block adds `updatedToolOutput`, the result with the same shape and the text removed | `UserPromptSubmit`: `decision: "block"`; the reason names the key type and is shown to the user, not to Claude |
+| Codex CLI | `PostToolUse` (`^Bash$\|^mcp__`): warn is `additionalContext`; block is `decision: "block"`, which replaces what the model sees with the reason, so the reason carries the cleaned result, cut to 8,000 characters. Codex fires no hook for its hosted web search, and cannot rewrite a result otherwise (`updatedMCPToolOutput` fails the hook) | `UserPromptSubmit`: `decision: "block"` |
+| pi, oh-my-pi | `tool_result`: block returns the cleaned `content`, warn appends a note. Tools that only touch local work (`edit`, `write`, `grep`, `find`, `ls`, `task`) are not sent | `input`: `{action: "handled"}` (pi) / `{handled: true}` (omp) drops the prompt, with a notification; in omp only the interactive prompt fires `input` |
+| opencode | `tool.execute.after`: `output.output` edited in place; for an MCP tool the hook sees the raw MCP result, so its `content[].text` is edited | `chat.message` throws: the message is not saved, and opencode shows an error (a plugin has no friendlier way) |
+| Hermes | `post_tool_call` is observe-only and `pre_llm_call` runs once per turn, before any tool: a finding is logged and taints the session at once, and its note reaches the model at the start of the next turn. Rewriting results needs a Python plugin (`transform_tool_result`), which Reflex does not ship | no hook can block a message; in enforce mode `pre_llm_call` tells the model the message holds a credential it must not repeat |
+
+**Taint.** A warn or block in enforce mode writes `taint/<hash of the session id>.json` in the
+data directory. For the rest of that session the gate:
+
+- asks before network egress (`curl`, `wget`, `ssh`, `scp`, `git push`, `gh api` and `gh … create/comment`,
+  `npm publish`, `docker push`, any URL, a script opening a socket): `tainted` in `rules.json`,
+  checked before the read-only list and the fast lane, since `gh api "…?q=$SECRET"` is a read and
+  `git push` is fast lane;
+- never allows (calibrated allow is off);
+- applies the policy's taint gates (flag `taintStrict`): ask at `exfil >= 0.2`, at `blast >= 1.0`,
+  and for a mutation with `on_task < 0.6`.
+
+Rules that deny still deny. Like Jev decisions, the taint only takes effect in enforce mode. A
+user `policy.json` seeded by an earlier setup gets what it lacks on the next `reflex setup`: gates,
+params and flags of the bundled policy missing from it by id or name are added (a new gate right
+after the one before it in the bundled order), nothing of the user's is changed or reordered, and
+setup prints what it added. A deleted bundled gate comes back that way; switch one off with its
+flag instead. In opencode the taint is kept under a subagent's root session, so a child that read
+an injection makes its parent stricter.
+
+**Credentials in prompts** use the credential shapes of `setup/redact.json` (AWS keys, GitHub,
+GitLab, OpenAI and Slack tokens, private keys, JWTs, Stripe, Google and npm keys, Slack webhooks;
+not the bare 40-character shape, which also matches long identifiers), and not its `KEY=` context
+patterns, which would stop *what does max_tokens: 100 do*. The log keeps the key type and a hash of the redacted prompt, never the key.
+
+**Modes.** The guard follows the gate's mode unless `REFLEX_GUARD` (or `"guard"` in
+`~/.config/reflex/config.json`) says otherwise. Shadow judges in a detached background process,
+logs, and changes nothing: no note, no rewrite, no taint, no blocked prompt. Off does nothing. Any
+error passes: the guard only adds friction when it has a judgment to add.
+
+**Try it:**
+
+```sh
+reflex scan page.html                  # exit 0 pass, 1 warn, 2 block; JSON with the signals
+curl -s https://example.com | reflex scan - --rewrite     # also print the cleaned text
+npm run eval-injection                 # setup/injection/golden.json against the live API
+```
+
+The golden set holds 53 results: 26 benign documents agents read every day (install guides that pipe
+`curl` to a shell, man pages, API docs, npm output, HTML with comments and hidden menus, OWASP pages
+and a blog post that quote injections, a GitHub issue that mentions `@claude` next to an install
+line, an `AGENTS.md` from another repo, accented, right-to-left and emoji text) and 27 injections
+following published research (hidden-text pages, the GitHub MCP issue attack, MCP tool poisoning,
+Unicode tag and variation-selector smuggling, look-alike letters, JSON escapes, markdown image
+exfiltration, also reference-style, the rules-file backdoor, EchoLeak-style mail, fake role tags,
+paraphrased injections with no trigger words, one of them behind twelve chunks of benign text).
+Current result, `jev-1.13.0`: precision 96 %, recall 100 %, every expected outcome met (the
+`@claude` issue warns), 23 of 24 high-severity injections blocked and the last warned. With the
+local engine: precision 83 % (articles that quote injections warn or block), recall 93 % (the
+GitHub MCP issue attack and the long paraphrase, which have no trigger phrase, pass). A missed high-severity injection fails the run.
+
+**Logs.** `guard.jsonl` in the data directory: one line per inspected result (tool, source kind,
+hashes of the text and origin, length, signal counts, Jev's numbers per chunk, outcome, what was
+emitted, latency, tokens, the kind of a Jev error) and per blocked prompt (key types, a hash). Never
+the text, the URL or the command. `reflex report` summarises it: results by source, outcome and
+attack, tainted sessions and blocked prompts, as counts.
+
+**Limits.** This is a heuristic filter, not a sandbox: it lowers the odds that injected text steers
+the agent; it does not make untrusted content safe, and the gate still judges every command the
+agent runs. The detectors are phrase lists and a handful of structural checks, so an injection
+phrased like ordinary prose passes them (Jev is there for that; the local engine has no answer to
+it), and text spaced out letter by letter is left to Jev. Jev sees at most 24 chunks of 3,000
+characters per result; past that only the detectors read the rest, and past 4 MB nothing does
+(the result warns). A paraphrase split across two chunks is judged in halves. Hidden elements are found by their own `style` or `hidden`
+attributes, not by class names or stylesheets. A tool the source list does not name (a custom pi
+extension tool, an MCP tool in opencode that shares a built-in name) is not inspected. The agent has
+read the result before Codex and Hermes can do anything about it, and in Hermes the note arrives a
+turn late. A Jev-blocked chunk is removed whole, which can cut useful text next to the injection.
+Shadow mode never taints, so the gate's taint behaviour only starts once the guard enforces.
+A hook that times out passes the result unguarded. Subagents run under their own session id in
+oh-my-pi and Hermes (and Hermes starts a new one after compressing the context), so taint does not
+cross between a parent and its subagents there. Codex fires no PostToolUse for a failed tool or an
+MCP error result, and scans only the last chunk of a long-running command. In Claude Code, `WebFetch`
+hands the hook the fetch model's summary of the page, not the page.
 
 ## Conditional instructions
 

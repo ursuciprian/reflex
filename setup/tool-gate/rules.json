@@ -1,6 +1,6 @@
 {
-  "version": "rules-v9",
-  "note": "Deterministic and authoritative: checked before Jev, enforced even in shadow mode. Patterns are case-insensitive and run over the command plus its context (cwd=, aws_profile=, kube_context=, tf_workspace=, git_branch=). A rule fires when every pattern in `all` matches. `pass` patterns apply per segment: a command passes the fast lane when every segment is read-only or matches one. `applies_to` says what a rule reads: the command (the default) and/or the local scripts the command runs. Script rules run line by line, with the script's simple VAR=value assignments expanded and whole-line comments dropped; `whole_script` rules see the whole body. `context: false` rules read the command without the cwd=/profile context.",
+  "version": "rules-v10",
+  "note": "Deterministic and authoritative: checked before Jev, enforced even in shadow mode. Patterns are case-insensitive and run over the command plus its context (cwd=, aws_profile=, kube_context=, tf_workspace=, git_branch=). A rule fires when every pattern in `all` matches. `pass` patterns apply per segment: a command passes the fast lane when every segment is read-only or matches one. `applies_to` says what a rule reads: the command (the default) and/or the local scripts the command runs. Script rules run line by line, with the script's simple VAR=value assignments expanded and whole-line comments dropped; `whole_script` rules see the whole body. `context: false` rules read the command without the cwd=/profile context. `tainted` rules apply only in a session whose agent read a suspected prompt injection (guard.mjs); like Jev decisions, they are enforced in enforce mode only.",
   "rules": [
     {
       "id": "secret-read",
@@ -93,7 +93,7 @@
         "script"
       ],
       "all": [
-        "(/reflex(/|\\s|$)|\\.claude/(settings|hooks)|\\.codex/(hooks\\.json|config\\.toml|rules)|\\.hermes/.*config\\.yaml|opencode/(plugins?|opencode\\.jsonc?)|\\.(pi|omp)/agent/(extensions|settings)|reflex_(mode|allow))"
+        "(/reflex(/|\\s|$)|(\\.local/state|\\.config|xdg_(state|config)_home)\\b[^\\n]{0,200}\\breflex\\b|\\.claude/(settings|hooks)|\\.codex/(hooks\\.json|config\\.toml|rules)|\\.hermes/.*config\\.yaml|opencode/(plugins?|opencode\\.jsonc?)|\\.(pi|omp)/agent/(extensions|settings)|reflex_(mode|allow|guard))"
       ]
     },
     {
@@ -123,5 +123,16 @@
     "^chmod\\s+[+u]?x\\s[^<>`$]*$",
     "^git\\s+(add|commit|stash(\\s+push)?|checkout\\s+-b|switch(\\s+-c)?|restore\\s+--staged)\\b[^<>`$]*$",
     "^git\\s+push\\s+(-u\\s+|--set-upstream\\s+)?origin\\s+(?!-)(?!(main|master|release|prod)\\b)[\\w./-]+$"
+  ],
+  "tainted": [
+    {
+      "id": "tainted-egress",
+      "outcome": "ask",
+      "rule": "network egress in a session that read a suspected prompt injection",
+      "all": [
+        "\\b(curl|wget|nc|ncat|netcat|socat|scp|sftp|rsync|ftp|telnet|ssh|xh|httpie)\\b|https?://|\\bgit\\s+(push|send-email|remote\\s+(add|set-url))\\b|\\bgh\\s+(api|gist|issue\\s+(create|comment|edit)|pr\\s+(create|comment|review|edit)|release\\s+(create|upload)|repo\\s+create)\\b|\\b(npm|pnpm|yarn|bun)\\s+publish\\b|\\b(docker|podman)\\s+push\\b|\\baws\\s+s3\\s+(cp|sync|mv)\\b|\\bopen\\s+[\"']?https?:|\\b(python[\\d.]*|node|ruby|perl|php)\\b[^\\n]{0,300}(socket|urllib|requests\\.|fetch\\(|http\\.request|Net::HTTP)"
+      ],
+      "context": false
+    }
   ]
 }

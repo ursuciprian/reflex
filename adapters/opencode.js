@@ -7,6 +7,12 @@
 // Conditional instructions: chat.message sees each new user message and picks the fragments that
 // apply; experimental.chat.system.transform appends them to the system prompt of every model call
 // in that session until the next user message, so compaction cannot drop them.
+//
+// Injection guard (guard.mjs): tool.execute.after sends each result of a tool that can carry
+// third-party text to the guard and edits it in place (output.output; an MCP tool's hook output is
+// the raw CallToolResult, so its content[].text): block replaces the offending text, warn appends
+// a note. chat.message checks each prompt for pasted credentials; a block throws, which is the only
+// way a plugin can stop a message in opencode 1.4 (it surfaces as an error).
 import {spawnSync} from "node:child_process";
 
 const GATE = process.env.REFLEX_GATE ?? "__REFLEX_GATE__";
@@ -14,18 +20,68 @@ const NODE = process.env.REFLEX_NODE ?? "__REFLEX_NODE__";
 const MODE = process.env.REFLEX_MODE ?? "__REFLEX_MODE__";
 const ALLOW = process.env.REFLEX_ALLOW ?? "__REFLEX_ALLOW__";
 const INSTRUCTIONS = GATE.replace(/gate\.mjs$/, "instructions.mjs");
+const GUARD = GATE.replace(/gate\.mjs$/, "guard.mjs");
 const selected = new Map();   // sessionID -> injected text. ponytail: never pruned; one short string per session.
+// Built-in tools: those that only touch the user's own work are not sent to the guard; any tool
+// not built in is an MCP (or plugin) tool. ponytail: a list per opencode version.
+const LOCAL_TOOLS = new Set(["edit", "write", "apply_patch", "grep", "glob", "todowrite", "task", "skill", "lsp", "invalid", "question", "plan_exit"]);
+const BUILTIN = new Set([...LOCAL_TOOLS, "bash", "read", "webfetch", "websearch", "codesearch"]);
+// A subagent (task) runs in a child session. Taint and decisions are kept under the root session,
+// so a child that read an injection makes its parent stricter and a tainted parent's children
+// start strict. ponytail: never pruned; one short string per session.
+const roots = new Map();
+async function rootOf(client, id) {
+  if (!id || !client?.session?.get) return id;
+  if (!roots.has(id)) {
+    let root = id;
+    try {
+      for (let s = id, i = 0; s && i < 8; i++) {
+        const r = await Promise.race([client.session.get({path: {id: s}}), new Promise(res => setTimeout(res, 1000).unref?.())]);
+        if (!r) return root;   // timed out: not cached, asked again next time
+        const parent = (r.data ?? r)?.parentID;
+        if (!parent) break;
+        root = s = parent;
+      }
+    } catch { return root; }
+    roots.set(id, root);
+  }
+  return roots.get(id);
+}
+
+// The guard's verdict on one result, applied to the hook's output in place.
+function guardResult(input, output, directory, session_id) {
+  if (LOCAL_TOOLS.has(input.tool) || !output) return;
+  const parts = typeof output.output === "string" ? null : Array.isArray(output.content) ? output.content : null;
+  const slots = parts ? parts.flatMap(c => typeof c?.text === "string" ? [[c, "text"]] : typeof c?.resource?.text === "string" ? [[c.resource, "text"]] : [])
+    : typeof output.output === "string" ? [[output, "output"]] : [];
+  const texts = slots.map(([o, k]) => o[k]);
+  if (!texts.some(t => t.trim())) return;
+  let d;
+  try {
+    d = JSON.parse(gate("--scan", {agent: "opencode", tool: input.tool, input: input.args, texts, cwd: directory,
+      session_id, call_id: input.callID, mcp: !BUILTIN.has(input.tool)}, GUARD));
+  } catch { return; }
+  if (d.effective === "block" && Array.isArray(d.texts)) slots.forEach(([o, k], i) => { o[k] = d.texts[i] ?? ""; });
+  if (d.effective === "block" || d.effective === "warn") {
+    if (parts) parts.push({type: "text", text: d.note});
+    else output.output += `\n\n${d.note}`;
+  }
+}
 
 function gate(flag, payload, script = GATE) {
   const args = script === GATE ? [script, flag, "--mode", MODE, "--allow", ALLOW] : [script, flag, "--mode", MODE];
-  const r = spawnSync(NODE, args, {input: JSON.stringify(payload), encoding: "utf8", timeout: 10000});
+  const r = spawnSync(NODE, args, {input: JSON.stringify(payload), encoding: "utf8", timeout: 15000});   // the guard: an 8 s Jev budget plus node start
   return r.stdout;
 }
 
-export const Reflex = async ({directory}) => ({
+export const Reflex = async ({directory, client}) => ({
   "chat.message": async (input, output) => {
     const prompt = (output.parts ?? []).filter(p => p.type === "text" && !p.synthetic).map(p => p.text).join("\n");
     if (!prompt.trim()) return;
+    let p = null;
+    try { p = JSON.parse(gate("--prompt", {agent: "opencode", prompt, session_id: input.sessionID}, GUARD)); }
+    catch { /* the credential check could not run: the prompt goes on */ }
+    if (p?.effective === "block") throw new Error(p.reason);
     let r = null;
     try { r = JSON.parse(gate("--select", {agent: "opencode", prompt, cwd: directory, session_id: input.sessionID}, INSTRUCTIONS)); }
     catch { /* instructions are advisory: nothing is injected */ }
@@ -52,7 +108,7 @@ export const Reflex = async ({directory}) => ({
     let d;
     try {
       d = JSON.parse(gate("--decide", {agent: "opencode", command: output.args?.command,
-        cwd: output.args?.workdir || directory, session_id: input.sessionID, call_id: input.callID}));
+        cwd: output.args?.workdir || directory, session_id: await rootOf(client, input.sessionID), call_id: input.callID}));
     } catch {
       // The gate itself failed. Only block when enforcing; shadow mode must never get in the way.
       if (MODE === "enforce") throw new Error("reflex: gate unavailable, blocked (fail-closed)");
@@ -65,8 +121,8 @@ export const Reflex = async ({directory}) => ({
   "tool.execute.after": async (input, output) => {
     // A task that ran is a launched subgoal: dedup offers only those.
     if (input.tool === "task") return void gate("--record", {agent: "opencode", event: "ran", session_id: input.sessionID, call_id: input.callID});
-    if (input.tool !== "bash") return;
-    gate("--record", {agent: "opencode", event: "ran", session_id: input.sessionID, call_id: input.callID,
-                      exit_code: output?.metadata?.exit ?? null});
+    if (input.tool === "bash") gate("--record", {agent: "opencode", event: "ran", session_id: input.sessionID, call_id: input.callID,
+                                                 exit_code: output?.metadata?.exit ?? null});
+    guardResult(input, output, directory, await rootOf(client, input.sessionID));
   },
 });

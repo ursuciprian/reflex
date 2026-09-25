@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// What the gate has been doing, and what a policy change would do. No API calls.
+// What the gate and the injection guard have been doing, and what a policy change would do. No API calls.
 //
 //   node report.mjs                         summary of the last 7 days
 //   node report.mjs --since 30              ... of the last 30 days
@@ -126,6 +126,15 @@ console.log(best
   ? `    recommend      of ${best.n} with blast <= ${best.b} and confidence >= ${best.c}, you approved ${Math.round(100 * best.ok / best.n)}%` +
     ` -> allowBlastMax ${best.b}, allowConfidence ${best.c} (now ${pv.allowBlastMax}, ${pv.allowConfidence})`
   : `    recommend      not enough data: no band with ${MIN_N}+ labelled commands approved 95%+ of the time; keep ${pv.allowBlastMax} / ${pv.allowConfidence}`);
+
+// The injection guard (guard.jsonl): counts only. Its log holds hashes and signals, never text.
+const guardRows = rows(join(CONFIG.data, "guard.jsonl")).filter(r => Date.parse(r.ts) >= since);
+const results = guardRows.filter(r => r.kind === "result"), prompts = guardRows.filter(r => r.kind === "prompt");
+console.log(`  guard        ${results.length} tool results judged · by source ${JSON.stringify(count(results, r => r.source_kind))}`);
+console.log(`    outcome      ${JSON.stringify(count(results, r => r.outcome))} · effective ${JSON.stringify(count(results, r => r.effective))} · fallbacks ${results.filter(r => r.source === "fallback").length}`);
+console.log(`    attacks      ${JSON.stringify(count(results.flatMap(r => (r.chunks ?? []).filter(c => c.attack && c.attack !== "none")), c => c.attack))} (Jev, per chunk) · rules ${JSON.stringify(count(results.filter(r => r.outcome !== "pass"), r => r.gate ?? "none"))}`);
+console.log(`    tainted      ${new Set(results.filter(r => r.tainted && r.session_id).map(r => r.session_id)).size} sessions`);
+console.log(`    credentials  ${prompts.filter(r => r.effective === "block").length} prompts blocked, ${prompts.filter(r => r.effective !== "block").length} seen in shadow · ${JSON.stringify(count(prompts.flatMap(r => r.found ?? []), f => f.type))}`);
 
 const push = arg("--push");
 if (push) {

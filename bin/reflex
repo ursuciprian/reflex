@@ -5,6 +5,7 @@
 //                                                      every agent found (what curl / npx / pnpm dlx /
 //                                                      bunx / yarn dlx run)
 //   reflex check "<cmd>" [--cwd dir] [--intent text]   judge one command
+//   reflex scan <file|-> [--rewrite]                  judge text for prompt injection (exit 0 pass, 1 warn, 2 block)
 //   reflex report [...]                                what the gate has been doing
 //   reflex install [...]                               re-wire agents (install.mjs flags)
 //   reflex uninstall                                   remove every hook, the package and its link
@@ -12,7 +13,7 @@
 //   reflex version
 import {spawnSync} from "node:child_process";
 import {closeSync, copyFileSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync,
-        renameSync, rmSync, symlinkSync, writeSync} from "node:fs";
+        renameSync, rmSync, symlinkSync, writeFileSync, writeSync} from "node:fs";
 import {homedir, platform} from "node:os";
 import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
@@ -48,6 +49,25 @@ function node() {
   if (found) return found;
   if (!process.versions.bun) return process.execPath;
   die("Node.js 18+ is required for the hooks; install it (https://nodejs.org) and rerun");
+}
+
+// Add to the user's policy the params, flags and gates (by name / id) the bundled one has and it
+// lacks; nothing of the user's is changed or reordered. A new gate goes right after the nearest
+// gate before it in the bundled order that the user also has (first when there is none).
+// Returns what was added.
+function mergePolicy(mine, bundled) {
+  const added = [];
+  for (const k of ["params", "flags"])
+    for (const [name, v] of Object.entries(bundled[k] ?? {})) if (!Object.hasOwn(mine[k] ??= {}, name)) { mine[k][name] = v; added.push(`${k.slice(0, -1)} ${name}`); }
+  const gates = mine.gates ??= [], have = new Set(gates.map(g => g.id));
+  (bundled.gates ?? []).forEach((g, i) => {
+    if (have.has(g.id)) return;
+    const prev = bundled.gates.slice(0, i).reverse().find(p => have.has(p.id));
+    gates.splice(prev ? gates.findIndex(x => x.id === prev.id) + 1 : 0, 0, g);
+    have.add(g.id);
+    added.push(`gate ${g.id}`);
+  });
+  return added;
 }
 
 // A line from the terminal, even when stdin is a pipe (curl | bash). Hidden when `secret`.
@@ -96,6 +116,17 @@ function setup() {
     const previous = join(TARGET, "setup/tool-gate/policy.json");
     copyFileSync(existsSync(previous) ? previous : join(ROOT, "setup/tool-gate/policy.json"), join(policyDirectory, "policy.json"));
   }
+  // A policy seeded by an earlier setup lacks what later versions added (the tainted-* gates).
+  const userPolicy = join(policyDirectory, "policy.json");
+  try {
+    const mine = JSON.parse(readFileSync(userPolicy, "utf8"));
+    const added = mergePolicy(mine, JSON.parse(readFileSync(join(ROOT, "setup/tool-gate/policy.json"), "utf8")));
+    if (added.length) {
+      copyFileSync(userPolicy, `${userPolicy}.bak-${Date.now()}`);
+      writeFileSync(userPolicy, JSON.stringify(mine, null, 2) + "\n");
+      say(`policy: added ${added.join(", ")} from this version (your gates and values are unchanged; disable a gate with its flag, since a deleted one is added back)`);
+    }
+  } catch (e) { say(`policy: could not add new gates to ${userPolicy}: ${e.message}`); }
 
   // 1. Copy the package to its stable home (replaced whole, so an upgrade leaves no stale files).
   if (realpathSync(ROOT) !== (existsSync(TARGET) ? realpathSync(TARGET) : "")) {
@@ -161,6 +192,10 @@ switch (cmd) {
   case "setup": setup(); break;
   case "uninstall": uninstall(); break;
   case "check": process.exit(run("gate.mjs", ["--check", ...args]));
+  case "scan": {
+    if (!args[0] || (args[0].startsWith("--") && args[0] !== "-")) die("usage: reflex scan <file|-> [--rewrite]");
+    process.exit(run("guard.mjs", ["--check", ...args]));
+  }
   case "status": case "doctor": process.exit(run("status.mjs", ["--" + cmd, ...args]));
   case "run": {
     if (!args[0] || args[0].startsWith("--")) die('usage: reflex run "command" [--cwd directory]');
@@ -176,6 +211,6 @@ switch (cmd) {
   case "test": process.exit(spawnSync("npm", ["test", "--silent"], {cwd: ROOT, stdio: "inherit"}).status ?? 1);
   case "version": case "--version": case "-v": console.log(version(ROOT)); break;
   default:
-    console.error("usage: reflex setup | status | doctor | check <cmd> | run <cmd> | report | install | uninstall | test | eval | version");
+    console.error("usage: reflex setup | status | doctor | check <cmd> | scan <file|-> | run <cmd> | report | install | uninstall | test | eval | version");
     process.exit(cmd ? 2 : 0);
 }

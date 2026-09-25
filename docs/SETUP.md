@@ -140,12 +140,17 @@ absolute path of the Node that ran `install.mjs`; pass `--node /path/to/node` to
 
 | Agent | What `install.mjs` does | After installing |
 |---|---|---|
-| Claude Code | `~/.claude/settings.json`: `PreToolUse` hook on `Bash\|Task\|Agent` (`gate.mjs --claude`; `Task\|Agent` is subgoal dedup), `PostToolUse` / `PostToolUseFailure` / `PermissionDenied` hooks on the same tools (`--claude-post`), a `PermissionRequest` hook on the same tools (`--claude-prompted`, which only records that Claude Code showed its own dialog — it never answers it), a `UserPromptSubmit` hook for conditional instructions (`instructions.mjs --claude`), and permission rules that make Claude Code ask before editing the Reflex checkout, its logs, your personal instruction fragments (`~/.config/reflex`) or its own settings | restart sessions |
-| Codex CLI | `~/.codex/hooks.json`: `PreToolUse` + `PostToolUse` on `^(Bash\|spawn_agent)$` (`spawn_agent` is subgoal dedup), and `UserPromptSubmit` (`instructions.mjs --codex`) | open Codex, run `/hooks` and **trust** the Reflex hooks — untrusted hooks do not run |
-| pi | `~/.pi/agent/extensions/reflex.ts` (gate on `tool_call`, instructions on `before_agent_start`) | restart pi |
+| Claude Code | `~/.claude/settings.json`: `PreToolUse` hook on `Bash\|Task\|Agent` (`gate.mjs --claude`; `Task\|Agent` is subgoal dedup), `PostToolUse` / `PostToolUseFailure` / `PermissionDenied` hooks on the same tools (`--claude-post`), a `PermissionRequest` hook on the same tools (`--claude-prompted`, which only records that Claude Code showed its own dialog — it never answers it), a `UserPromptSubmit` hook for conditional instructions (`instructions.mjs --claude`), the injection guard (`guard.mjs --claude` on `PostToolUse` for web, MCP, `Read` and `Bash` results; `guard.mjs --claude-prompt` on `UserPromptSubmit`), and permission rules that make Claude Code ask before editing the Reflex checkout, its logs, your personal instruction fragments (`~/.config/reflex`) or its own settings | restart sessions |
+| Codex CLI | `~/.codex/hooks.json`: `PreToolUse` + `PostToolUse` on `^(Bash\|spawn_agent)$` (`spawn_agent` is subgoal dedup), `UserPromptSubmit` (`instructions.mjs --codex`), and the injection guard (`guard.mjs --codex` on `PostToolUse` for `^Bash$\|^mcp__`, `guard.mjs --codex-prompt` on `UserPromptSubmit`) | open Codex, run `/hooks` and **trust** the Reflex hooks — untrusted hooks do not run |
+| pi | `~/.pi/agent/extensions/reflex.ts` (gate on `tool_call`, instructions on `before_agent_start`, injection guard on `tool_result` and `input`) | restart pi |
 | oh-my-pi | `~/.omp/agent/extensions/reflex.ts` (same file) | restart omp |
-| opencode | `~/.config/opencode/plugins/reflex.js` (gate on `tool.execute.before`, instructions on `chat.message` + `experimental.chat.system.transform`) | restart opencode |
-| Hermes | prints a `hooks:` block with `pre_tool_call`, `post_tool_call` and `pre_llm_call` (Hermes config is YAML, so you paste it) | add it to each profile's `config.yaml`, then `hermes hooks list` to accept it |
+| opencode | `~/.config/opencode/plugins/reflex.js` (gate on `tool.execute.before`, instructions on `chat.message` + `experimental.chat.system.transform`, injection guard on `tool.execute.after` and `chat.message`) | restart opencode |
+| Hermes | prints a `hooks:` block with `pre_tool_call`, `post_tool_call` (gate records and the injection guard) and `pre_llm_call` (instructions and the guard's notes) (Hermes config is YAML, so you paste it) | add it to each profile's `config.yaml`, then `hermes hooks list` to accept it |
+
+The injection guard follows the installed mode: in shadow it only logs (`guard.jsonl`). To enforce it
+while the gate stays in shadow, or the other way round, set `"guard": "enforce"` (or `"shadow"`,
+`"off"`) in `~/.config/reflex/config.json`, or `REFLEX_GUARD` for one session. See
+[GUIDE: injection guard](GUIDE.md#injection-guard) for what each agent can do with a finding.
 
 The instruction hooks do nothing until you add fragments (`.reflex/instructions/*.md` in a repo, or
 `~/.config/reflex/instructions/`); see [GUIDE: conditional instructions](GUIDE.md#conditional-instructions).
@@ -191,6 +196,16 @@ node report.mjs --list pass
 
 Logs live in `~/.local/state/reflex/` (`trace.jsonl`, `feedback.jsonl`, `instructions.jsonl`, `cache.json`).
 
+To see what the injection guard makes of a page or a file, without an agent:
+
+```sh
+reflex scan ~/Downloads/page.html          # exit 0 pass, 1 warn, 2 block
+curl -s https://example.com | reflex scan - --rewrite
+```
+
+`reflex doctor` also feeds each installed agent's guard hook a synthetic injected result and a
+prompt with a fake AWS key (guard enforced for the probe, local engine), and expects both blocked.
+
 A quick check that a rule blocks in each agent, even in shadow mode: in an empty scratch
 directory ask the agent to run `git push --force origin main`. It must be refused with
 `reflex (rule): force push or delete of main/master`.
@@ -230,6 +245,9 @@ All optional.
 | `REFLEX_DATA_DIR` | `~/.local/state/reflex` | Trace, feedback, cache, eval results |
 | `REFLEX_KEYCHAIN_SERVICE` | `typesafe-api-key` | macOS Keychain item holding the key |
 | `REFLEX_API_URL` | TypeSafe System One endpoint | Override for a proxy |
+| `REFLEX_GUARD` | `"guard"` in `config.json`, else the gate's mode | Injection guard mode: `off` · `shadow` (log only) · `enforce` (warn, rewrite, taint, block credential prompts) |
+| `REFLEX_GUARD_TIMEOUT_MS` | `8000` | Budget for the guard's one Jev request per result; on timeout the detectors decide |
+| `REFLEX_INJECTION_DIR` | `./setup/injection` | Directory with the guard's detectors / questions / policy / golden; a file missing there comes from the next place |
 | `REFLEX_INSTRUCTIONS_THRESHOLD` | `0.5` | Jev probability at which a conditional instruction fragment is injected |
 | `REFLEX_INSTRUCTIONS_MAX_CHARS` | `6000` | Most fragment text injected per prompt; whole fragments are dropped, never cut |
 | `XDG_CONFIG_HOME` | `~/.config` | Personal fragments are read from `$XDG_CONFIG_HOME/reflex/instructions/`; they win over a repo fragment with the same id |
@@ -238,7 +256,9 @@ Runtime precedence is environment, explicit hook flags, saved settings, then def
 `node install.mjs` retains the legacy Jev default until an engine is selected. User overrides in
 `$XDG_CONFIG_HOME/reflex/tool-gate/` (default `~/.config/reflex/tool-gate/`) win over bundled files;
 `REFLEX_SETUP_DIR` takes precedence over both. Setup seeds only `policy.json`; you can also place
-`rules.json`, `questions.json` and `subgoals.json` there. Invalid configuration asks instead of silently
+`rules.json`, `questions.json` and `subgoals.json` there. The injection guard reads
+`$XDG_CONFIG_HOME/reflex/injection/` the same way (`detectors.json`, `questions.json`, `policy.json`,
+whose `sources` pick which tool results are inspected); `REFLEX_INJECTION_DIR` wins over both. Invalid configuration asks instead of silently
 enabling hosted calls. Inspect active paths with `reflex status`.
 
 A standalone LiteLLM process reads the same engine setting at startup. If its container cannot read
