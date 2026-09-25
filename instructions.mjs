@@ -133,7 +133,7 @@ export async function select({prompt, cwd, recent_files = [], recent_commands = 
   const rows = fragments.map(f => ({f, id: f.id, p: null,
     via: f.paths.some(g => files.some(p => pathMatches(g, p))) ? "paths"
        : f.keywords.some(k => keywordHit(k, prompt)) ? "keywords" : null}));
-  const pending = rows.filter(r => !r.via && r.f.when).slice(0, MAX_QUESTIONS);
+  const pending = CONFIG.engine === "local" ? [] : rows.filter(r => !r.via && r.f.when).slice(0, MAX_QUESTIONS);
   let res = {usage: {}};
   if (pending.length) {
     const questions = Object.fromEntries(pending.map((r, i) => [`f${i}`, question(r.f)]));

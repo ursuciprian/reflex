@@ -9,7 +9,7 @@
 //   node report.mjs --calibration           how well blast / mutates predict your approvals (ECE)
 import {existsSync, readFileSync} from "node:fs";
 import {join} from "node:path";
-import {CONFIG, promptKey} from "./gate.mjs";
+import {CONFIG, promptKey, setupFile} from "./gate.mjs";
 import {compile} from "./policy.mjs";
 
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i > -1 ? process.argv[i + 1] : d; };
@@ -20,18 +20,23 @@ const logged = rows(join(CONFIG.data, "trace.jsonl")).filter(r => Date.parse(r.t
 const trace = logged.filter(r => r.tag !== "subgoal"), subgoals = logged.filter(r => r.tag === "subgoal");
 const feedback = rows(join(CONFIG.data, "feedback.jsonl"));
 const ran = new Set(feedback.filter(r => r.event === "ran" || r.event === "failed" || r.event == null).map(r => r.call_id ?? r.tool_use_id));
+const denied = new Set(feedback.filter(r => r.event === "denied").map(r => r.call_id ?? r.tool_use_id).filter(Boolean));
 // Claude Code's PermissionRequest hook: the dialogs it actually showed, by session and command.
 const prompted = feedback.filter(r => r.event === "prompted");
 const promptedSince = prompted.map(r => r.ts).sort()[0];
-const policy = compile(JSON.parse(readFileSync(arg("--policy", join(CONFIG.setup, "policy.json")), "utf8")));
+const policy = compile(JSON.parse(readFileSync(arg("--policy", setupFile("policy.json")), "utf8")));
 
 const count = (list, key) => list.reduce((m, r) => { const k = key(r); m[k] = (m[k] ?? 0) + 1; return m; }, {});
 const q = (xs, p) => xs.length ? xs[Math.min(xs.length - 1, Math.floor(p * xs.length))] : 0;
 const jev = trace.filter(r => r.source === "jev");
 const lat = jev.map(r => r.latency_s).sort((a, b) => a - b);
-// An emitted ask is approved when the command then ran; rejected when it did not within 10 minutes.
+// Missing execution feedback can mean an abandoned session or a lost event, never a rejection.
 const asks = trace.filter(r => r.emitted === "ask");
-const verdict = r => ran.has(r.call_id ?? r.tool_use_id) ? "approved" : Date.now() - Date.parse(r.ts) > 6e5 ? "rejected" : "pending";
+const verdict = r => {
+  const id = r.call_id ?? r.tool_use_id;
+  return id && denied.has(id) ? "rejected" : id && ran.has(id) ? "approved"
+    : Date.now() - Date.parse(r.ts) > 6e5 ? "unknown" : "pending";
+};
 const resolved = count(asks, verdict);
 // Replay: stored Jev answers through the chosen policy; rule and fast-lane decisions are code.
 // Policy is compared with policy: the logged policy_decision is what the policy said before
@@ -54,7 +59,7 @@ const labelled = replayed.filter(({r, now}) => r.emitted !== "allow" && r.answer
     ((r.emitted === "ask" && r.mode === "enforce") || (r.agent === "claude-code" && [undefined, null, "default"].includes(r.permission_mode) &&
       (now === "allow" || r.decision === "would_allow") && shown(r))))
   .map(({r}) => ({blast: r.answers.blast.score, conf: r.answers.blast.confidence ?? 0, mutates: r.answers.mutates?.noul, v: verdict(r)}))
-  .filter(x => x.v !== "pending").map(x => ({...x, ok: x.v === "approved" ? 1 : 0}));
+  .filter(x => ["approved", "rejected"].includes(x.v)).map(x => ({...x, ok: x.v === "approved" ? 1 : 0}));
 const rate = xs => xs.length ? `${xs.filter(x => x.ok).length}/${xs.length} (${Math.round(100 * xs.filter(x => x.ok).length / xs.length)}%)` : "-";
 const bucket = (xs, f, edges) => edges.slice(0, -1).map((lo, i) => `${lo}-${edges[i + 1]} ${rate(xs.filter(x => f(x) >= lo && (f(x) < edges[i + 1] || i === edges.length - 2)))}`).join(" · ");
 // The band covering the most commands you approved at least 95% of (10+ labelled); among equals

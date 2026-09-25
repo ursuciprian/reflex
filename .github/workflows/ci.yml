@@ -13,13 +13,19 @@ permissions:
 
 jobs:
   selfcheck:
-    name: selfcheck (node ${{ matrix.node }}, python ${{ matrix.python }})
-    runs-on: ubuntu-latest
+    name: selfcheck (${{ matrix.os }}, node ${{ matrix.node }}, python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         node: ["18", "22"]
         python: ["3.9", "3.12"]
+        include:
+          - os: macos-latest
+            node: "22"
+            python: "3.12"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

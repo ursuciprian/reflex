@@ -113,7 +113,10 @@ export default function (pi: any) {
     if (d.effective === "ask") {
       if (!ctx.hasUI) return {block: true, reason: `${d.reason}. Needs human approval and there is no UI to ask.`};
       const ok = await ctx.ui.confirm("Reflex: run this command?", `${event.input.command}\n\n${d.reason}`);
-      if (!ok) return {block: true, reason: `${d.reason}. The user declined.`};
+      if (!ok) {
+        await gate("--record", {agent: AGENT, event: "denied", call_id: event.toolCallId, session_id: ctx.sessionManager?.getSessionId?.()});
+        return {block: true, reason: `${d.reason}. The user declined.`};
+      }
     }
   });
 

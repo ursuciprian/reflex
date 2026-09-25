@@ -37,7 +37,16 @@ except ImportError:  # the selfcheck and the CLI run without litellm
 
 HERE = Path(__file__).resolve().parent
 ENV = os.environ
+try:
+    USER_CONFIG = json.loads((Path(ENV.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "reflex/config.json").read_text())
+    if not isinstance(USER_CONFIG, dict):
+        raise ValueError("expected a JSON object")
+except FileNotFoundError:
+    USER_CONFIG = {}
+except (OSError, ValueError):
+    USER_CONFIG = {"engine": "local"}  # Invalid settings cannot enable a hosted call.
 CONFIG = {
+    "engine": ENV.get("REFLEX_ENGINE", USER_CONFIG.get("engine", "jev")),
     "api": ENV.get("REFLEX_API_URL", "https://api.typesafe.ai/v1/systemone"),
     "model": ENV.get("REFLEX_MODEL", "jev-1.13.0"),
     "mode": ENV.get("REFLEX_ROUTING_MODE", "shadow"),
@@ -211,6 +220,8 @@ def api_key():
 
 def ask(state, questions, timeout_s):
     """One Jev call -> (answers, usage). Raises on any failure; the caller falls back."""
+    if CONFIG["engine"] != "jev":
+        raise RuntimeError("hosted classification is disabled")
     t0 = time.monotonic()
     body = json.dumps({"state": state, "model": CONFIG["model"], "questions": questions}).encode()
     for attempt in (0, 1):
@@ -413,7 +424,7 @@ class ReflexRouter(CustomLogger):
 
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
         mode = self.mode or CONFIG["mode"]
-        if mode == "off" or call_type not in ROUTED or not isinstance(data.get("model"), str):
+        if CONFIG["engine"] != "jev" or mode == "off" or call_type not in ROUTED or not isinstance(data.get("model"), str):
             return data
         try:
             f, requested = features(data), data["model"]

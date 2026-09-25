@@ -11,11 +11,12 @@
 //   reflex test | eval                                 offline selfchecks | live golden set
 //   reflex version
 import {spawnSync} from "node:child_process";
-import {closeSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync,
+import {closeSync, copyFileSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync,
         renameSync, rmSync, symlinkSync, writeSync} from "node:fs";
 import {homedir, platform} from "node:os";
 import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
+import {USER_CONFIG, USER_CONFIG_ERROR, USER_CONFIG_FILE, policyDirectory} from "../gate.mjs";
 
 const ROOT = join(dirname(realpathSync(fileURLToPath(import.meta.url))), "..");
 const [cmd, ...args] = process.argv.slice(2);
@@ -24,11 +25,15 @@ const PREFIX = ENV.REFLEX_PREFIX ?? join(homedir(), ".local/share/reflex");
 // The stable home of the package: hooks point here, so it must outlive npx / pnpm dlx caches.
 const TARGET = join(PREFIX, "lib/node_modules/@ursuciprian/reflex");
 const BIN_LINK = join(homedir(), ".local/bin/reflex");
-const CONFIG_FILE = join(ENV.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "reflex/config.json");
 const version = dir => JSON.parse(readFileSync(join(dir, "package.json"), "utf8")).version;
 const say = s => console.log(`\x1b[1mreflex\x1b[0m ${s}`);
 const die = s => { console.error(`\x1b[31mreflex: ${s}\x1b[0m`); process.exit(1); };
-const opt = (list, n, d) => { const i = list.indexOf(n); return i > -1 ? list[i + 1] : d; };
+const opt = (list, n, d) => {
+  const i = list.indexOf(n);
+  if (i < 0) return d;
+  if (!list[i + 1] || list[i + 1].startsWith("--")) die(`${n} needs a value`);
+  return list[i + 1];
+};
 
 const run = (file, extra, root = ROOT) => {
   const r = spawnSync(node(), [join(root, file), ...extra], {stdio: "inherit"});
@@ -39,7 +44,7 @@ const run = (file, extra, root = ROOT) => {
 // binary (a Homebrew Cellar or a bundled copy behind a symlink), which moves on the next upgrade,
 // while the PATH entry keeps working. bunx may run this file with Bun, so never use Bun's path.
 function node() {
-  const found = spawnSync("sh", ["-c", "command -v node"], {encoding: "utf8"}).stdout.trim();
+  const found = spawnSync("sh", ["-c", "command -v node"], {encoding: "utf8"}).stdout?.trim();
   if (found) return found;
   if (!process.versions.bun) return process.execPath;
   die("Node.js 18+ is required for the hooks; install it (https://nodejs.org) and rerun");
@@ -62,19 +67,42 @@ function ask(question, secret) {
 }
 
 function setup() {
+  if (platform() === "win32") die("Native Windows setup is not supported yet. Run Reflex and your agent inside WSL.");
+  if (USER_CONFIG_ERROR) die(USER_CONFIG_ERROR);
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--dry-run") continue;
+    if (!["--mode", "--allow", "--agents", "--keychain", "--node", "--engine"].includes(args[i])) die(`unknown setup option ${args[i]}`);
+    opt(args, args[i]); i++;
+  }
   if (Number(process.versions.node?.split(".")[0] ?? 99) < 18) die(`Node.js 18+ is required, found ${process.version}`);
-  const mode = opt(args, "--mode", ENV.REFLEX_MODE ?? "shadow");
-  const allow = opt(args, "--allow", ENV.REFLEX_ALLOW ?? "off");
+  const mode = opt(args, "--mode", ENV.REFLEX_MODE ?? USER_CONFIG.mode ?? "shadow");
+  const allow = opt(args, "--allow", ENV.REFLEX_ALLOW ?? USER_CONFIG.allow ?? "off");
+  const engine = opt(args, "--engine", ENV.REFLEX_ENGINE ?? USER_CONFIG.engine ?? (existsSync(TARGET) ? "jev" : "local"));
   const agents = opt(args, "--agents", ENV.REFLEX_AGENTS ?? "all");
-  const keychain = opt(args, "--keychain", ENV.REFLEX_KEYCHAIN_SERVICE ?? "typesafe-api-key");
+  const keychain = opt(args, "--keychain", ENV.REFLEX_KEYCHAIN_SERVICE ?? USER_CONFIG.keychain ?? "typesafe-api-key");
   const nodeBin = opt(args, "--node", node());
+  const nodeVersion = spawnSync(nodeBin, ["--version"], {encoding: "utf8"});
+  if (nodeVersion.status !== 0 || Number(nodeVersion.stdout?.match(/^v(\d+)/)?.[1] ?? 0) < 18) die(`--node must point to Node.js 18+: ${nodeBin}`);
+  const installArgs = ["--agent", agents, "--mode", mode, "--allow", allow, "--engine", engine, "--node", nodeBin, "--keychain", keychain];
+  // Validate every option and preview changes before copying or changing any configuration.
+  const preview = run("install.mjs", [...installArgs, "--dry-run"]);
+  if (preview) process.exit(preview);
+  say(`package: ${TARGET}; command: ${BIN_LINK}`);
+  if (args.includes("--dry-run")) return;
+
+  mkdirSync(policyDirectory, {recursive: true, mode: 0o700});
+  if (!existsSync(join(policyDirectory, "policy.json"))) {
+    // Preserve an existing installation's policy when migrating to durable configuration.
+    const previous = join(TARGET, "setup/tool-gate/policy.json");
+    copyFileSync(existsSync(previous) ? previous : join(ROOT, "setup/tool-gate/policy.json"), join(policyDirectory, "policy.json"));
+  }
 
   // 1. Copy the package to its stable home (replaced whole, so an upgrade leaves no stale files).
   if (realpathSync(ROOT) !== (existsSync(TARGET) ? realpathSync(TARGET) : "")) {
     const next = `${TARGET}.new-${process.pid}`;
     rmSync(next, {recursive: true, force: true});
     mkdirSync(dirname(TARGET), {recursive: true});
-    cpSync(ROOT, next, {recursive: true, filter: src => !src.includes(`${ROOT}/node_modules`)});
+    cpSync(ROOT, next, {recursive: true, filter: src => !["node_modules", ".git", ".serena"].some(d => src === join(ROOT, d))});
     rmSync(TARGET, {recursive: true, force: true});
     renameSync(next, TARGET);
   }
@@ -86,7 +114,7 @@ function setup() {
   symlinkSync(join(TARGET, "bin/reflex"), BIN_LINK);
 
   // 3. The TypeSafe key: environment, else the macOS Keychain (offered once, never written to a file).
-  if (!ENV.TYPESAFE_API_KEY && platform() === "darwin" &&
+  if (engine === "jev" && !ENV.TYPESAFE_API_KEY && platform() === "darwin" &&
       spawnSync("security", ["find-generic-password", "-s", keychain], {stdio: "ignore"}).status !== 0) {
     say("no TypeSafe API key found. Create one at https://console.typesafe.ai/keys");
     const key = ask(`paste it to store it in the macOS Keychain as '${keychain}' (Enter to skip): `, true);
@@ -97,15 +125,18 @@ function setup() {
         input: `add-generic-password -U -s ${quote(keychain)} -a ${quote(ENV.USER ?? "reflex")} -w ${quote(key)}\n`});
       say(r.status === 0 ? "key stored in the Keychain" : "could not store the key; set TYPESAFE_API_KEY instead");
     }
-  } else if (!ENV.TYPESAFE_API_KEY && platform() !== "darwin") {
+  } else if (engine === "jev" && !ENV.TYPESAFE_API_KEY && platform() !== "darwin") {
     say("set TYPESAFE_API_KEY (https://console.typesafe.ai/keys) in the environment your agents start from");
   }
 
   // 4. Hook every agent, recording where the key lives so every hook finds it.
-  const status = run("install.mjs", ["--agent", agents, "--mode", mode, "--allow", allow, "--node", nodeBin, "--keychain", keychain], TARGET);
+  const status = run("install.mjs", installArgs, TARGET);
   if (status !== 0) process.exit(status);
 
-  say(`installed (${mode} mode, allow ${allow})`);
+  say(`installed (${engine} engine, ${mode} mode, allow ${allow})`);
+  say(engine === "local" ? "local rules and instruction matches; no hosted classification or API key needed" : "Jev classification sends redacted context to TypeSafe");
+  say(mode === "shadow" ? "shadow: deterministic rules still block; other decisions are logged only" : mode === "off" ? "off: protection is disabled" : "enforce: uncertain commands require human review");
+  say(`editable policy: ${join(policyDirectory, "policy.json")} (preserved by upgrades)`);
   if (!(ENV.PATH ?? "").split(":").includes(dirname(BIN_LINK))) say(`add ${dirname(BIN_LINK)} to PATH to use the 'reflex' command`);
   console.log(`
 Next:
@@ -113,28 +144,38 @@ Next:
   - Codex: open Codex and trust the Reflex hooks in /hooks
   - Hermes: paste the printed block into each profile's config.yaml
   - check:   reflex check "git push --force origin main"
+  - verify:  reflex doctor      (then reflex status after a real agent command)
   - later:   reflex report      (then: reflex setup --mode enforce)`);
 }
 
 function uninstall() {
   const root = existsSync(join(TARGET, "install.mjs")) ? TARGET : ROOT;
-  run("install.mjs", ["--agent", "all", "--uninstall", "--node", node()], root);
+  const status = run("install.mjs", ["--agent", "all", "--uninstall", "--node", node()], root);
+  if (status) process.exit(status);
   rmSync(PREFIX, {recursive: true, force: true});
   rmSync(BIN_LINK, {force: true});
-  rmSync(CONFIG_FILE, {force: true});
-  say(`removed. Logs are kept in ${ENV.REFLEX_DATA_DIR ?? join(homedir(), ".local/state/reflex")}.`);
+  say(`removed. User settings and policy are kept beside ${USER_CONFIG_FILE}; logs are kept in ${ENV.REFLEX_DATA_DIR ?? join(ENV.XDG_STATE_HOME ?? join(homedir(), ".local/state"), "reflex")}.`);
 }
 
 switch (cmd) {
   case "setup": setup(); break;
   case "uninstall": uninstall(); break;
   case "check": process.exit(run("gate.mjs", ["--check", ...args]));
+  case "status": case "doctor": process.exit(run("status.mjs", ["--" + cmd, ...args]));
+  case "run": {
+    if (!args[0] || args[0].startsWith("--")) die('usage: reflex run "command" [--cwd directory]');
+    if (args.length !== 1 && !(args.length === 3 && args[1] === "--cwd")) die('usage: reflex run "command" [--cwd directory]');
+    const r = spawnSync(node(), [join(ROOT, "gate.mjs"), "--sh", "-c", args[0]], {
+      cwd: opt(args, "--cwd", process.cwd()), stdio: "inherit", env: {...ENV, REFLEX_MODE: "enforce", REFLEX_ALLOW: "off"}});
+    if (r.error) console.error(`reflex: ${r.error.message}`);
+    process.exit(r.status ?? 1);
+  }
   case "report": process.exit(run("report.mjs", args));
   case "install": process.exit(run("install.mjs", args.includes("--agent") ? args : ["--agent", "all", ...args]));
   case "eval": process.exit(run("eval.mjs", args));
   case "test": process.exit(spawnSync("npm", ["test", "--silent"], {cwd: ROOT, stdio: "inherit"}).status ?? 1);
   case "version": case "--version": case "-v": console.log(version(ROOT)); break;
   default:
-    console.error("usage: reflex setup | check <cmd> | report | install | uninstall | test | eval | version");
+    console.error("usage: reflex setup | status | doctor | check <cmd> | run <cmd> | report | install | uninstall | test | eval | version");
     process.exit(cmd ? 2 : 0);
 }
