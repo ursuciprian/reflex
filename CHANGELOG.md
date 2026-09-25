@@ -6,6 +6,8 @@ All notable changes to Reflex are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-25
+
 ### Fixed
 
 - A fresh install through the `curl` installer now starts with the local engine like `npx` / `pnpm dlx`
@@ -89,6 +91,7 @@ All notable changes to Reflex are documented here. The format follows
   and 3.12).
 - `LICENSE` (MIT), `SECURITY.md`, `CONTRIBUTING.md`, this changelog and issue templates.
 
-[Unreleased]: https://github.com/ursuciprian/reflex/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ursuciprian/reflex/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ursuciprian/reflex/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ursuciprian/reflex/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ursuciprian/reflex/releases/tag/v0.2.0
