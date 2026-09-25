@@ -6,7 +6,11 @@ All notable changes to Reflex are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-25
+
 ### Added
+
+- Logo, wordmark and social preview image (`assets/`); the README opens with the wordmark.
 
 - Injection guard (`guard.mjs`, `setup/injection/`): tool results from the web, MCP servers, files
   outside the project and network commands are scanned for prompt injection (deterministic
@@ -79,4 +83,6 @@ All notable changes to Reflex are documented here. The format follows
   and 3.12).
 - `LICENSE` (MIT), `SECURITY.md`, `CONTRIBUTING.md`, this changelog and issue templates.
 
+[Unreleased]: https://github.com/ursuciprian/reflex/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ursuciprian/reflex/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ursuciprian/reflex/releases/tag/v0.2.0
