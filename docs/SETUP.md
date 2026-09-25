@@ -43,20 +43,58 @@ Hooks and plugins inherit the environment the agent was started with. Either:
 
 Never put the key in `settings.json`, the repo, or shell history.
 
-## 2. Get Reflex and check it
+## 2. Install
 
 ```sh
-git clone https://github.com/ursuciprian/reflex.git ~/src/reflex
-cd ~/src/reflex
-npm test                                   # offline: policy + gate self-checks
-node gate.mjs --check "git push --force origin main"                       # a rule, no API call
-node gate.mjs --check "aws iam attach-role-policy --role-name ci --policy-arn arn:aws:iam::aws:policy/AdministratorAccess"
-npm run eval                               # the golden set through the live API
+gh auth refresh -s read:packages     # once: GitHub Packages needs a token even to read
+gh api repos/ursuciprian/reflex/contents/install.sh -H 'Accept: application/vnd.github.raw' | bash
 ```
 
-`--check` prints the decision, the rule that fired, where it came from (`read-only`, `rule`,
+The installer:
+
+- checks Node 18+ and npm;
+- installs `@ursuciprian/reflex` from GitHub Packages into `~/.local/share/reflex` (no sudo), using
+  `GITHUB_TOKEN` or your `gh` login through a temporary npmrc that is deleted on exit — nothing is
+  written to `~/.npmrc`;
+- links the `reflex` command into `~/.local/bin`;
+- offers to store your TypeSafe key in the macOS Keychain if none is found;
+- hooks every supported agent it finds (step 3), in shadow mode with allow off, and records the
+  Keychain item name in `~/.config/reflex/config.json` so every hook finds the key.
+
+Options go after `bash -s --`:
+
+| Option | Default | |
+|---|---|---|
+| `--agents claude,codex,…` | `all` found | which agents to hook |
+| `--mode shadow\|enforce\|off` | `shadow` | |
+| `--allow off\|shadow\|on` | `off` | see step 6 |
+| `--keychain NAME` | `typesafe-api-key` | Keychain item holding the key |
+| `--version X` | latest | package version |
+| `--uninstall` | | remove every hook, the package and `config.json` (logs stay) |
+
+Rerunning the installer upgrades in place; hook paths don't change.
+
+Check it:
+
+```sh
+reflex check "git push --force origin main"          # a rule, no API call
+reflex check "aws iam attach-role-policy --role-name ci --policy-arn arn:aws:iam::aws:policy/AdministratorAccess"
+```
+
+`reflex check` prints the decision, the rule that fired, where it came from (`read-only`, `rule`,
 `fast-lane`, `jev`, `fallback`) and Jev's raw answers. If a Jev call fails it prints the error and
-the policy's fallback decision (`ask`).
+the policy's fallback decision (`ask`). Other commands: `reflex report`, `reflex install`,
+`reflex uninstall`, `reflex test`, `reflex eval`, `reflex version`.
+
+To work on Reflex itself, clone the repo, run `npm test`, and install that checkout with
+`node install.mjs --agent all` instead.
+
+### Publishing a release (maintainers)
+
+Bump `version` in `package.json`, merge, then tag: `git tag v0.2.0 && git push origin v0.2.0`.
+`.github/workflows/publish.yml` runs the self-checks and publishes `@ursuciprian/reflex` to GitHub
+Packages. The package inherits the repository's visibility: anyone with read access to the repo
+can install it.
 
 ## 3. Install the hooks (shadow mode)
 
@@ -243,6 +281,7 @@ team.
 ## Uninstall
 
 ```sh
-node install.mjs --agent all --uninstall
+gh api repos/ursuciprian/reflex/contents/install.sh -H 'Accept: application/vnd.github.raw' | bash -s -- --uninstall
+#   or, from a checkout:  node install.mjs --agent all --uninstall
 rm -rf ~/.local/state/reflex        # optional: logs, the context layer's chunk store, bundles, reviews
 ```

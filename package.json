@@ -1,10 +1,34 @@
 {
-  "name": "reflex",
-  "version": "0.1.0",
+  "name": "@ursuciprian/reflex",
+  "version": "0.2.0",
   "description": "Risk gate for coding-agent shell commands: deterministic rules + TypeSafe Jev judgments + an editable policy",
-  "private": true,
   "type": "module",
-  "engines": {"node": ">=18"},
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "reflex": "bin/reflex"
+  },
+  "files": [
+    "*.mjs",
+    "adapters/",
+    "bin/",
+    "dashboards/",
+    "docs/",
+    "examples/",
+    "router/",
+    "routing/",
+    "setup/",
+    "install.sh",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ursuciprian/reflex.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "scripts": {
     "test": "node policy.mjs && node gate.mjs --selfcheck && node instructions.mjs --selfcheck && node install.mjs --selfcheck && node context.mjs --selfcheck && node router/server.mjs --selfcheck && python3 routing/reflex_router.py --selfcheck",
     "eval": "node eval.mjs",

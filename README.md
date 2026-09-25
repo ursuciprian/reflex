@@ -98,19 +98,35 @@ leave the machine*, *ask when a mutating command does not match the stated task*
 
 ## Quick start
 
+One command installs the package from GitHub Packages and hooks it into every supported agent on
+the machine, in shadow mode:
+
 ```sh
-git clone https://github.com/ursuciprian/reflex.git && cd reflex
-export TYPESAFE_API_KEY=...          # from https://console.typesafe.ai/keys — see docs/SETUP.md
-npm test                             # offline self-checks, no API calls
-node gate.mjs --check "terraform apply -auto-approve" --cwd ~/infra/envs/prod
-npm run eval                         # 63 labelled commands through the real gate (~31k tokens)
-npm run eval                         # 65 labelled commands through the real gate (~47k tokens)
-node install.mjs --agent all         # hook into every supported agent found here, shadow mode
+gh api repos/ursuciprian/reflex/contents/install.sh -H 'Accept: application/vnd.github.raw' | bash
+```
+
+It needs Node 18+, the GitHub CLI logged in with `read:packages` (`gh auth refresh -s read:packages`
+once), and a TypeSafe API key, which it offers to store in the macOS Keychain. Options follow
+`bash -s --`, e.g. `| bash -s -- --agents claude,codex --keychain dev/typesafe-ai-api-key`.
+See [docs/SETUP.md](docs/SETUP.md).
+
+```sh
+reflex check "terraform apply -auto-approve" --cwd ~/infra/envs/prod   # judge one command
+reflex report                                                          # after a few days of use
 ```
 
 Shadow mode changes nothing the agent does: deterministic rules still apply, and Jev judges
 every other mutating command in the background and logs what it *would* have done. After a
-week, `node report.mjs` shows the decisions, and `node install.mjs --mode enforce` turns them on.
+week, `reflex report` shows the decisions; rerun the installer with `--mode enforce` to apply them.
+
+Working on Reflex itself:
+
+```sh
+git clone https://github.com/ursuciprian/reflex.git && cd reflex
+npm test                             # offline self-checks, no API calls
+npm run eval                         # 90 labelled commands through the real gate (~50k tokens)
+node install.mjs --agent all         # hook this checkout into every agent found here
+```
 
 ## Documentation
 
