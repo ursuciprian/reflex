@@ -97,7 +97,11 @@ function setup() {
   if (Number(process.versions.node?.split(".")[0] ?? 99) < 18) die(`Node.js 18+ is required, found ${process.version}`);
   const mode = opt(args, "--mode", ENV.REFLEX_MODE ?? USER_CONFIG.mode ?? "shadow");
   const allow = opt(args, "--allow", ENV.REFLEX_ALLOW ?? USER_CONFIG.allow ?? "off");
-  const engine = opt(args, "--engine", ENV.REFLEX_ENGINE ?? USER_CONFIG.engine ?? (existsSync(TARGET) ? "jev" : "local"));
+  // A fresh install starts local (no key needed). "Fresh" is judged from saved settings, not from
+  // the package directory: the curl installer puts the package in place before running setup.
+  // Settings from before `engine` existed (a Keychain item or an agent record) mean Jev was in use.
+  const engine = opt(args, "--engine", ENV.REFLEX_ENGINE ?? USER_CONFIG.engine ??
+    (USER_CONFIG.keychain || Object.keys(USER_CONFIG.agents ?? {}).length ? "jev" : "local"));
   const agents = opt(args, "--agents", ENV.REFLEX_AGENTS ?? "all");
   const keychain = opt(args, "--keychain", ENV.REFLEX_KEYCHAIN_SERVICE ?? USER_CONFIG.keychain ?? "typesafe-api-key");
   const nodeBin = opt(args, "--node", node());
