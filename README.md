@@ -1,8 +1,10 @@
-# Reflex
+<h1 align="center"><img src="assets/wordmark.svg" alt="Reflex" width="320"></h1>
 
-[![ci](https://github.com/ursuciprian/reflex/actions/workflows/ci.yml/badge.svg)](https://github.com/ursuciprian/reflex/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/@ursuciprian/reflex)](https://www.npmjs.com/package/@ursuciprian/reflex)
-[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+<p align="center">
+  <a href="https://github.com/ursuciprian/reflex/actions/workflows/ci.yml"><img src="https://github.com/ursuciprian/reflex/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+  <a href="https://www.npmjs.com/package/@ursuciprian/reflex"><img src="https://img.shields.io/npm/v/@ursuciprian/reflex" alt="npm"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
+</p>
 
 Pre-execution risk checks for coding agents. Reflex hooks into Claude Code, Codex CLI, pi,
 oh-my-pi, opencode and Hermes, and decides for every shell command the agent wants to run whether
