@@ -71,8 +71,24 @@ absolute path of the Node that ran `install.mjs`; pass `--node /path/to/node` to
 
 | Agent | What `install.mjs` does | After installing |
 |---|---|---|
-| Claude Code | `~/.claude/settings.json`: `PreToolUse` hook on `Bash` (`gate.mjs --claude`), `PostToolUse` / `PostToolUseFailure` / `PermissionDenied` hooks (`--claude-post`), and permission rules that make Claude Code ask before editing the Reflex checkout, its logs or its own settings | restart sessions |
-| Codex CLI | `~/.codex/hooks.json`: `PreToolUse` + `PostToolUse` on `^Bash$` | open Codex, run `/hooks` and **trust** the Reflex hooks — untrusted hooks do not run |
+| Claude Code | `~/.claude/settings.json`: `PreToolUse` hook on `Bash` (`gate.mjs --claude`), `PostToolUse` / `PostToolUseFailure` / `PermissionDenied` hooks (`--claude-post`), a `UserPromptSubmit` hook for conditional instructions (`instructions.mjs --claude`), and permission rules that make Claude Code ask before editing the Reflex checkout, its logs, your personal instruction fragments (`~/.config/reflex`) or its own settings | restart sessions |
+| Codex CLI | `~/.codex/hooks.json`: `PreToolUse` + `PostToolUse` on `^Bash$`, and `UserPromptSubmit` (`instructions.mjs --codex`) | open Codex, run `/hooks` and **trust** the Reflex hooks — untrusted hooks do not run |
+| pi | `~/.pi/agent/extensions/reflex.ts` (gate on `tool_call`, instructions on `before_agent_start`) | restart pi |
+| oh-my-pi | `~/.omp/agent/extensions/reflex.ts` (same file) | restart omp |
+| opencode | `~/.config/opencode/plugins/reflex.js` (gate on `tool.execute.before`, instructions on `chat.message` + `experimental.chat.system.transform`) | restart opencode |
+| Hermes | prints a `hooks:` block with `pre_tool_call`, `post_tool_call` and `pre_llm_call` (Hermes config is YAML, so you paste it) | add it to each profile's `config.yaml`, then `hermes hooks list` to accept it |
+
+The instruction hooks do nothing until you add fragments (`.reflex/instructions/*.md` in a repo, or
+`~/.config/reflex/instructions/`); see [GUIDE: conditional instructions](GUIDE.md#conditional-instructions).
+
+**Optional, pi and oh-my-pi only: the context layer.** `node install.mjs --agent pi,omp --context` also
+writes `~/.{pi,omp}/agent/extensions/reflex-context.ts` (see the GUIDE's *Context layer*);
+`--no-context` removes it, and a plain re-install keeps it only where it is already installed. It
+sends redacted excerpts of tool output to TypeSafe, so turn it on deliberately. To try it for one session
+without installing: `pi -e /path/to/reflex/adapters/pi-context.ts` with
+`REFLEX_CONTEXT=/path/to/reflex/context.mjs` in the environment (same for `omp -e`).
+| Claude Code | `~/.claude/settings.json`: `PreToolUse` hook on `Bash\|Task\|Agent` (`gate.mjs --claude`; `Task\|Agent` is subgoal dedup), `PostToolUse` / `PostToolUseFailure` / `PermissionDenied` hooks on the same tools (`--claude-post`), and permission rules that make Claude Code ask before editing the Reflex checkout, its logs or its own settings | restart sessions |
+| Codex CLI | `~/.codex/hooks.json`: `PreToolUse` + `PostToolUse` on `^(Bash\|spawn_agent)$` (`spawn_agent` is subgoal dedup) | open Codex, run `/hooks` and **trust** the Reflex hooks — untrusted hooks do not run |
 | pi | `~/.pi/agent/extensions/reflex.ts` | restart pi |
 | oh-my-pi | `~/.omp/agent/extensions/reflex.ts` | restart omp |
 | opencode | `~/.config/opencode/plugins/reflex.js` | restart opencode |
@@ -92,7 +108,7 @@ node report.mjs            # should show 1 judged command, source "jev", mode "s
 node report.mjs --list pass
 ```
 
-Logs live in `~/.local/state/reflex/` (`trace.jsonl`, `feedback.jsonl`, `cache.json`).
+Logs live in `~/.local/state/reflex/` (`trace.jsonl`, `feedback.jsonl`, `instructions.jsonl`, `cache.json`).
 
 A quick check that a rule blocks in each agent, even in shadow mode: in an empty scratch
 directory ask the agent to run `git push --force origin main`. It must be refused with
@@ -107,6 +123,16 @@ node install.mjs --agent all --mode enforce     # or --mode off to disable every
 `REFLEX_MODE` in the environment overrides the installed mode for one session, e.g.
 `REFLEX_MODE=enforce claude` to try enforce without changing the install.
 
+## 6. Optional: let clearly safe commands through
+
+```sh
+node install.mjs --agent all --mode enforce --allow shadow   # log would_allow, change nothing
+node report.mjs                                              # calibration section, after a while
+node install.mjs --agent all --mode enforce --allow on       # skip the agent's prompt for them
+```
+
+See [Calibrated allow](GUIDE.md#calibrated-allow). `REFLEX_ALLOW` overrides the installed value.
+
 ## Configuration
 
 All optional.
@@ -115,12 +141,92 @@ All optional.
 |---|---|---|
 | `TYPESAFE_API_KEY` | — | API key (or use the Keychain item) |
 | `REFLEX_MODE` | installed `--mode`, else `shadow` | `off` · `shadow` (rules enforce, Jev logs only) · `enforce` |
+| `REFLEX_ALLOW` | installed `--allow`, else `off` | `off` · `shadow` (log `would_allow`) · `on` (clearly safe commands skip the agent's prompt; enforce mode only) |
 | `REFLEX_MODEL` | `jev-1.13.0` | Pinned model; `jev-latest` follows TypeSafe's current version |
 | `REFLEX_TIMEOUT_MS` | `3000` | Budget for one Jev call, retry included; on timeout the policy fallback applies |
 | `REFLEX_SETUP_DIR` | `./setup/tool-gate` | Directory with rules / questions / policy / golden |
 | `REFLEX_DATA_DIR` | `~/.local/state/reflex` | Trace, feedback, cache, eval results |
 | `REFLEX_KEYCHAIN_SERVICE` | `typesafe-api-key` | macOS Keychain item holding the key |
 | `REFLEX_API_URL` | TypeSafe System One endpoint | Override for a proxy |
+| `REFLEX_INSTRUCTIONS_THRESHOLD` | `0.5` | Jev probability at which a conditional instruction fragment is injected |
+| `REFLEX_INSTRUCTIONS_MAX_CHARS` | `6000` | Most fragment text injected per prompt; whole fragments are dropped, never cut |
+| `XDG_CONFIG_HOME` | `~/.config` | Personal fragments are read from `$XDG_CONFIG_HOME/reflex/instructions/`; they win over a repo fragment with the same id |
+
+## Optional: the tool router
+
+An MCP server that gives the agent three tools (`find_tools`, `describe_tool`, `run`) in front of
+built-in read-only shell tools and any MCP servers you list; Jev picks the tool and its arguments.
+How it works: [GUIDE → Tool router](GUIDE.md#tool-router).
+
+```sh
+node router/server.mjs --selfcheck                              # offline, also part of npm test
+node router/server.mjs --check "show the last 5 commits" --run  # one live Jev round trip
+npm run eval-router                                             # router/golden.json through live Jev; nothing runs; exit 1 only on unsafe
+node install.mjs --router                                       # prints the registration for every agent
+node install.mjs --router --agent codex --mode enforce          # one agent; --mode is the gate's mode for the router's calls
+```
+
+`--router` only prints: registering an MCP server writes the agent's global config (`~/.claude.json`,
+`~/.codex/config.toml`, …), so you run the printed command or paste the snippet yourself. If the key
+lives in the Keychain under a non-default name, run it with `REFLEX_KEYCHAIN_SERVICE` set and the
+snippets carry it in their `env`. To route other MCP servers, move their entries from the agent's
+config into `router/config.json` (`mcpServers`, `.mcp.json` shape; stdio only).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `REFLEX_ROUTER_CONFIG` | `router/config.json` | Downstream MCP servers |
+| `REFLEX_ROUTER_MIN_CONFIDENCE` | `0.5` | Below this probability for the tool or any argument, `run` returns candidates instead of running |
+| `REFLEX_ROUTER_TIMEOUT_MS` | `30000` | Per shell command and per downstream request |
+
+Selections are logged to `router.jsonl` in `REFLEX_DATA_DIR`.
+
+## Optional: model routing in a LiteLLM proxy
+
+`routing/reflex_router.py` runs inside the LiteLLM proxy process (tested against LiteLLM
+1.100.1). It uses only the Python standard library, plus `certifi` when present (LiteLLM ships it)
+for TLS on Python builds without a CA bundle.
+
+1. Check it offline, then against the live API:
+
+   ```sh
+   python3 routing/reflex_router.py --selfcheck
+   npm run eval-routing                            # 27 labelled prompts, ~1k input tokens each
+   ```
+
+2. Edit `routing/policy.json` for your gateway: one family per set of interchangeable model groups
+   (their `model_name`s in LiteLLM's `model_list`), each model's `tier`, `price_in` (USD per
+   million input tokens) and tags (`first_party`, `frontier`, `tools`).
+3. Put the module next to the proxy's `config.yaml` (copy, symlink, or a Docker bind mount of the
+   file next to `/app/config.yaml`) and add the callback — see `routing/litellm-config.example.yaml`.
+   A copy or a mount also needs `policy.json`, `questions.json` and `setup/redact.json` mounted and
+   named by the variables below; a symlink into this repo finds them itself:
+
+   ```yaml
+   litellm_settings:
+     callbacks: ["reflex_router.proxy_handler_instance"]
+   ```
+
+   If `callbacks` already lists something (e.g. `"prometheus"`), add it to that list.
+4. Give the proxy the environment below and restart it. Start in `shadow`; after a week, read
+   `routing.jsonl` (`chosen` vs `applied`, `violation`, `action: block`, `source: fallback`) before
+   `enforce`. For stickiness across several workers, share LiteLLM's key cache through Redis
+   (`litellm_settings.enable_redis_auth_cache: true`); the router then keeps each conversation's
+   model there too.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `REFLEX_ROUTING_MODE` | `shadow` | `off` · `shadow` (log only, no added latency) · `enforce` (rewrite the model) |
+| `REFLEX_ROUTING_POLICY` | `routing/policy.json` next to the module | Families, pools, tiers, stickiness, latency budget, cache TTL, fallback |
+| `REFLEX_ROUTING_QUESTIONS` | `routing/questions.json` next to the module | The three Jev questions |
+| `REFLEX_REDACT` | `setup/redact.json` beside the module's directory | Secret patterns shared with the gate; without it routing is skipped (requests keep their model) |
+| `REFLEX_DATA_DIR` | `~/.local/state/reflex` | Where `routing.jsonl` is written (inside Docker, mount a volume) |
+| `TYPESAFE_API_KEY` / `REFLEX_KEYCHAIN_SERVICE` | — / `typesafe-api-key` | Same key lookup as the gate; the Keychain is not reachable from a container, so use the variable there |
+| `REFLEX_MODEL`, `REFLEX_API_URL` | as the gate | Jev model and endpoint |
+| `REFLEX_CONTEXT_TIMEOUT_MS` | `8000` | Budget for one context-layer Jev call (up to 24 questions), capped at 25000 (omp gives a handler 30 s); on timeout the context is left as it was |
+| `REFLEX_CHUNK_DAYS` / `REFLEX_CHUNK_MB` | `7` / `200` | Context-layer chunk store: delete chunks unused for this many days, then the least recently used beyond this size |
+| `REFLEX_CACHE_READ` / `REFLEX_CACHE_WRITE` | `0.1` / `1.25` | Prompt-cache read and write price as a fraction of uncached input, for the rebuild-or-keep decision |
+| `REFLEX_CONTEXT` | set by `install.mjs` | Path to `context.mjs` for the pi / omp context extension |
+| `REFLEX_REVIEWER` | — | Reviewer command for `bin/reflex-review`, e.g. `codex exec -s read-only -` |
 
 ## Optional: Grafana
 
@@ -138,5 +244,5 @@ team.
 
 ```sh
 node install.mjs --agent all --uninstall
-rm -rf ~/.local/state/reflex        # optional: the logs
+rm -rf ~/.local/state/reflex        # optional: logs, the context layer's chunk store, bundles, reviews
 ```

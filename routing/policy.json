@@ -1,0 +1,76 @@
+{
+  "name": "Model routing",
+  "version": "routing-v3",
+  "subject": "Which model serves a request, by how sensitive its content is and how hard it is. Routing stays inside one family: the clients' credentials are not interchangeable across providers.",
+  "latency_budget_ms": 1500,
+  "cache_ttl_s": 3600,
+  "no_eligible": {
+    "action": "block",
+    "model": null,
+    "note": "enforce, when no model in the family is both eligible for the content and allowed for the caller's key: block (reject the request with an error), keep (send it to the requested model; the log marks the violation) or fallback_model (send it to `model`, which the key must be allowed to call; otherwise block). Shadow only logs the action."
+  },
+  "require_same_guardrails": true,
+  "require_same_limits": true,
+  "require_same_note": "LiteLLM applies model-level guardrails (litellm_params.guardrails), the key's per-model rpm / tpm limits and the per-model budgets of the key, the internal user and the end user (model_max_budget, user_model_max_budget, end_user_model_max_budget; LiteLLM 1.100.1) for the requested model before this hook runs, and not again for the model it picks. A team's model_max_budget is not enforced per request in 1.100.1 and is not compared. true: a model whose guardrails (or limits) differ from the requested model's is never chosen; the log lists it under excluded. The requested model itself is always allowed.",
+  "paths_to_jev": "shape_outside_repo",
+  "paths_to_jev_note": "full: every path as written. shape_outside_repo: paths inside the agent's working directory as repo-relative paths, others as their file name plus [outside repo, sensitive] flags. shape: every path as file name plus flags. restricted_paths are always matched on the full path, locally.",
+  "fallback": {
+    "sensitivity": "restricted",
+    "difficulty": 1,
+    "note": "Any Jev error or timeout: treat the content as restricted and the task as medium."
+  },
+  "sensitivity": {
+    "order": ["public", "application", "restricted", "proprietary"],
+    "restricted_at": 0.25,
+    "restricted_at_note": "Treat the request as restricted when P(restricted) + P(proprietary) reaches this, whatever the top choice was.",
+    "restricted_paths": [
+      "(^|/)\\.env(\\.[\\w-]+)?$",
+      "\\.(pem|key|p12|pfx|tfvars|tfstate)$",
+      "(^|/)(id_rsa|id_ed25519|\\.netrc|\\.npmrc|\\.pypirc)$",
+      "(^|/)\\.aws/(credentials|config)$",
+      "(^|/)\\.kube/config$",
+      "(^|/)\\.ssh/",
+      "secret",
+      "(^|/)envs?/prod"
+    ],
+    "pools": {
+      "public": {"require": [], "note": "Any model in the family; cheapest first."},
+      "application": {"require": ["first_party"], "note": "No third-party hosts."},
+      "restricted": {"require": ["first_party", "frontier"], "note": "First-party frontier only."},
+      "proprietary": {"require": ["first_party", "frontier"], "note": "First-party frontier only."}
+    }
+  },
+  "tiers": {
+    "order": ["small", "medium", "large"],
+    "up_at": {"medium": 0.4, "large": 0.5},
+    "from_score": {"small": 0, "medium": 0.6, "large": 1.4},
+    "note": "difficulty is a 0-2 score whose levels are the tiers in order. up_at: the tier is the highest whose probability mass P(level >= tier) reaches its threshold, so a hesitant answer routes up (under-tiering costs quality, over-tiering only money). from_score: used instead when an answer has no probabilities (the fallback) or up_at is absent; the tier is the highest whose threshold the expected score reaches. A model of a higher tier may serve a lower one, never the reverse."
+  },
+  "needs_tools_at": 0.5,
+  "stickiness": {
+    "cache_read_factor": 0.1,
+    "turn_tokens": 3000,
+    "remaining_turns": 1,
+    "note": "Mid-conversation, a cheaper model is only taken when (context x cache_read_factor + turn_tokens) x (old - new input price) x remaining_turns exceeds context x new input price, the cost of the new model reprocessing the whole context. remaining_turns 1: the switch must pay for itself on the next turn, because nobody knows how many turns are left; at 1/cache_read_factor turns the context term cancels and every cheaper model wins. Moves to a higher tier, and moves forced by sensitivity, always happen."
+  },
+  "families": {
+    "claude": {
+      "aliases": ["claude-auto"],
+      "note": "Claude Code via the forwarded subscription login. A request is routed when its model is one of these (a dated or suffixed id such as claude-haiku-4-5-20251001 counts) or an alias; any other model is left alone. Prices are list USD per million input tokens; edit to your contract. max_context (optional, tokens): the model is skipped when the estimated context is larger.",
+      "models": {
+        "claude-haiku-4-5": {"tier": "small", "price_in": 1.0, "first_party": true, "frontier": false, "max_context": 200000},
+        "claude-sonnet-5": {"tier": "medium", "price_in": 3.0, "first_party": true, "frontier": true},
+        "claude-opus-5": {"tier": "large", "price_in": 5.0, "first_party": true, "frontier": true}
+      }
+    },
+    "chatgpt": {
+      "aliases": ["auto"],
+      "note": "Codex via the ChatGPT subscription. Prices are placeholders for relative cost; edit to your contract.",
+      "models": {
+        "gpt-5.6-luna": {"tier": "small", "price_in": 0.25, "first_party": true, "frontier": false},
+        "gpt-5.6-terra": {"tier": "medium", "price_in": 1.25, "first_party": true, "frontier": true},
+        "gpt-5.6-sol": {"tier": "large", "price_in": 5.0, "first_party": true, "frontier": true}
+      }
+    }
+  }
+}

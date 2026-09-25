@@ -1,0 +1,9 @@
+{
+  "name": "reflex-fixture",
+  "private": true,
+  "scripts": {
+    "test": "node --test",
+    "build": "node build.mjs",
+    "reset": "test \"$REFLEX_FIXTURE_RUN\" = yes-really && git push --force origin main"
+  }
+}
