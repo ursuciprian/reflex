@@ -7,6 +7,8 @@ import {join} from "node:path";
 import {CONFIG, USER_CONFIG, USER_CONFIG_FILE, configurationError, load, setupFile} from "./gate.mjs";
 import {compile} from "./policy.mjs";
 import {detectors, guardMode, sourceKind} from "./guard.mjs";
+import {judgeKey, probe, budgetState} from "./judge2.mjs";
+import {breaker, listItems} from "./autonomy.mjs";
 
 const doctor = process.argv.includes("--doctor"), json = process.argv.includes("--json");
 const errors = [], warnings = [], agents = [];
@@ -109,12 +111,37 @@ for (const [name, saved] of Object.entries(USER_CONFIG.agents ?? {})) {
   agents.push(item);
 }
 if (!agents.length) warnings.push("No agent installations recorded. Run reflex setup --agents claude,codex, or use reflex run in your own terminal.");
-const result = {engine: CONFIG.engine, mode: CONFIG.mode, guard: guardMode(), allow: CONFIG.allow, config: USER_CONFIG_FILE,
-  policy, api_key: key, agents, errors, warnings};
+// The escalation ladder. Reachability is a GET of the judge's model list: never a paid call.
+const cliJudge = CONFIG.judge.backend === "cli";
+const judge = {enabled: CONFIG.judge.enabled, backend: CONFIG.judge.backend, ...(cliJudge ? {cli: CONFIG.judge.cli, command: CONFIG.judge.command ?? null}
+  : {url: CONFIG.judge.url, key: judgeKey() ? "found" : CONFIG.judge.key_env || CONFIG.judge.keychain ? "missing" : "none configured"}),
+  model: CONFIG.judge.model ?? null, reachable: null, status: null, budget: null};
+if (!configuration && CONFIG.judge.enabled) {
+  const p = await probe();
+  const b = budgetState();
+  Object.assign(judge, {reachable: p.reachable, status: p.status, budget: {day: b.day, calls_used: b.calls, calls_left: b.calls_left, usd_used: +b.usd.toFixed(4), usd_left: b.usd_left}});
+  if (!p.reachable) warnings.push(cliJudge ? `System 2's CLI (${p.url}) was not found: every escalation goes to a human. Re-run reflex setup --profile autonomous.`
+    : `System 2 is not reachable at ${p.url} (${p.error}): every escalation goes to a human.`);
+  else if (!p.ok) warnings.push(`System 2 answered HTTP ${p.status} at ${p.url}${p.status === 401 || p.status === 403 ? `: check the key (${CONFIG.judge.key_env ? `$${CONFIG.judge.key_env}` : "judge.keychain"})` : ""}.`);
+  if (b.calls_left <= 0 || b.usd_left <= 0) warnings.push("System 2's daily budget is used up: escalations go to a human until tomorrow (UTC).");
+  const br = breaker();
+  judge.breaker = {open: br.open, rate: +br.rate.toFixed(2), decisions: br.n};
+  if (br.open) warnings.push(`System 2 is paused: ${Math.round(100 * br.rate)}% of the last ${br.n} commands escalated in ${CONFIG.judge.breaker.window_minutes} min, above ${Math.round(100 * CONFIG.judge.breaker.rate)}%; cases go to the queue.`);
+  if (CONFIG.mode !== "enforce") warnings.push(`System 2 is on but the mode is ${CONFIG.mode}: it is logged as what would have happened.`);
+}
+const items = listItems(), pending = items.filter(i => i.status === "pending");
+const queue = {enabled: CONFIG.queue.enabled, pending: pending.length, total: items.length, oldest_pending: pending.at(-1)?.created ?? null};
+if (pending.length) warnings.push(`${pending.length} item${pending.length === 1 ? "" : "s"} waiting in the approval queue: reflex queue list.`);
+const result = {profile: CONFIG.profile, engine: CONFIG.engine, mode: CONFIG.mode, guard: guardMode(), allow: CONFIG.allow, config: USER_CONFIG_FILE,
+  policy, api_key: key, judge, queue, checkpoints: CONFIG.checkpoints, agents, errors, warnings};
 if (json) console.log(JSON.stringify(result, null, 2));
 else {
-  console.log(`Reflex: ${CONFIG.engine} engine · ${CONFIG.mode} mode · guard ${guardMode()} · allow ${CONFIG.allow}`);
+  console.log(`Reflex: ${CONFIG.profile} profile · ${CONFIG.engine} engine · ${CONFIG.mode} mode · guard ${guardMode()} · allow ${CONFIG.allow}`);
   console.log(`Settings: ${USER_CONFIG_FILE}\nPolicy: ${policy}\nAPI key: ${key}`);
+  console.log(`System 2: ${judge.enabled ? `${cliJudge ? `cli ${judge.cli} (${judge.command ?? "from PATH"})` : `${judge.backend} ${judge.url}; key ${judge.key}`}; model ${judge.model ?? "default"}; ` +
+    `${judge.reachable ? (cliJudge ? "found" : `reachable (HTTP ${judge.status})`) : judge.reachable === false ? "NOT reachable" : "not checked"}` +
+    (judge.budget ? `; budget left today ${judge.budget.calls_left} calls, $${judge.budget.usd_left}` : "") : "off"}`);
+  console.log(`Queue: ${queue.enabled ? "on" : "off"}; ${queue.pending} pending of ${queue.total} · checkpoints ${CONFIG.checkpoints ? "on" : "off"}`);
   for (const a of agents) console.log(`${a.name}: ${a.configured ? "configured" : "not verified"}${a.guard ? " + guard" : ""}; ${a.mode}/${a.engine}; ${a.hook_observed ? "hook observed" : "awaiting hook event"}; ${a.version ?? "version unknown"}${a.checks.length ? `; probes ${a.checks.every(c => c.ok) ? "passed" : "FAILED"}` : ""}`);
   for (const w of warnings) console.log(`Note: ${w}`);
   for (const e of errors) console.error(`Error: ${e}`);

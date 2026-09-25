@@ -21,6 +21,8 @@ const MODE = process.env.REFLEX_MODE ?? "__REFLEX_MODE__";
 const ALLOW = process.env.REFLEX_ALLOW ?? "__REFLEX_ALLOW__";
 const INSTRUCTIONS = GATE.replace(/gate\.mjs$/, "instructions.mjs");
 const GUARD = GATE.replace(/gate\.mjs$/, "guard.mjs");
+// 0: the default; with System 2 on, install.mjs writes how long a gate call may take (Jev plus the judge).
+const GATE_TIMEOUT_MS = Number("__REFLEX_GATE_TIMEOUT_MS__") || 15000;
 const selected = new Map();   // sessionID -> injected text. ponytail: never pruned; one short string per session.
 // Built-in tools: those that only touch the user's own work are not sent to the guard; any tool
 // not built in is an MCP (or plugin) tool. ponytail: a list per opencode version.
@@ -70,7 +72,8 @@ function guardResult(input, output, directory, session_id) {
 
 function gate(flag, payload, script = GATE) {
   const args = script === GATE ? [script, flag, "--mode", MODE, "--allow", ALLOW] : [script, flag, "--mode", MODE];
-  const r = spawnSync(NODE, args, {input: JSON.stringify(payload), encoding: "utf8", timeout: 15000});   // the guard: an 8 s Jev budget plus node start
+  // the guard: an 8 s Jev budget plus node start; the gate: Jev, and System 2 when it is on
+  const r = spawnSync(NODE, args, {input: JSON.stringify(payload), encoding: "utf8", timeout: script === GATE ? GATE_TIMEOUT_MS : 15000});
   return r.stdout;
 }
 

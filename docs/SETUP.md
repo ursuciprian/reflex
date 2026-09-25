@@ -229,6 +229,90 @@ node install.mjs --agent all --mode enforce --allow on       # skip the agent's 
 
 See [Calibrated allow](GUIDE.md#calibrated-allow). `REFLEX_ALLOW` overrides the installed value.
 
+## 7. Optional: the autonomous profile
+
+For agents that should not wait for you on every uncertain command. Read
+[GUIDE: autonomous agents](GUIDE.md#autonomous-agents) first; it assumes the Jev engine.
+
+```sh
+reflex setup --profile autonomous --dry-run   # the effective settings; nothing is written
+reflex setup --profile autonomous             # engine jev, enforce, allow on, System 2, queue, checkpoints
+```
+
+**System 2.** Setup picks a backend and prints which:
+
+- the `claude` CLI, when it is on `PATH`: no extra key, it uses your existing sign-in. It runs with
+  no tools, hooks, MCP servers or CLAUDE.md, in an empty directory, with Reflex off for that process,
+  and a pinned model (`sonnet` unless you pass `--judge-model`). Measured: about 3,100 input tokens
+  (mostly cached after the first call), ~300 output tokens, 3 to 4 s, $0.004 to $0.016 a call at API
+  prices; see [GUIDE](GUIDE.md#system-2) for the numbers and why Haiku is not a default.
+- else `anthropic` when `ANTHROPIC_API_KEY` is set (the Messages API, model `claude-sonnet-5`, the steadiest judge in live tests);
+- else `none`: uncertain commands go straight to the approval queue.
+
+Pick one yourself with `--judge`:
+
+```sh
+reflex setup --judge cli --judge-cli claude [--judge-model sonnet]
+reflex setup --judge cli --judge-cli codex                 # heavier: codex sends its base instructions with every call
+reflex setup --judge anthropic [--judge-model claude-sonnet-5] [--judge-key-env ANTHROPIC_API_KEY | --judge-keychain ITEM]
+reflex setup --judge openai-compatible --judge-url http://localhost:11434 --judge-model llama3.1      # Ollama
+reflex setup --judge openai-compatible --judge-url https://api.openai.com --judge-model MODEL --judge-key-env OPENAI_API_KEY
+reflex setup --judge openai-compatible --judge-url http://localhost:4000 --judge-model MODEL --judge-key-env LITELLM_KEY  # a LiteLLM gateway
+reflex setup --judge none
+```
+
+Keys are read from the environment variable named by `--judge-key-env` (its name is saved, never the
+key) or the macOS Keychain item named by `--judge-keychain`. `--judge-timeout SECONDS` (20),
+`--judge-budget-calls N` (200 a day) and `--judge-budget-usd X` ($5 a day) set limits; with System 2
+on, setup gives the Claude Code, Codex and Hermes gate hooks the judge's timeout plus 30 s, so a slow
+answer never makes a hook time out (which would let the command through). Further settings live in
+`judge` in `config.json`:
+
+```json
+"judge": {"backend": "anthropic", "model": "claude-sonnet-5", "max_input_tokens": 1500, "max_tokens": 100,
+          "thinking": "disabled", "min_confidence": 0.8, "cache_ttl_hours": 12,
+          "tiers": null,
+          "budget": {"calls": 200, "usd": 5, "session_calls": 40, "session_usd": 1},
+          "price": {"input": 5, "output": 25},
+          "breaker": {"rate": 0.3, "window_minutes": 60, "min_decisions": 20}}
+```
+
+`tiers` asks models in order, cheapest first, for example
+`[{"model": "a-small-model", "min_confidence": 0.9}, {}]` (each entry overrides the settings above;
+`{}` is the configured model). Add a small model only after `npm run eval-ladder` passes with it:
+in measurement Haiku ignored the JSON-only instruction and misread a simple case. `price` is USD per million tokens, for the cost estimate; set it for your
+model. Check with `reflex status`: it shows the backend, whether it is reachable (a GET of the model
+list, or that the CLI is installed; never a paid call), the budget left and the breaker.
+
+**The approval queue.** A decision that needs you is refused with a queue id, and the agent moves on:
+
+```sh
+reflex queue                                 # what waits
+reflex queue approve <id> [--ttl 2h]         # the agent's identical retry runs, once
+reflex queue deny <id> --reason "why"
+reflex setup --queue-ttl 8 --notify 'terminal-notifier -title reflex -message "$REFLEX_QUEUE_ID"'
+```
+
+`--notify` runs a command for each new item, with `REFLEX_QUEUE_ID`, `REFLEX_QUEUE_REASON` and
+`REFLEX_QUEUE_AGENT` in its environment. `--queue off` makes a human decision an `ask` in the agent
+again.
+
+**Task envelope.** Say what the agent may touch; work inside it resolves without escalation:
+
+```sh
+reflex envelope set "may modify this repo and the dev AWS account (profile dev); nothing in prod" --ttl 8h
+reflex envelope show
+```
+
+A `.reflex/envelope.md` in a repository can only narrow yours.
+
+**Checkpoints.** `reflex checkpoints` lists the recovery points taken before mutating commands in a
+git repository; `reflex checkpoints restore <name>` brings the tracked files back (untracked files,
+other directories and remote systems are not covered). `--checkpoints off` turns them off.
+
+**Watch it.** `reflex report` shows human interventions per 100 commands, System 2's escalation
+rate, verdicts, tokens and cost, cache hits, queue waits and fast-lane candidates.
+
 ## Configuration
 
 All optional.
@@ -248,6 +332,9 @@ All optional.
 | `REFLEX_GUARD` | `"guard"` in `config.json`, else the gate's mode | Injection guard mode: `off` · `shadow` (log only) · `enforce` (warn, rewrite, taint, block credential prompts) |
 | `REFLEX_GUARD_TIMEOUT_MS` | `8000` | Budget for the guard's one Jev request per result; on timeout the detectors decide |
 | `REFLEX_INJECTION_DIR` | `./setup/injection` | Directory with the guard's detectors / questions / policy / golden; a file missing there comes from the next place |
+| `REFLEX_JUDGE` | the saved `judge.backend` | `off` turns System 2 off for this session (autonomous profile) |
+| `REFLEX_QUEUE` | saved `queue` | `on` · `off`: park human decisions in the approval queue, or ask in the agent |
+| `REFLEX_CHECKPOINTS` | saved `checkpoints` | `on` · `off`: git recovery points before mutating commands |
 | `REFLEX_INSTRUCTIONS_THRESHOLD` | `0.5` | Jev probability at which a conditional instruction fragment is injected |
 | `REFLEX_INSTRUCTIONS_MAX_CHARS` | `6000` | Most fragment text injected per prompt; whole fragments are dropped, never cut |
 | `XDG_CONFIG_HOME` | `~/.config` | Personal fragments are read from `$XDG_CONFIG_HOME/reflex/instructions/`; they win over a repo fragment with the same id |

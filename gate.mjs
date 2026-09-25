@@ -28,6 +28,7 @@ import {homedir, platform, tmpdir} from "node:os";
 import {dirname, join, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 import {compile} from "./policy.mjs";
+import {envelopeFor, ladder, queueAnswer} from "./autonomy.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ENV = process.env;
@@ -43,6 +44,21 @@ export const USER_CONFIG = (() => {
     return value;
   } catch (e) { if (e.code !== "ENOENT") USER_CONFIG_ERROR = `invalid ${USER_CONFIG_FILE}: ${e.message}`; return {}; }
 })();
+// System 2 (judge2.mjs). `backend`: cli (an agent CLI already installed and signed in: claude or
+// codex, no extra key), anthropic (Messages API), openai-compatible (any /v1/chat/completions
+// endpoint: OpenAI, Ollama, vLLM, LM Studio, LiteLLM, OpenRouter), none. A per-day cap of 200 calls
+// or $5 (price: USD per million input / output tokens, for the estimate; a CLI counts calls only).
+export const JUDGE_BACKENDS = ["cli", "anthropic", "openai-compatible", "none"];
+// Spend is small by design: a case assembled to max_input_tokens, a JSON verdict in max_tokens, no
+// extended thinking, a verdict cache, optional cheaper tiers first (judge.tiers), per-day and
+// per-session caps, and a breaker that pauses System 2 when the last hour escalated too much.
+export const JUDGE_DEFAULTS = {backend: "none", url: null, model: null, key_env: null, keychain: null, timeout_ms: 20000, max_tokens: 100,
+  max_input_tokens: 1500, thinking: "disabled", effort: "low", min_confidence: 0.8, cache_ttl_hours: 12, tiers: null,
+  budget: {calls: 200, usd: 5, session_calls: 40, session_usd: 1}, price: {input: 5, output: 25},
+  breaker: {rate: 0.3, window_minutes: 60, min_decisions: 20}};
+export const BACKEND_DEFAULTS = {cli: {cli: "claude", model: "sonnet"}, anthropic: {url: "https://api.anthropic.com", model: "claude-sonnet-5", key_env: "ANTHROPIC_API_KEY"},
+  "openai-compatible": {}, none: {}};
+export const QUEUE_DEFAULTS = {ttl_hours: 24, notify: null};
 export const CONFIG = {
   api: ENV.REFLEX_API_URL ?? "https://api.typesafe.ai/v1/systemone",
   model: ENV.REFLEX_MODEL ?? "jev-1.13.0",              // pinned so a decision can be reproduced
@@ -57,7 +73,21 @@ export const CONFIG = {
   data: ENV.REFLEX_DATA_DIR ?? join(ENV.XDG_STATE_HOME ?? join(homedir(), ".local/state"), "reflex"),
   timeoutMs: Number(ENV.REFLEX_TIMEOUT_MS ?? 3000),
   keychain: ENV.REFLEX_KEYCHAIN_SERVICE ?? USER_CONFIG.keychain ?? "typesafe-api-key",
+  // The escalation ladder (autonomous profile, autonomy.mjs): System 2, the async human queue and
+  // checkpoints. Off unless config.json turns them on; REFLEX_JUDGE / REFLEX_QUEUE / REFLEX_CHECKPOINTS
+  // (on | off) override for one session (`reflex run` turns them off: a human is at the terminal).
+  profile: USER_CONFIG.profile ?? "supervised",
+  judge: judgeSettings(USER_CONFIG.judge, ENV.REFLEX_JUDGE),
+  queue: {...QUEUE_DEFAULTS, ...USER_CONFIG.queue, enabled: onOff(ENV.REFLEX_QUEUE, USER_CONFIG.queue?.enabled)},
+  checkpoints: onOff(ENV.REFLEX_CHECKPOINTS, USER_CONFIG.checkpoints),
 };
+/** Saved judge settings with the backend's defaults filled in; `enabled` unless the backend is none or REFLEX_JUDGE=off. */
+export function judgeSettings(saved = {}, env) {
+  const backend = saved?.backend ?? JUDGE_DEFAULTS.backend, s = saved ?? {};
+  return {...JUDGE_DEFAULTS, ...BACKEND_DEFAULTS[backend], ...s, backend, budget: {...JUDGE_DEFAULTS.budget, ...s.budget},
+          price: {...JUDGE_DEFAULTS.price, ...s.price}, breaker: {...JUDGE_DEFAULTS.breaker, ...s.breaker}, enabled: env === undefined || env === "on" ? backend !== "none" : env === "off" ? false : env};
+}
+function onOff(env, saved) { return env === undefined ? saved === true : env === "on" ? true : env === "off" ? false : env; }
 // Functions, not constants, so the self-check can point the whole gate at a scratch directory.
 const TRACE = () => join(CONFIG.data, "trace.jsonl");
 const FEEDBACK = () => join(CONFIG.data, "feedback.jsonl");
@@ -72,7 +102,36 @@ export const load = f => JSON.parse(readFileSync(setupFile(f), "utf8"));
 export function configurationError() {
   return USER_CONFIG_ERROR ?? (!["local", "jev"].includes(CONFIG.engine) ? "engine must be local or jev"
     : !["off", "shadow", "enforce"].includes(CONFIG.mode) ? "mode must be off, shadow or enforce"
-    : !["off", "shadow", "on"].includes(CONFIG.allow) ? "allow must be off, shadow or on" : null);
+    : !["off", "shadow", "on"].includes(CONFIG.allow) ? "allow must be off, shadow or on" : ladderError());
+}
+// Invalid ladder settings ask, like any invalid configuration: a typo must not turn System 2 into an approver.
+function ladderError() {
+  const j = CONFIG.judge, q = CONFIG.queue, num = (v, lo, hi = Infinity) => typeof v === "number" && Number.isFinite(v) && v >= lo && v <= hi;
+  for (const [k, v] of [["judge", j.enabled], ["queue", q.enabled], ["checkpoints", CONFIG.checkpoints]])
+    if (typeof v !== "boolean") return `${k} must be on or off`;
+  if (!["supervised", "autonomous"].includes(CONFIG.profile)) return "profile must be supervised or autonomous";
+  if (!num(q.ttl_hours, 0.01) || (q.notify != null && typeof q.notify !== "string")) return "queue.ttl_hours must be a positive number and queue.notify a command";
+  if (!JUDGE_BACKENDS.includes(j.backend)) return `judge.backend must be one of ${JUDGE_BACKENDS.join(", ")}`;
+  if (!j.enabled) return null;
+  if (j.backend === "cli") {
+    if (!["claude", "codex"].includes(j.cli)) return "judge.cli must be claude or codex";
+    if (j.command != null && (typeof j.command !== "string" || !j.command.startsWith("/"))) return "judge.command must be an absolute path";
+    if (j.model != null && (typeof j.model !== "string" || !/^[\w.:\/-]+$/.test(j.model))) return "judge.model must be a model name";
+  } else {
+    let url;
+    try { url = new URL(j.url); } catch { return `judge.url must be a URL (the ${j.backend} endpoint)`; }
+    if (!/^https?:$/.test(url.protocol)) return "judge.url must be http or https";
+    if (typeof j.model !== "string" || !j.model) return "judge.model must be a model name";
+  }
+  if (!num(j.timeout_ms, 100) || !num(j.max_tokens, 16) || !num(j.max_input_tokens, 200) || !num(j.min_confidence, 0, 1) || !num(j.cache_ttl_hours, 0) ||
+      !["calls", "usd", "session_calls", "session_usd"].every(k => num(j.budget[k], 0)) || !num(j.price.input, 0) || !num(j.price.output, 0) ||
+      !num(j.breaker.rate, 0, 1) || !num(j.breaker.window_minutes, 1) || !num(j.breaker.min_decisions, 1))
+    return "judge: timeout_ms, max_tokens, max_input_tokens, min_confidence, cache_ttl_hours, budget, price and breaker must be numbers in range";
+  if (j.tiers != null && (!Array.isArray(j.tiers) || j.tiers.some(t => !t || typeof t !== "object" || (t.backend && !JUDGE_BACKENDS.includes(t.backend)) ||
+      (t.min_confidence != null && !num(t.min_confidence, 0, 1)))))
+    return "judge.tiers must be a list of overrides ({model, backend, url, min_confidence, ...}), cheapest first";
+  if (j.thinking != null && !["disabled", "adaptive"].includes(j.thinking)) return "judge.thinking must be disabled, adaptive or null";
+  return null;
 }
 export const sha = v => createHash("sha256").update(typeof v === "string" ? v : JSON.stringify(v)).digest("hex").slice(0, 12);
 export const readText = p => { try { return readFileSync(p, "utf8"); } catch { return null; } };
@@ -539,8 +598,10 @@ export function precheck(command, cwd, env) {
   // The checkout itself is protected wherever it was cloned, not only under a directory named reflex.
   const inRepo = cwd && (cwd + "/").startsWith(HERE + "/");
   if (command.includes(HERE) || command.includes(CONFIG.data) || command.includes(dirname(USER_CONFIG_FILE)) ||
-      /\breflex\s+(setup|install|uninstall)\b/.test(command) ||
-      (inRepo && /\b(gate|policy|install|eval|report|instructions|context)\.mjs\b|\bsetup\/|\brouter\/|\brouting\/|\bbin\/reflex-|\badapters\/|\.git\/hooks/.test(command)))
+      // an agent must not answer its own queue item, widen its own envelope or rewind the tree
+      /\breflex\s+(setup|install|uninstall)\b/.test(command.replace(/["'\\]/g, "")) ||
+      /\breflex\b[^\n;&|]*\b(queue|envelope|checkpoints)\b[^\n;&|]*\b(approve|deny|clear|set|restore)\b/.test(command.replace(/["'\\]/g, "")) ||
+      (inRepo && /\b(gate|policy|install|eval|report|instructions|context|autonomy|judge2|eval-ladder)\.mjs\b|\bsetup\/|\brouter\/|\brouting\/|\bbin\/reflex-|\badapters\/|\.git\/hooks/.test(command)))
     return ruled({outcome: "ask", rule: "touches the Reflex gate, its setup or its logs", id: "tamper"});
   const on = (r, what) => (r.applies_to ?? ["command"]).includes(what);
   const hit = checkRules(haystack, {rules: rules.rules.filter(r => !r.before_read_only && on(r, "command"))}, bare);
@@ -638,18 +699,25 @@ export async function jevJudge({command, cwd, env, session = {}, useCache = true
     excerpt: seen.map(s => seen.length > 1 ? `# --- ${s.path}\n${s.excerpt}` : s.excerpt).join("\n").slice(0, SCRIPT_BYTES)} : undefined;
   const state = {[spec.item_key]: {title: redact(command).slice(0, 160), command: redact(command), cwd, env, ...(script && {script}), ...session},
                  [spec.context_key]: spec.context};
-  // An edited script is a different command: its content is part of the key.
-  const key = sha([redact(command), cwd, env, spec.version, CONFIG.model, ...scripts.map(s => sha(s.body))]);
+  // A question with `requires` is asked only when that part of the call is there (the envelope ones).
+  const present = p => p.split(".").reduce((o, k) => o?.[k], state[spec.item_key]) != null;
+  const questions = Object.fromEntries(Object.entries(spec.questions).filter(([, q]) => !q.requires || present(q.requires))
+    .map(([id, {requires, ...q}]) => [id, q]));
+  // An edited script is a different command: its content is part of the key, and so is the envelope.
+  const key = sha([redact(command), cwd, env, spec.version, CONFIG.model, ...scripts.map(s => sha(s.body)), ...(session.envelope ? [session.envelope] : [])]);
   const cached = useCache && cacheGet(key);
-  const res = cached ? {answers: cached, usage: {}, error: null, latency_s: 0} : await asker(state, spec.questions);
+  const res = cached ? {answers: cached, usage: {}, error: null, latency_s: 0} : await asker(state, questions);
   // Every question must come back with a value, or the policy would read missing answers as "no".
-  const missing = Object.keys(spec.questions).filter(q => !(cached && SESSION_BOUND.includes(q)) &&
+  const missing = Object.keys(questions).filter(q => !(cached && SESSION_BOUND.includes(q)) &&
     (res.answers?.[q]?.noul ?? res.answers?.[q]?.choice ?? res.answers?.[q]?.score) == null);
   if (!res.error && missing.length) res.error = `incomplete answer: missing ${missing.join(", ")}`;
   if (!cached && !res.error && useCache) cachePut(key, res.answers);
   // Taint is a fact about the session, not the command: never cached, logged with the answers so
-  // report.mjs replays it.
+  // report.mjs replays it. Which envelopes exist is a fact too: the envelope gates read these flags,
+  // so a repository's envelope alone can never reach the gate that passes work inside the user's.
   if (tainted && !res.error) res.answers = {...res.answers, tainted: {noul: 1}};
+  if (!res.error && session.envelope?.user) res.answers = {...res.answers, envelope: {noul: 1}};
+  if (!res.error && session.envelope?.repo) res.answers = {...res.answers, repo_envelope: {noul: 1}};
   const d = res.error
     ? {outcome: policy.policy.fallback ?? "ask", rule: `jev unavailable (${res.error.slice(0, 80)})`}
     : policy.decide(res.answers, policy.values());
@@ -664,10 +732,13 @@ export async function jevJudge({command, cwd, env, session = {}, useCache = true
     : redact(command) !== command ? "redacted command"
     : scripts.some(s => s.partial) || script?.excerpt.length >= SCRIPT_BYTES ? "runs code Jev did not see in full"
     : [homedir(), "/", dirname(homedir())].includes(resolve("/", cwd || "/")) ? "broad cwd" : null;
+  const allowGuard = res.error ? "no answer" : cached ? "cached answer" : !session.intent ? "no stated intent" : redact(command) !== command ? "redacted command"
+    : scripts.some(s => s.partial) || script?.excerpt.length >= SCRIPT_BYTES ? "runs code Jev did not see in full"
+    : [homedir(), "/", dirname(homedir())].includes(resolve("/", cwd || "/")) ? "broad cwd" : null;
   const policyOutcome = d.outcome;   // logged as is, so report.mjs replays policy against policy
   if (d.outcome === "allow" && noAllow) Object.assign(d, {outcome: "pass", rule: `low risk (not allowed: ${noAllow})`});
   return {outcome: d.outcome, policy_outcome: policyOutcome, rule: d.rule, source: res.error ? "fallback" : cached ? "cache" : "jev",
-          state, questions: spec.questions, qset: spec.version, policy_version: policy.version, ...res};
+          state, questions, gate: d.path?.at(-1)?.outcome === "yes" ? d.path.at(-1).gate : null, allow_guard: allowGuard, qset: spec.version, policy_version: policy.version, ...res};
 }
 
 /** The whole gate for one command, as eval.mjs and the hook see it. */
@@ -687,7 +758,7 @@ const localJudgment = () => ({outcome: "ask", source: "local", rule: "not covere
 // A call with `subgoal` (the task a subagent is about to get), or `subgoals` (a batch of them), and
 // no `command` is checked for duplicates, see subgoalJudge(); a batch where only some items repeat
 // earlier work also gets `drop`, the indexes to leave out. A command is always judged as a command.
-export async function decide(call, {background = false, asker} = {}) {
+export async function decide(call, {background = false, asker, judger} = {}) {
   const subgoals = call.command ? [] : [call.subgoals ?? call.subgoal].flat().filter(s => typeof s === "string" && s.trim());
   if (CONFIG.mode === "off" || !(call.command || subgoals.length)) return {effective: "pass", decision: "pass", reason: "reflex off", source: "off"};
   if (subgoals.length) {
@@ -699,6 +770,13 @@ export async function decide(call, {background = false, asker} = {}) {
   }
   const env = envContext(call.cwd);
   const quick = background ? null : precheck(call.command, call.cwd, env);
+  // A human's answer in the approval queue (autonomous profile): the identical command, cwd and
+  // session, within its TTL. A deterministic deny is never lifted, not even by an approval.
+  if (CONFIG.mode === "enforce" && !background && CONFIG.queue.enabled && quick?.source !== "read-only" &&
+      !(quick?.source === "rule" && quick.outcome === "deny")) {
+    const q = queueAnswer(call);
+    if (q) return finish(q, call, q.outcome === "deny" ? "deny" : allowSetting(holdAllow(q, call)).outcome === "allow" ? "allow" : "pass", {env});
+  }
   // A session whose agent read a suspected prompt injection: network egress asks, before the
   // read-only list and the fast lane (`gh api "…?q=$SECRET"` reads, `git push` is fast lane), and
   // Jev's policy applies its taint gates. Like Jev, enforced only in enforce mode (shadow takes the
@@ -708,31 +786,34 @@ export async function decide(call, {background = false, asker} = {}) {
   const egress = t && CONFIG.mode === "enforce" && !(quick?.source === "rule" && quick.outcome !== "pass") && taintedRule(call.command);
   if (egress) {
     const j = CONFIG.engine === "jev" ? await jevJudge({command: call.command, cwd: call.cwd, env, session: callSession(call), asker, tainted: true}) : null;
-    const d = j?.outcome === "deny" ? j : egress;
-    trace(d, call, d.outcome);
-    return view(d, d.outcome);
+    const d = j?.outcome === "deny" ? j : {...egress, ...(j && {answers: j.answers, state: j.state, gate: j.gate})};
+    return finish(d, call, d.outcome, {env, judger, egress: true});
   }
   if (quick) {
     const effective = quick.source === "rule" ? quick.outcome : "pass";
-    if (quick.source !== "read-only") trace(quick, call, effective);
-    return view(quick, effective);
+    if (quick.source === "read-only") return view(quick, effective);
+    return finish(quick, call, effective, {env, judger});
   }
-  if (CONFIG.engine === "local") {
-    const j = localJudgment(), effective = CONFIG.mode === "enforce" ? "ask" : "pass";
-    trace(j, call, effective);
-    return view(j, effective);
-  }
+  if (CONFIG.engine === "local") return finish(localJudgment(), call, CONFIG.mode === "enforce" ? "ask" : "pass", {env, judger, background});
   // Shadow mode: nobody waits for Jev. A detached copy of this script judges and logs.
   if (CONFIG.mode !== "enforce" && !background) return inBackground(call);
   const j = allowSetting(holdAllow(await jevJudge({command: call.command, cwd: call.cwd, env, session: callSession(call), asker, tainted: !!t}), call));
   const effective = CONFIG.mode === "enforce" && j.outcome !== "would_allow" ? j.outcome : "pass";
+  return finish(j, call, effective, {env, judger, background, tainted: !!t});
+}
+// Every judged command ends here: the escalation ladder when the autonomous profile has it on
+// (System 2, the always-human class, the queue, checkpoints), then the trace and the agent's view.
+async function finish(j, call, effective, opts = {}) {
+  if (CONFIG.judge.enabled || CONFIG.queue.enabled || CONFIG.checkpoints) ({j, effective} = await ladder(j, call, effective, opts));
   trace(j, call, effective);
   return view(j, effective);
 }
-function callSession(call) {
+export function callSession(call) {
   const session = sessionContext(call.transcript_path, call.call_id);
   if (call.intent) session.intent = redact(call.intent).slice(-600);
   if (call.recent?.length) session.recent = call.recent.slice(-5).map(c => redact(c).slice(0, 200));
+  const envelope = envelopeFor(call);
+  if (envelope) session.envelope = envelope;
   return session;
 }
 function inBackground(call) {
@@ -758,7 +839,7 @@ function inBackground(call) {
 // ponytail: the files' last 2 MB are read per spawn, no lock (appends are atomic lines).
 const SUBGOALS = () => join(CONFIG.data, "subgoals.jsonl");
 const TAIL_BYTES = 2 * 1024 * 1024;
-function readTail(path, bytes = TAIL_BYTES) {
+export function readTail(path, bytes = TAIL_BYTES) {
   if (!path || !existsSync(path)) return "";
   const size = statSync(path).size, len = Math.min(size, bytes), buf = Buffer.alloc(len);
   const fd = openSync(path, "r");
@@ -766,7 +847,7 @@ function readTail(path, bytes = TAIL_BYTES) {
   return buf.toString("utf8");
 }
 // A torn or cut line is skipped, not fatal.
-const jsonLines = text => text.split("\n").flatMap(l => { try { return l ? [JSON.parse(l)] : []; } catch { return []; } });
+export const jsonLines = text => text.split("\n").flatMap(l => { try { return l ? [JSON.parse(l)] : []; } catch { return []; } });
 async function subgoalJudge(call, asker = ask) {
   const spec = load("subgoals.json");
   const now = Date.now(), pendingMs = (spec.pendingSeconds ?? 300) * 1000, tag = randomUUID().slice(0, 8);
@@ -893,8 +974,9 @@ export function holdAllow(j, call) {
 }
 // A fallback can pass, ask or deny; never allow, whatever the file says.
 function safeFallback() { try { const f = load("policy.json").fallback; return ["pass", "ask", "deny"].includes(f) ? f : null; } catch { return null; } }
-// Only a fresh Jev judgment may allow; a rule, the read-only list or the fast lane never does.
-const view = (j, effective) => ({effective: effective === "allow" && j.source !== "jev" ? "pass"
+// Only a fresh Jev judgment, a System 2 approval or a human's queue approval may allow; a rule, the
+// read-only list or the fast lane never does.
+const view = (j, effective) => ({effective: effective === "allow" && !["jev", "judge", "queue"].includes(j.source) ? "pass"
                                    : ["pass", "allow", "ask", "deny"].includes(effective) ? effective : "ask", decision: j.outcome, reason: `reflex (${j.source}): ${j.rule}`,
                                  source: j.source, policy: j.policy_version ?? null});
 
@@ -924,7 +1006,7 @@ function trace(j, call, effective) {
     decision: j.outcome, policy_decision: j.policy_outcome ?? j.outcome, rule: j.rule, source: j.source, policy_version: j.policy_version ?? null,
     mode: CONFIG.mode, emitted: effective === "pass" ? null : effective,
     agent: call.agent ?? null, session_id: call.session_id ?? null, call_id: call.call_id ?? null,
-    permission_mode: call.permission_mode ?? null});
+    permission_mode: call.permission_mode ?? null, ...(j.ladder && {ladder: j.ladder})});
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1189,7 +1271,17 @@ async function selfcheck() {
   ok(["mutates", "exfil", "injection"].every(k => p.decide(S({[k]: {noul: 0.4}})).outcome === "pass"), "some mutation, exfil or injection never allows");
   ok(p.decide(S({on_task: {noul: 0.2}})).outcome === "pass", "off-task never allows");
   const ai = p.gates.findIndex(g => g.outcome === "allow");
-  ok(ai === p.gates.length - 1 && p.gates.slice(0, ai).every(g => ["ask", "deny"].includes(g.outcome)), "allow is the last gate: every deny and ask gate wins");
+  ok(ai === p.gates.length - 1 && p.gates.slice(0, ai).every(g => ["ask", "deny"].includes(g.outcome) || (g.id === "in-envelope" && g.outcome === "pass")),
+     "allow is the last gate: every deny and ask gate wins (the one pass before it, in-envelope, never allows)");
+  // the task envelope: only the user's envelope reaches the pass gate; the repository's can only ask
+  const E = (extra = {}) => A(0.8, 2.0, "nonprod", 0.1, 0.9, {on_task: {noul: 0.9}, ...extra});
+  ok(p.decide(E()).outcome === "ask", "envelope: without one, a nonprod blast-2 mutation asks");
+  ok(p.decide(E({envelope: {noul: 1}, in_envelope: {noul: 0.9}})).outcome === "pass", "envelope: inside the user's envelope, nonprod work passes");
+  ok(p.decide(E({in_envelope: {noul: 0.99}, repo_envelope: {noul: 1}})).outcome === "ask", "envelope: a repository envelope alone never passes anything");
+  ok(p.decide(E({envelope: {noul: 1}, in_envelope: {noul: 0.9}, repo_envelope: {noul: 1}, repo_forbids: {noul: 0.8}})).outcome === "ask", "envelope: the repository can rule out what the user allowed");
+  ok(p.decide(E({envelope: {noul: 1}, in_envelope: {noul: 0.1}})).outcome === "ask" && p.decide(A(0.8, 0.8, "local", 0.1, 0.9, {on_task: {noul: 0.9}, envelope: {noul: 1}, in_envelope: {noul: 0.1}})).outcome === "ask",
+     "envelope: a mutation outside it asks, even a low-blast local one");
+  ok(p.decide(A(0.9, 2.0, "production", 0.1, 0.9, {on_task: {noul: 0.9}, envelope: {noul: 1}, in_envelope: {noul: 0.99}})).outcome === "ask", "envelope: production is never passed by an envelope");
 
   // intent: the text right before this call's tool_use, never an older message
   const tp = join(tmpdir(), `reflex-selfcheck-${process.pid}.jsonl`);

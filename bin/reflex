@@ -4,6 +4,11 @@
 //                                                      install into ~/.local/share/reflex and hook
 //                                                      every agent found (what curl / npx / pnpm dlx /
 //                                                      bunx / yarn dlx run)
+//   reflex setup --profile supervised|autonomous [--judge on|off --judge-url U --judge-model M ...]
+//                                                      presets; flags beside a profile win
+//   reflex queue [list|show|approve|deny|clear]        the async human queue (autonomous profile)
+//   reflex envelope set "<text>" | show | list | clear what the agent may do for this task
+//   reflex checkpoints [list|restore <name>]           recovery points taken before mutations
 //   reflex check "<cmd>" [--cwd dir] [--intent text]   judge one command
 //   reflex scan <file|-> [--rewrite]                  judge text for prompt injection (exit 0 pass, 1 warn, 2 block)
 //   reflex report [...]                                what the gate has been doing
@@ -17,7 +22,8 @@ import {closeSync, copyFileSync, cpSync, existsSync, mkdirSync, openSync, readFi
 import {homedir, platform} from "node:os";
 import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
-import {USER_CONFIG, USER_CONFIG_ERROR, USER_CONFIG_FILE, policyDirectory} from "../gate.mjs";
+import {JUDGE_BACKENDS, QUEUE_DEFAULTS, USER_CONFIG, USER_CONFIG_ERROR, USER_CONFIG_FILE, judgeSettings, policyDirectory} from "../gate.mjs";
+import {onPath} from "../judge2.mjs";
 
 const ROOT = join(dirname(realpathSync(fileURLToPath(import.meta.url))), "..");
 const [cmd, ...args] = process.argv.slice(2);
@@ -86,22 +92,107 @@ function ask(question, secret) {
   } catch { return ""; } finally { closeSync(fd); }
 }
 
+// Profiles are presets written to config.json; a flag given next to one still wins. supervised is
+// the behaviour Reflex always had: a human answers every ask in the agent. autonomous puts System 2
+// and an async human queue in front of the human (autonomy.mjs, docs/GUIDE.md#autonomous-agents).
+const PROFILES = {
+  supervised: {judge: "none", queue: false, checkpoints: false},
+  autonomous: {engine: "jev", mode: "enforce", allow: "on", judge: "auto", queue: true, checkpoints: true},
+};
+const SETUP_OPTIONS = ["--mode", "--allow", "--agents", "--keychain", "--node", "--engine", "--profile", "--judge", "--judge-cli", "--judge-url",
+  "--judge-model", "--judge-key-env", "--judge-keychain", "--judge-timeout", "--judge-budget-calls", "--judge-budget-usd", "--queue", "--queue-ttl",
+  "--notify", "--checkpoints"];
+const onOff = (flag, fallback) => {
+  const v = opt(args, flag);
+  if (v === undefined) return fallback;
+  if (!["on", "off"].includes(v)) die(`${flag} must be on or off`);
+  return v === "on";
+};
+const number = (flag, fallback) => {
+  const v = opt(args, flag);
+  if (v === undefined) return fallback;
+  if (!/^\d+(\.\d+)?$/.test(v)) die(`${flag} must be a number`);
+  return Number(v);
+};
+// System 2's backend when none is named: the claude CLI when it is installed (signed in, so no extra
+// key; judge2.mjs runs it lean: its system prompt replaced, no tools, MCP, skills, CLAUDE.md or
+// thinking), else the Messages API when ANTHROPIC_API_KEY is set, else none (uncertain decisions go
+// to a human). codex is never picked on its own: `codex exec` cannot replace its base instructions,
+// so every call carries them; name it with --judge cli --judge-cli codex. An OpenAI-compatible
+// endpoint (OpenAI, Ollama, vLLM, LM Studio, LiteLLM, OpenRouter) is never guessed either: it takes
+// --judge openai-compatible --judge-url and --judge-model. Setup says which one it picked.
+function detectJudge() {
+  const command = onPath("claude");
+  if (command) return {backend: "cli", cli: "claude", command};
+  return {backend: ENV.ANTHROPIC_API_KEY?.trim() ? "anthropic" : "none"};
+}
+// The ladder settings setup writes, from flags, else the profile, else what is saved.
+function ladderSettings(preset) {
+  const saved = USER_CONFIG, j = saved.judge ?? {};
+  const chosen = opt(args, "--judge");
+  if (chosen !== undefined && !JUDGE_BACKENDS.includes(chosen)) die(`--judge must be one of ${JUDGE_BACKENDS.join(", ")}`);
+  let judge = {...j}, detected = false;
+  if (chosen === "cli" || (chosen === undefined && opt(args, "--judge-cli"))) {
+    const cli = opt(args, "--judge-cli", j.backend === "cli" ? j.cli : onPath("claude") ? "claude" : "codex");
+    if (!["claude", "codex"].includes(cli)) die("--judge-cli must be claude or codex");
+    const command = onPath(cli);
+    if (!command) die(`--judge cli: ${cli} is not on PATH`);
+    judge = {...judge, backend: "cli", cli, command};
+  } else if (chosen) judge = {...judge, backend: chosen};
+  else if (preset.judge === "none") judge = {...judge, backend: "none"};
+  else if (preset.judge === "auto" && (!j.backend || j.backend === "none")) { judge = {...judge, ...detectJudge()}; detected = true; }
+  for (const [flag, key] of [["--judge-url", "url"], ["--judge-model", "model"], ["--judge-key-env", "key_env"], ["--judge-keychain", "keychain"]]) {
+    const v = opt(args, flag);
+    if (v !== undefined) judge[key] = v;
+  }
+  if (judge.url !== undefined && judge.url !== null) { try { if (!/^https?:$/.test(new URL(judge.url).protocol)) throw 0; } catch { die("--judge-url must be an http(s) URL"); } }
+  if (judge.key_env && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(judge.key_env)) die("--judge-key-env takes the NAME of an environment variable, never the key");
+  if (judge.backend === "openai-compatible" && (!judge.url || !judge.model)) die("--judge openai-compatible needs --judge-url and --judge-model (for example Ollama: --judge-url http://localhost:11434 --judge-model llama3.1)");
+  const timeout = number("--judge-timeout"), calls = number("--judge-budget-calls"), usd = number("--judge-budget-usd");
+  if (timeout !== undefined) judge.timeout_ms = timeout * 1000;
+  if (calls !== undefined || usd !== undefined) judge.budget = {...j.budget, ...(calls !== undefined && {calls}), ...(usd !== undefined && {usd})};
+  const q = saved.queue ?? {}, queue = {...q, enabled: onOff("--queue", preset.queue ?? q.enabled ?? false)};
+  const ttl = number("--queue-ttl");
+  if (ttl !== undefined) queue.ttl_hours = ttl;
+  if (opt(args, "--notify") !== undefined) queue.notify = opt(args, "--notify") || null;
+  return {judge, queue, checkpoints: onOff("--checkpoints", preset.checkpoints ?? saved.checkpoints ?? false), detected};
+}
+function describe(s) {
+  const j = judgeSettings(s.judge), q = {...QUEUE_DEFAULTS, ...s.queue};
+  const key = j.key_env && ENV[j.key_env]?.trim() ? `$${j.key_env} (set)` : j.keychain ? `Keychain item ${j.keychain}`
+    : j.key_env ? `$${j.key_env} (not set)` : "none (a keyless endpoint)";
+  const where = j.backend === "cli" ? `cli ${j.cli} (${j.command ?? "not found"}), model ${j.model ?? "the CLI's default (pin one with --judge-model)"}, no API key`
+    : `${j.backend} ${j.url}, model ${j.model}, key ${key}`;
+  const picked = !s.detected ? "" : j.backend === "cli" ? " [picked because claude is installed; --judge anthropic|openai-compatible|none to change]"
+    : j.backend === "anthropic" ? " [picked because ANTHROPIC_API_KEY is set; --judge to change]" : " [no claude CLI and no ANTHROPIC_API_KEY; --judge to pick one]";
+  return [`profile ${s.profile} · engine ${s.engine} · mode ${s.mode} · allow ${s.allow}`,
+    `System 2: ${j.enabled ? `${where}; timeout ${j.timeout_ms / 1000} s; case capped at ${j.max_input_tokens} tokens; budget ${j.budget.calls} calls${j.backend === "cli" ? "" : ` / $${j.budget.usd}`} a day` : "none (uncertain decisions go to a human)"}${picked}`,
+    `queue: ${q.enabled ? `on (approvals valid ${q.ttl_hours} h, notify ${q.notify ? "on" : "off"})` : "off (a human answers in the agent)"} · checkpoints: ${s.checkpoints ? "on" : "off"}`];
+}
+
 function setup() {
   if (platform() === "win32") die("Native Windows setup is not supported yet. Run Reflex and your agent inside WSL.");
   if (USER_CONFIG_ERROR) die(USER_CONFIG_ERROR);
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--dry-run") continue;
-    if (!["--mode", "--allow", "--agents", "--keychain", "--node", "--engine"].includes(args[i])) die(`unknown setup option ${args[i]}`);
+    if (!SETUP_OPTIONS.includes(args[i])) die(`unknown setup option ${args[i]}`);
     opt(args, args[i]); i++;
   }
   if (Number(process.versions.node?.split(".")[0] ?? 99) < 18) die(`Node.js 18+ is required, found ${process.version}`);
-  const mode = opt(args, "--mode", ENV.REFLEX_MODE ?? USER_CONFIG.mode ?? "shadow");
-  const allow = opt(args, "--allow", ENV.REFLEX_ALLOW ?? USER_CONFIG.allow ?? "off");
+  const profile = opt(args, "--profile");
+  if (profile !== undefined && !PROFILES[profile]) die("--profile must be supervised or autonomous");
+  const preset = PROFILES[profile] ?? {};
+  const mode = opt(args, "--mode", preset.mode ?? ENV.REFLEX_MODE ?? USER_CONFIG.mode ?? "shadow");
+  const allow = opt(args, "--allow", preset.allow ?? ENV.REFLEX_ALLOW ?? USER_CONFIG.allow ?? "off");
   // A fresh install starts local (no key needed). "Fresh" is judged from saved settings, not from
   // the package directory: the curl installer puts the package in place before running setup.
   // Settings from before `engine` existed (a Keychain item or an agent record) mean Jev was in use.
-  const engine = opt(args, "--engine", ENV.REFLEX_ENGINE ?? USER_CONFIG.engine ??
+  const engine = opt(args, "--engine", preset.engine ?? ENV.REFLEX_ENGINE ?? USER_CONFIG.engine ??
     (USER_CONFIG.keychain || Object.keys(USER_CONFIG.agents ?? {}).length ? "jev" : "local"));
+  const ladder = ladderSettings(preset);
+  const settings = {profile: profile ?? USER_CONFIG.profile ?? "supervised", engine, mode, allow, ...ladder};
+  const judgeOn = judgeSettings(settings.judge).enabled;
+  if (judgeOn && mode !== "enforce") say(`note: System 2 only acts in enforce mode; in ${mode} mode it is logged as what would have happened`);
   const agents = opt(args, "--agents", ENV.REFLEX_AGENTS ?? "all");
   const keychain = opt(args, "--keychain", ENV.REFLEX_KEYCHAIN_SERVICE ?? USER_CONFIG.keychain ?? "typesafe-api-key");
   const nodeBin = opt(args, "--node", node());
@@ -111,6 +202,7 @@ function setup() {
   // Validate every option and preview changes before copying or changing any configuration.
   const preview = run("install.mjs", [...installArgs, "--dry-run"]);
   if (preview) process.exit(preview);
+  for (const line of describe(settings)) say(line);
   say(`package: ${TARGET}; command: ${BIN_LINK}`);
   if (args.includes("--dry-run")) return;
 
@@ -164,13 +256,21 @@ function setup() {
     say("set TYPESAFE_API_KEY (https://console.typesafe.ai/keys) in the environment your agents start from");
   }
 
-  // 4. Hook every agent, recording where the key lives so every hook finds it.
+  // 4. The ladder settings first: install.mjs reads them to give the gate hooks room for System 2.
+  let written = {};
+  try { written = JSON.parse(readFileSync(USER_CONFIG_FILE, "utf8")); } catch { /* first setup */ }
+  mkdirSync(dirname(USER_CONFIG_FILE), {recursive: true});
+  writeFileSync(USER_CONFIG_FILE, JSON.stringify({...written, profile: settings.profile, judge: settings.judge, queue: settings.queue,
+    checkpoints: settings.checkpoints}, null, 2) + "\n");
+  // 5. Hook every agent, recording where the key lives so every hook finds it.
   const status = run("install.mjs", installArgs, TARGET);
   if (status !== 0) process.exit(status);
 
   say(`installed (${engine} engine, ${mode} mode, allow ${allow})`);
   say(engine === "local" ? "local rules and instruction matches; no hosted classification or API key needed" : "Jev classification sends redacted context to TypeSafe");
-  say(mode === "shadow" ? "shadow: deterministic rules still block; other decisions are logged only" : mode === "off" ? "off: protection is disabled" : "enforce: uncertain commands require human review");
+  say(mode === "shadow" ? "shadow: deterministic rules still block; other decisions are logged only" : mode === "off" ? "off: protection is disabled"
+    : judgeOn ? `enforce: uncertain commands go to System 2, then ${settings.queue.enabled ? "the approval queue (reflex queue)" : "a human in the agent"}`
+    : settings.queue.enabled ? "enforce: uncertain commands are parked in the approval queue (reflex queue)" : "enforce: uncertain commands require human review");
   say(`editable policy: ${join(policyDirectory, "policy.json")} (preserved by upgrades)`);
   if (!(ENV.PATH ?? "").split(":").includes(dirname(BIN_LINK))) say(`add ${dirname(BIN_LINK)} to PATH to use the 'reflex' command`);
   console.log(`
@@ -205,16 +305,19 @@ switch (cmd) {
     if (!args[0] || args[0].startsWith("--")) die('usage: reflex run "command" [--cwd directory]');
     if (args.length !== 1 && !(args.length === 3 && args[1] === "--cwd")) die('usage: reflex run "command" [--cwd directory]');
     const r = spawnSync(node(), [join(ROOT, "gate.mjs"), "--sh", "-c", args[0]], {
-      cwd: opt(args, "--cwd", process.cwd()), stdio: "inherit", env: {...ENV, REFLEX_MODE: "enforce", REFLEX_ALLOW: "off"}});
+      // a human is at this terminal: no System 2, no queue, no checkpoint; an ask is asked here
+      cwd: opt(args, "--cwd", process.cwd()), stdio: "inherit", env: {...ENV, REFLEX_MODE: "enforce", REFLEX_ALLOW: "off",
+        REFLEX_JUDGE: "off", REFLEX_QUEUE: "off", REFLEX_CHECKPOINTS: "off"}});
     if (r.error) console.error(`reflex: ${r.error.message}`);
     process.exit(r.status ?? 1);
   }
   case "report": process.exit(run("report.mjs", args));
+  case "queue": case "envelope": case "checkpoints": process.exit(run("autonomy.mjs", [cmd, ...args]));
   case "install": process.exit(run("install.mjs", args.includes("--agent") ? args : ["--agent", "all", ...args]));
   case "eval": process.exit(run("eval.mjs", args));
   case "test": process.exit(spawnSync("npm", ["test", "--silent"], {cwd: ROOT, stdio: "inherit"}).status ?? 1);
   case "version": case "--version": case "-v": console.log(version(ROOT)); break;
   default:
-    console.error("usage: reflex setup | status | doctor | check <cmd> | scan <file|-> | run <cmd> | report | install | uninstall | test | eval | version");
+    console.error("usage: reflex setup | status | doctor | check <cmd> | scan <file|-> | run <cmd> | report | queue | envelope | checkpoints | install | uninstall | test | eval | version");
     process.exit(cmd ? 2 : 0);
 }

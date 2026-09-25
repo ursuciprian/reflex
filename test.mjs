@@ -2,7 +2,7 @@
 // Run every existing selfcheck and the onboarding journey without the user's configuration or keys.
 import assert from "node:assert/strict";
 import {cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync} from "node:fs";
-import {spawnSync} from "node:child_process";
+import {spawn, spawnSync} from "node:child_process";
 import {tmpdir} from "node:os";
 import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
@@ -21,7 +21,7 @@ try {
   for (const [program, args] of [
     [process.execPath, ["policy.mjs"]], [process.execPath, ["gate.mjs", "--selfcheck"]],
     [process.execPath, ["instructions.mjs", "--selfcheck"]], [process.execPath, ["install.mjs", "--selfcheck"]],
-    [process.execPath, ["guard.mjs", "--selfcheck"]],
+    [process.execPath, ["guard.mjs", "--selfcheck"]], [process.execPath, ["judge2.mjs", "--selfcheck"]], [process.execPath, ["autonomy.mjs", "--selfcheck"]],
     [process.execPath, ["context.mjs", "--selfcheck"]], [process.execPath, ["router/server.mjs", "--selfcheck"]],
     ["python3", ["routing/reflex_router.py", "--selfcheck"]],
   ]) {
@@ -225,4 +225,115 @@ try {
   assert.deepEqual(read(settings).agents,{});
   assert.ok(!read(join(scratch,".claude/settings.json")).hooks?.PreToolUse);
   console.log("onboarding integration checks OK");
+
+  // The autonomous profile, onboarded in a second throwaway HOME. System 2 is first a fake `claude`
+  // on PATH (the default backend when an agent CLI is installed), then an OpenAI-compatible stub on
+  // 127.0.0.1. Jev points at a closed local port, so every uncertain command is the System 1
+  // fallback and goes up the ladder; nothing else is reachable.
+  const stub = spawn(process.execPath, [join(root, "judge2.mjs"), "--stub"], {stdio: ["ignore", "pipe", "inherit"]});
+  try {
+    const stubUrl = await new Promise((res, rej) => { stub.stdout.once("data", d => res(String(d).trim())); stub.once("exit", () => rej(new Error("stub judge exited"))); });
+    const home = join(scratch, "auto"), cfg = join(home, "config"), fakes = join(home, "fake-bin");
+    mkdirSync(home, {recursive: true});
+    success(invoke("judge2.mjs", ["--fake-cli", fakes]));
+    const env2 = {...env, HOME: home, XDG_CONFIG_HOME: cfg, XDG_STATE_HOME: join(home, "state"), REFLEX_PREFIX: join(home, "installed"),
+      PATH: `${fakes}:/usr/bin:/bin`, TYPESAFE_API_KEY: ["test", "key", process.pid].join("-")};   // built at run time; it only ever reaches the closed port
+    delete env2.ANTHROPIC_API_KEY;
+    const fakeKey = env2.TYPESAFE_API_KEY;   // a placeholder built at run time, never a real key
+    const cli2 = (args, extra = {}) => invoke("bin/reflex", args, {...extra, env: {...env2, ...extra.env}});
+    const settings2 = join(cfg, "reflex/config.json"), data2 = join(home, "state/reflex");
+    const agents2 = ["--agents", "claude,codex"];
+    // the backend is picked at setup: an agent CLI, else the Messages API with ANTHROPIC_API_KEY, else none
+    const dry = success(cli2(["setup", "--profile", "autonomous", ...agents2, "--dry-run"]));
+    assert.match(dry, /profile autonomous · engine jev · mode enforce · allow on/);
+    assert.match(dry, new RegExp(`System 2: cli claude \\(${fakes.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/claude\\), model sonnet, no API key; timeout 20 s; case capped at 1500 tokens; budget 200 calls a day \\[picked because claude is installed`));
+    assert.match(dry, /queue: on \(approvals valid 24 h, notify off\) · checkpoints: on/);
+    assert.match(success(cli2(["setup", "--profile", "autonomous", ...agents2, "--dry-run"], {env: {PATH: "/usr/bin:/bin"}})), /System 2: none \(uncertain decisions go to a human\)/);
+    assert.match(success(cli2(["setup", "--profile", "autonomous", ...agents2, "--dry-run"], {env: Object.fromEntries([["PATH", "/usr/bin:/bin"], ["ANTHROPIC_API_KEY", fakeKey]])})),
+      /System 2: anthropic https:\/\/api\.anthropic\.com, model claude-sonnet-5, key \$ANTHROPIC_API_KEY \(set\)/);
+    assert.match(success(cli2(["setup", "--profile", "autonomous", ...agents2, "--judge-cli", "codex", "--dry-run"])), /System 2: cli codex/);
+    // codex cannot be made lean (its base instructions go with every call): named, never picked on its own
+    const onlyCodex = join(home, "codex-only");
+    mkdirSync(onlyCodex, {recursive: true});
+    writeFileSync(join(onlyCodex, "codex"), readFileSync(join(fakes, "codex")), {mode: 0o755});
+    assert.match(success(cli2(["setup", "--profile", "autonomous", ...agents2, "--dry-run"], {env: {PATH: `${onlyCodex}:/usr/bin:/bin`}})), /System 2: none .*no claude CLI/);
+    assert.ok(!existsSync(settings2) && !existsSync(join(home, "installed")), "an autonomous preview writes nothing");
+    assert.match(success(cli2(["setup", "--profile", "autonomous", ...agents2, "--mode", "shadow", "--dry-run"])), /mode shadow/, "a flag beside a profile wins");
+    for (const bad of [["--profile", "yolo"], ["--judge", "litellm"], ["--judge", "openai-compatible"], ["--judge-key-env", "sk-live-123"], ["--judge", "cli", "--judge-cli", "gemini"]])
+      assert.notEqual(cli2(["setup", ...bad, "--profile", "autonomous", ...agents2]).status, 0, `refused: ${bad.join(" ")}`);
+    success(cli2(["setup", "--profile", "autonomous", ...agents2]));
+    const saved2 = read(settings2);
+    assert.ok(saved2.profile === "autonomous" && saved2.mode === "enforce" && saved2.allow === "on" && saved2.engine === "jev" && saved2.judge.backend === "cli" &&
+      saved2.judge.cli === "claude" && saved2.judge.command === join(fakes, "claude") && saved2.queue.enabled && saved2.checkpoints === true, JSON.stringify(saved2));
+    assert.ok(!JSON.stringify(saved2).includes(env2.TYPESAFE_API_KEY), "no key in the settings");
+    const pre = file => read(join(home, file)).hooks.PreToolUse.flatMap(g => g.hooks).find(h => h.command.includes("gate.mjs"));
+    assert.ok(pre(".claude/settings.json").timeout === 50 && pre(".codex/hooks.json").timeout === 50, "the gate hooks get System 2's timeout and 30 s: a hook timeout would fail open");
+    const claudeHook = pre(".claude/settings.json").command, codexHook = pre(".codex/hooks.json").command;
+    let calls = 0;
+    const hook2 = (hook, command, cwd = home, session_id = "auto") => JSON.parse(success(spawnSync("/bin/sh", ["-c", hook], {encoding: "utf8", env: env2,
+      input: JSON.stringify({tool_name: "Bash", tool_input: {command}, session_id, cwd, tool_use_id: `toolu_${++calls}`})})) || "{}").hookSpecificOutput;
+    const cliCalls = () => readFileSync(join(fakes, "calls.jsonl"), "utf8").trim().split("\n").map(l => JSON.parse(l));
+    // System 1 has no answer (Jev unreachable): System 2 (the fake claude) approves it, but that stays
+    // a pass (Claude Code's own permissions decide): System 2 cannot allow what System 1 could not judge
+    assert.equal(hook2(claudeHook, "unknown-action --flag")?.permissionDecision, undefined);
+    const c1 = cliCalls().at(-1);
+    assert.ok(c1.cli === "claude" && c1.env.REFLEX_MODE === "off" && c1.env.REFLEX_GUARD === "off" && c1.argv[c1.argv.indexOf("--tools") + 1] === "" &&
+      c1.argv.includes("--strict-mcp-config") && !c1.cwd.startsWith(home) && c1.input.includes("unknown-action"), "the judge CLI runs without tools, hooks or Reflex, outside the project");
+    // always-human: never approved, parked in the queue with an id, for every adapter as a deny; System 2 is not asked
+    const before = cliCalls().length;
+    const iam = hook2(claudeHook, "aws iam create-user --user-name ci-bot");
+    assert.equal(iam.permissionDecision, "deny");
+    const qid = /queue as (q-[0-9a-f]{10})/.exec(iam.permissionDecisionReason)?.[1];
+    assert.ok(qid, iam.permissionDecisionReason);
+    const cx = hook2(codexHook, "aws iam create-user --user-name ci-bot2");
+    assert.ok(cx.permissionDecision === "deny" && /approval queue/.test(cx.permissionDecisionReason), "codex: the queue is a deny with the reason");
+    assert.equal(cliCalls().length, before, "System 2 is never asked about the always-human class");
+    assert.match(success(cli2(["queue", "list"])), new RegExp(`${qid}  pending`));
+    assert.equal(JSON.parse(success(cli2(["queue", "show", qid, "--json"]))).status, "pending");
+    // the agent cannot answer its own queue item: that is tamper, parked for a human too
+    assert.match(hook2(claudeHook, `reflex queue approve ${qid}`).permissionDecisionReason, /parked in the approval queue/);
+    assert.equal(JSON.parse(success(cli2(["queue", "show", qid, "--json"]))).status, "pending");
+    success(cli2(["queue", "approve", qid, "--ttl", "1h"]));
+    assert.equal(hook2(claudeHook, "aws iam create-user --user-name ci-bot").permissionDecision, "allow", "the approved, identical retry runs");
+    assert.equal(hook2(claudeHook, "aws iam create-user --user-name ci-bot").permissionDecision, "deny", "once");
+    // System 2 hands one up, or denies; a rule deny never reaches it
+    assert.match(hook2(claudeHook, "deploy-tool --target stub:human").permissionDecisionReason, /parked in the approval queue/);
+    assert.match(hook2(claudeHook, "deploy-tool --target stub:deny").permissionDecisionReason, /System 2 denied it/);
+    assert.match(hook2(claudeHook, "git push --force origin main").permissionDecisionReason, /force push/);
+    // reflex run: the human is at the terminal; nothing goes to System 2 or the queue, no TTY means no
+    const pendingBefore = JSON.parse(success(cli2(["status", "--json"]))).queue.pending, cliBefore = cliCalls().length;
+    const marker2 = join(home, "must-not-exist");
+    assert.equal(cli2(["run", `printf x > '${marker2}'`, "--cwd", home], {detached: true}).status, 126);
+    assert.ok(!existsSync(marker2) && cliCalls().length === cliBefore);
+    let st = JSON.parse(success(cli2(["status", "--json"])));
+    assert.ok(st.profile === "autonomous" && st.judge.backend === "cli" && st.judge.reachable && st.judge.budget.calls_used >= 3 && st.queue.pending === pendingBefore &&
+      st.queue.pending >= 2 && st.checkpoints, JSON.stringify(st));
+    // an OpenAI-compatible endpoint instead (Ollama, vLLM, LM Studio, LiteLLM, OpenRouter, OpenAI): here the local stub
+    success(cli2(["setup", ...agents2, "--judge", "openai-compatible", "--judge-url", stubUrl, "--judge-model", "stub-model"]));
+    assert.equal(read(settings2).judge.backend, "openai-compatible");
+    // reached and approved; with Jev unreachable an approval stays a pass (see above)
+    assert.equal(hook2(claudeHook, "unknown-action --other")?.permissionDecision, undefined);
+    st = JSON.parse(success(cli2(["status", "--json"])));
+    assert.ok(st.judge.backend === "openai-compatible" && st.judge.reachable && st.judge.status === 200, JSON.stringify(st.judge));
+    // none: no System 2; uncertain decisions go straight to the queue
+    success(cli2(["setup", ...agents2, "--judge", "none"]));
+    assert.match(hook2(claudeHook, "unknown-action --third").permissionDecisionReason, /System 2 is off.*parked in the approval queue/);
+    assert.equal(pre(".claude/settings.json").timeout, 10, "without System 2 the gate hook keeps its short timeout");
+    // envelope and checkpoints through the CLI
+    const proj = join(home, "proj");
+    mkdirSync(proj, {recursive: true});
+    const G = a => spawnSync("git", ["-C", proj, "-c", "user.name=t", "-c", "user.email=t@t", ...a], {encoding: "utf8"});
+    G(["init", "-q"]); writeFileSync(join(proj, "a.txt"), "1\n"); G(["add", "a.txt"]); G(["commit", "-q", "-m", "i"]); writeFileSync(join(proj, "a.txt"), "2\n");
+    success(cli2(["envelope", "set", "May modify this repo; nothing in prod.", "--cwd", proj, "--ttl", "2h"]));
+    assert.match(success(cli2(["envelope", "show", "--cwd", join(proj, "sub")])), /user: May modify this repo/);
+    assert.equal(hook2(claudeHook, "mkdir -p build", proj), undefined, "a fast-lane pass is silent");
+    assert.match(success(cli2(["checkpoints", "list", "--cwd", proj])), /^\d+-\d+ {2}[0-9a-f]{7,} /);
+    assert.equal(G(["status", "--porcelain"]).stdout.trim(), "M a.txt", "the checkpoint left the working tree as it was");
+    const rep2 = success(cli2(["report"]));
+    assert.match(rep2, /ladder\s+\d+ judged commands with the ladder on/);
+    assert.match(rep2, /humans\s+[\d.]+ per 100/);
+    assert.ok(!rep2.includes("ci-bot"), "the report names no command");
+    assert.ok(!readFileSync(join(data2, "judge.jsonl"), "utf8").includes("unknown-action"), "the judge log holds no command");
+    console.log("autonomous onboarding checks OK");
+  } finally { stub.kill(); }
 } finally { rmSync(scratch, {recursive: true, force: true}); }

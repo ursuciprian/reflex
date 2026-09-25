@@ -21,6 +21,8 @@ const NODE = process.env.REFLEX_NODE ?? "__REFLEX_NODE__";
 const MODE = process.env.REFLEX_MODE ?? "__REFLEX_MODE__";
 const ALLOW = process.env.REFLEX_ALLOW ?? "__REFLEX_ALLOW__";
 const AGENT = "__REFLEX_AGENT__";
+// 0: the default; with System 2 on, install.mjs writes the gate's budget, capped under omp's 30 s.
+const GATE_TIMEOUT_MS = Number("__REFLEX_GATE_TIMEOUT_MS__") || 20_000;
 const INSTRUCTIONS = GATE.replace(/gate\.mjs$/, "instructions.mjs");
 const GUARD = GATE.replace(/gate\.mjs$/, "guard.mjs");
 // Tools whose results are the user's own work, never third-party text: not sent to the guard.
@@ -34,7 +36,7 @@ function gate(flag: string, payload: unknown, signal?: AbortSignal, script = GAT
     const args = script === GATE ? [script, flag, "--mode", MODE, "--allow", ALLOW] : [script, flag, "--mode", MODE];
     const p = spawn(NODE, args, {signal, stdio: ["pipe", "pipe", "ignore"]});
     let out = "";
-    const t = setTimeout(() => p.kill("SIGKILL"), 20_000);   // omp gives a handler 30 s
+    const t = setTimeout(() => p.kill("SIGKILL"), script === GATE ? GATE_TIMEOUT_MS : 20_000);   // omp gives a handler 30 s
     p.stdout.on("data", d => (out += d));
     p.on("error", () => { clearTimeout(t); resolve(""); });
     p.on("close", () => { clearTimeout(t); resolve(out); });
