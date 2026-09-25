@@ -46,16 +46,16 @@ Never put the key in `settings.json`, the repo, or shell history.
 ## 2. Install
 
 ```sh
-gh auth refresh -s read:packages     # once: GitHub Packages needs a token even to read
-gh api repos/ursuciprian/reflex/contents/install.sh -H 'Accept: application/vnd.github.raw' | bash
+curl -fsSL https://raw.githubusercontent.com/ursuciprian/reflex/main/install.sh | bash
 ```
 
 The installer:
 
 - checks Node 18+ and npm;
-- installs `@ursuciprian/reflex` from GitHub Packages into `~/.local/share/reflex` (no sudo), using
-  `GITHUB_TOKEN` or your `gh` login through a temporary npmrc that is deleted on exit — nothing is
-  written to `~/.npmrc`;
+- installs `@ursuciprian/reflex` from the public npm registry into `~/.local/share/reflex` (no sudo,
+  no login); `--registry gh` uses GitHub Packages instead, which always needs a token — the
+  installer then uses `GITHUB_TOKEN` or your `gh` login through a temporary npmrc that is deleted on
+  exit, and writes nothing to `~/.npmrc`;
 - links the `reflex` command into `~/.local/bin`;
 - offers to store your TypeSafe key in the macOS Keychain if none is found;
 - hooks every supported agent it finds (step 3), in shadow mode with allow off, and records the
@@ -68,8 +68,11 @@ Options go after `bash -s --`:
 | `--agents claude,codex,…` | `all` found | which agents to hook |
 | `--mode shadow\|enforce\|off` | `shadow` | |
 | `--allow off\|shadow\|on` | `off` | see step 6 |
-| `--keychain NAME` | `typesafe-api-key` | Keychain item holding the key |
+| `--registry npm\|gh` | `npm` | npmjs needs no token; GitHub Packages always does |
 | `--version X` | latest | package version |
+| `--prefix DIR` | `~/.local/share/reflex` | where the package is installed |
+| `--keychain NAME` | `typesafe-api-key` | Keychain item holding the key |
+| `--package SPEC` | | an npm spec or a local `.tgz` instead of the published package (testing) |
 | `--uninstall` | | remove every hook, the package and `config.json` (logs stay) |
 
 Rerunning the installer upgrades in place; hook paths don't change.
@@ -92,9 +95,10 @@ To work on Reflex itself, clone the repo, run `npm test`, and install that check
 ### Publishing a release (maintainers)
 
 Bump `version` in `package.json`, merge, then tag: `git tag v0.2.0 && git push origin v0.2.0`.
-`.github/workflows/publish.yml` runs the self-checks and publishes `@ursuciprian/reflex` to GitHub
-Packages. The package inherits the repository's visibility: anyone with read access to the repo
-can install it.
+`.github/workflows/publish.yml` runs the self-checks and publishes `@ursuciprian/reflex` to both
+registries: npmjs (needs the `NPM_TOKEN` repository secret — an npm access token for the
+`ursuciprian` account) and GitHub Packages (the workflow's own `GITHUB_TOKEN`). The same tarball
+lands on both, so nobody needs a GitHub login to install Reflex.
 
 ## 3. Install the hooks (shadow mode)
 
@@ -109,8 +113,8 @@ absolute path of the Node that ran `install.mjs`; pass `--node /path/to/node` to
 
 | Agent | What `install.mjs` does | After installing |
 |---|---|---|
-| Claude Code | `~/.claude/settings.json`: `PreToolUse` hook on `Bash` (`gate.mjs --claude`), `PostToolUse` / `PostToolUseFailure` / `PermissionDenied` hooks (`--claude-post`), a `UserPromptSubmit` hook for conditional instructions (`instructions.mjs --claude`), and permission rules that make Claude Code ask before editing the Reflex checkout, its logs, your personal instruction fragments (`~/.config/reflex`) or its own settings | restart sessions |
-| Codex CLI | `~/.codex/hooks.json`: `PreToolUse` + `PostToolUse` on `^Bash$`, and `UserPromptSubmit` (`instructions.mjs --codex`) | open Codex, run `/hooks` and **trust** the Reflex hooks — untrusted hooks do not run |
+| Claude Code | `~/.claude/settings.json`: `PreToolUse` hook on `Bash\|Task\|Agent` (`gate.mjs --claude`; `Task\|Agent` is subgoal dedup), `PostToolUse` / `PostToolUseFailure` / `PermissionDenied` hooks on the same tools (`--claude-post`), a `PermissionRequest` hook on the same tools (`--claude-prompted`, which only records that Claude Code showed its own dialog — it never answers it), a `UserPromptSubmit` hook for conditional instructions (`instructions.mjs --claude`), and permission rules that make Claude Code ask before editing the Reflex checkout, its logs, your personal instruction fragments (`~/.config/reflex`) or its own settings | restart sessions |
+| Codex CLI | `~/.codex/hooks.json`: `PreToolUse` + `PostToolUse` on `^(Bash\|spawn_agent)$` (`spawn_agent` is subgoal dedup), and `UserPromptSubmit` (`instructions.mjs --codex`) | open Codex, run `/hooks` and **trust** the Reflex hooks — untrusted hooks do not run |
 | pi | `~/.pi/agent/extensions/reflex.ts` (gate on `tool_call`, instructions on `before_agent_start`) | restart pi |
 | oh-my-pi | `~/.omp/agent/extensions/reflex.ts` (same file) | restart omp |
 | opencode | `~/.config/opencode/plugins/reflex.js` (gate on `tool.execute.before`, instructions on `chat.message` + `experimental.chat.system.transform`) | restart opencode |
@@ -125,12 +129,6 @@ writes `~/.{pi,omp}/agent/extensions/reflex-context.ts` (see the GUIDE's *Contex
 sends redacted excerpts of tool output to TypeSafe, so turn it on deliberately. To try it for one session
 without installing: `pi -e /path/to/reflex/adapters/pi-context.ts` with
 `REFLEX_CONTEXT=/path/to/reflex/context.mjs` in the environment (same for `omp -e`).
-| Claude Code | `~/.claude/settings.json`: `PreToolUse` hook on `Bash\|Task\|Agent` (`gate.mjs --claude`; `Task\|Agent` is subgoal dedup), `PostToolUse` / `PostToolUseFailure` / `PermissionDenied` hooks on the same tools (`--claude-post`), and permission rules that make Claude Code ask before editing the Reflex checkout, its logs or its own settings | restart sessions |
-| Codex CLI | `~/.codex/hooks.json`: `PreToolUse` + `PostToolUse` on `^(Bash\|spawn_agent)$` (`spawn_agent` is subgoal dedup) | open Codex, run `/hooks` and **trust** the Reflex hooks — untrusted hooks do not run |
-| pi | `~/.pi/agent/extensions/reflex.ts` | restart pi |
-| oh-my-pi | `~/.omp/agent/extensions/reflex.ts` | restart omp |
-| opencode | `~/.config/opencode/plugins/reflex.js` | restart opencode |
-| Hermes | prints a `hooks:` block (Hermes config is YAML, so you paste it) | add it to each profile's `config.yaml`, then `hermes hooks list` to accept it |
 
 For an agent with no hook system, point its shell setting at `bin/reflex-sh`: it behaves like
 `bash`, but judges every `-c` command first. Set `REFLEX_AGENT=<name>` so the logs say which agent
@@ -260,6 +258,15 @@ for TLS on Python builds without a CA bundle.
 | `REFLEX_DATA_DIR` | `~/.local/state/reflex` | Where `routing.jsonl` is written (inside Docker, mount a volume) |
 | `TYPESAFE_API_KEY` / `REFLEX_KEYCHAIN_SERVICE` | — / `typesafe-api-key` | Same key lookup as the gate; the Keychain is not reachable from a container, so use the variable there |
 | `REFLEX_MODEL`, `REFLEX_API_URL` | as the gate | Jev model and endpoint |
+
+## Optional: context layer (pi and oh-my-pi)
+
+Installed with `node install.mjs --agent pi,omp --context` (see step 3). What it does, and what it
+sends to TypeSafe, is in [GUIDE → Context layer](GUIDE.md#context-layer-pi-and-oh-my-pi). Its
+variables:
+
+| Variable | Default | Meaning |
+|---|---|---|
 | `REFLEX_CONTEXT_TIMEOUT_MS` | `8000` | Budget for one context-layer Jev call (up to 24 questions), capped at 25000 (omp gives a handler 30 s); on timeout the context is left as it was |
 | `REFLEX_CHUNK_DAYS` / `REFLEX_CHUNK_MB` | `7` / `200` | Context-layer chunk store: delete chunks unused for this many days, then the least recently used beyond this size |
 | `REFLEX_CACHE_READ` / `REFLEX_CACHE_WRITE` | `0.1` / `1.25` | Prompt-cache read and write price as a fraction of uncached input, for the rebuild-or-keep decision |
@@ -271,7 +278,7 @@ for TLS on Python builds without a CA bundle.
 Push a snapshot of the metrics to a Prometheus Pushgateway, e.g. every five minutes from cron:
 
 ```sh
-*/5 * * * * cd ~/src/reflex && /usr/local/bin/node report.mjs --push http://localhost:9091 >/dev/null
+*/5 * * * * cd /path/to/reflex && /usr/local/bin/node report.mjs --push http://localhost:9091 >/dev/null
 ```
 
 Import `dashboards/reflex.json` into Grafana (it asks for the Prometheus data source) or drop it
@@ -281,7 +288,7 @@ team.
 ## Uninstall
 
 ```sh
-gh api repos/ursuciprian/reflex/contents/install.sh -H 'Accept: application/vnd.github.raw' | bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/ursuciprian/reflex/main/install.sh | bash -s -- --uninstall
 #   or, from a checkout:  node install.mjs --agent all --uninstall
 rm -rf ~/.local/state/reflex        # optional: logs, the context layer's chunk store, bundles, reviews
 ```

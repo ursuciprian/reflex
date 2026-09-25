@@ -1042,7 +1042,7 @@ async function selfcheck() {
   for (const x of ["hunter3", "pw9", "S3cret", "pw7", "sk_live_a", "AIzab", "T0/B0", "sid=abc123", "wJalrXUtn", "p/w@d"]) ok(!r2.includes(x), `redact ${x}`);
   ok(redact("git show 3f5e8a9b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f").includes("3f5e8a9b"), "git SHA is not a secret");
   for (const c of REDACT.corpus) ok(redact(c.in) === c.out, `redact corpus: ${c.in.slice(0, 40)}`);
-  ok(redact("REFLEX_KEYCHAIN_SERVICE=dev/typesafe-ai-api-key npm run eval").includes("npm run eval") &&
+  ok(redact("REFLEX_KEYCHAIN_SERVICE=dev/my-typesafe-key npm run eval").includes("npm run eval") &&
      !redact("tool --api-key abc123").includes("abc123"), "a flag-like word inside a name is not a flag");
 
   // deterministic rules
@@ -1517,4 +1517,4 @@ else if (flag("--check")) {
   console.log(JSON.stringify({decision: j.outcome, rule: j.rule, source: j.source, policy: j.policy_version ?? null,
                               latency_s: j.latency_s ?? 0, answers, env: j.state?.call?.env, error: j.error ?? undefined}, null, 1));
 }
-else console.error("usage: gate.mjs --check <cmd> | --decide | --record | --claude[-post] | --codex[-post] | --hermes[-post] | --selfcheck");
+else console.error("usage: gate.mjs --check <cmd> | --decide | --record | --claude[-post|-prompted] | --codex[-post] | --hermes[-post] | --sh | --bg | --selfcheck");

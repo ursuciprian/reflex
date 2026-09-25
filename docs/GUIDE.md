@@ -12,10 +12,10 @@
 6. [Data handling](#data-handling)
 7. [Safety properties and limits](#safety-properties-and-limits)
 8. [Conditional instructions](#conditional-instructions)
-8. [Tool router](#tool-router)
-8. [Model routing](#model-routing)
-8. [Context layer (pi and oh-my-pi)](#context-layer-pi-and-oh-my-pi)
-9. [Where this goes next](#where-this-goes-next)
+9. [Tool router](#tool-router)
+10. [Model routing](#model-routing)
+11. [Context layer (pi and oh-my-pi)](#context-layer-pi-and-oh-my-pi)
+12. [Where this goes next](#where-this-goes-next)
 
 ## How a command is decided
 
@@ -238,8 +238,11 @@ auto-allowed; a MISS if it is). An `allow` counts as `pass` for `expect`.
 Cases with `"cwd": "$FIXTURES"` run in a temporary copy of `setup/tool-gate/fixtures/`, the
 scripts, Makefile and `package.json` those commands run (each guarded so it exits if run by hand).
 
-Current result: 65 cases, 0 misses, 0 over; 5 of 6 `allow: true` cases allow-eligible. Results are saved to `~/.local/state/reflex/eval-*.json`.
-Run it in CI with `TYPESAFE_API_KEY` as a secret to guard policy changes.
+The set has 90 cases, 6 of them `allow: true`. `npm run eval` prints the pass / MISS / over counts
+for the rules, questions and policy you have now, and saves them to
+`~/.local/state/reflex/eval-*.json`; Jev's answers vary between runs, so read a run as a sample and
+only treat a MISS as a blocker. CI runs the offline self-checks (`npm test`); the live eval needs
+`TYPESAFE_API_KEY` and spends tokens, so CI does not run it.
 
 **Grow the golden set from real traffic.** Every surprising decision in the trace becomes a case.
 
@@ -915,7 +918,7 @@ requests, assistant replies, tool results) against the new goal, starts a new se
 goal with only the relevant items, each at its level and with its `expand_chunk` id; the rest is
 left behind but still expandable. If Jev fails, the session is left as it is.
 
-**Shared retrieval for background tasks (§X), `node context.mjs --bundle`.** Given a change
+**Shared retrieval for background tasks, `node context.mjs --bundle`.** Given a change
 (`git diff <base>` plus untracked files that are not ignored, diffed against `/dev/null`), it
 collects the names defined on changed lines and in hunk context, plus the
 changed files' basenames, looks each up once with `git grep --untracked -w`, rates up to 24 candidate files with
@@ -940,8 +943,7 @@ read-only mode as above.
 |---|---|
 | Event and API surface | Read in the installed sources. pi 0.84.2, `dist/core/extensions/types.d.ts`: `tool_result` returns `{content, details, isError}`, `context` returns `{messages}`, `registerTool`, `registerCommand`, `ctx.newSession({withSession})`. omp 18.1.17, `src/extensibility/extensions/types.ts`: the same events, `newSession` without `withSession`, tool `approval` and `loadMode`; `runner.ts`: `emitContext`, 30 s handler budget; `sdk.ts`: `transformContext` calls `emitContext` before each LLM call. Both accept plain JSON Schema tool parameters (pi-ai / omp pi-ai `validateToolArguments`) |
 | Ladder, store, `expand_chunk`, assembly, cache decision, `/fresh`, bundle, reviewer | `node context.mjs --selfcheck`: the real extension driven with a fake `pi`, fake events and a fake Jev server on localhost, including every fail-open path |
-| Extension loads in the real agents | `pi -e` and `omp -e` load it without errors; in omp `expand_chunk` is in the provider request's tool list |
-| Extension loads in the real agents (this revision) | `pi -e` and `omp -e` with a throwaway `HOME` and `PI_CODING_AGENT_DIR` load it without extension errors |
+| Extension loads in the real agents | `pi -e` and `omp -e` with a throwaway `HOME` and `PI_CODING_AGENT_DIR` load it without extension errors; in omp `expand_chunk` is in the provider request's tool list |
 | Live Jev, ladder | `npm run eval-context`: 16 real outputs of this repo (greps, `cat -n`, a 1,026-line `git show`) at a pinned commit, each with the lines that must stay visible (`setup/context/golden.json`). jev-1.13.0, three runs: must-keep recall 17/17, 16/17 and 17/17, 73-74 % of characters hidden, ~188k input tokens per run (~12k per output). The ladder as first written: 15/17 on both runs, 83-85 % hidden. Twelve cases were used while tuning the question and the rendering; the four `late-*` cases were added afterwards and passed on every run of both versions. Jev's choices vary between runs, so treat one run as a sample |
 | Live Jev, smoke | `node context.mjs --smoke`: a ~490-line grep of this repo against a timeout question keeps the `timeoutMs` default and `ask()`; ~68 % hidden, ~11k input tokens, 1 s |
 | Quality over real sessions, the cost-model parameters, `/fresh` in a live session | **Experimental.** Not measured yet: read `context.jsonl` and tune. A miss is recoverable with `expand_chunk`, and it is why this layer is opt-in |
