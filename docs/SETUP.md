@@ -46,41 +46,49 @@ Never put the key in `settings.json`, the repo, or shell history.
 ## 2. Install
 
 ```sh
-gh auth refresh -s read:packages     # once: GitHub Packages needs a token even to read
-gh api repos/ursuciprian/reflex/contents/install.sh -H 'Accept: application/vnd.github.raw' | bash
+curl -fsSL https://raw.githubusercontent.com/ursuciprian/reflex/main/install.sh | bash
 ```
 
-If the repository and the npm package are public, `curl -fsSL
-https://raw.githubusercontent.com/ursuciprian/reflex/main/install.sh | bash` does the same with no
-login.
+or with any package runner (same result):
 
-The installer:
+```sh
+npx @ursuciprian/reflex setup
+pnpm dlx @ursuciprian/reflex setup
+bunx @ursuciprian/reflex setup
+yarn dlx @ursuciprian/reflex setup     # yarn 2+
+```
 
-- checks Node 18+ and npm;
-- installs `@ursuciprian/reflex` into `~/.local/share/reflex` (no sudo): from the public npm
-  registry when it is published there (no login), otherwise from GitHub Packages, which always needs
-  a token — `GITHUB_TOKEN` or your `gh` login, through a temporary npmrc deleted on exit; nothing
-  is written to `~/.npmrc`, and a stale `@ursuciprian` line in it cannot redirect the install;
+Either way `reflex setup` runs, which:
+
+- copies the package to `~/.local/share/reflex` (no sudo). Hooks point there, not into the npx /
+  pnpm / bun cache, so clearing a cache never breaks them;
 - links the `reflex` command into `~/.local/bin`;
-- offers to store your TypeSafe key in the macOS Keychain if none is found;
+- offers to store your TypeSafe key in the macOS Keychain if none is found (entered hidden, passed
+  to `security` on stdin, never written to a file);
 - hooks every supported agent it finds (step 3), in shadow mode with allow off, and records the
-  Keychain item name in `~/.config/reflex/config.json` so every hook finds the key.
+  Keychain item name in `~/.config/reflex/config.json` so every hook finds the key;
+- records the Node found on `PATH` (e.g. `/opt/homebrew/bin/node`, not the versioned binary behind
+  it), so a Node upgrade does not break the hooks.
 
-Options go after `bash -s --`:
+The `curl` script checks Node 18+, runs `npm install` into that directory (with the npm registry
+set explicitly for `@ursuciprian`, so a stale entry in `~/.npmrc` cannot redirect it) and then runs
+`reflex setup`.
+
+Options go after `bash -s --`, or after `setup`:
 
 | Option | Default | |
 |---|---|---|
 | `--agents claude,codex,…` | `all` found | which agents to hook |
 | `--mode shadow\|enforce\|off` | `shadow` | |
 | `--allow off\|shadow\|on` | `off` | see step 6 |
-| `--registry auto\|npm\|gh` | `auto` | `auto`: npmjs, then GitHub Packages if not found there. npmjs needs no token; GitHub Packages always does |
-| `--version X` | latest | package version |
-| `--prefix DIR` | `~/.local/share/reflex` | where the package is installed |
 | `--keychain NAME` | `typesafe-api-key` | Keychain item holding the key |
-| `--package SPEC` | | an npm spec or a local `.tgz` instead of the published package (testing) |
-| `--uninstall` | | remove every hook, the package and `config.json` (logs stay) |
+| `--node PATH` | `node` on `PATH` | the Node the hooks run with |
+| `--version X` | latest | package version (`curl` only; with a runner use `@ursuciprian/reflex@X`) |
+| `--prefix DIR` | `~/.local/share/reflex` | where the package lives (`REFLEX_PREFIX` for `setup`) |
+| `--package SPEC` | | an npm spec or a local `.tgz` (`curl` only, for testing) |
+| `--uninstall` | | remove every hook, the package, the link and `config.json` (`curl` only; otherwise `reflex uninstall`) |
 
-Rerunning the installer upgrades in place; hook paths don't change.
+Rerunning any install path upgrades in place; hook paths don't change.
 
 Check it:
 
@@ -99,12 +107,11 @@ To work on Reflex itself, clone the repo, run `npm test`, and install that check
 
 ### Publishing a release (maintainers)
 
-Bump `version` in `package.json`, merge, then tag: `git tag v0.2.0 && git push origin v0.2.0`.
-`.github/workflows/publish.yml` runs the self-checks and publishes `@ursuciprian/reflex` to GitHub
-Packages with the workflow's own `GITHUB_TOKEN`; the package inherits the repository's visibility.
-It also publishes the same tarball to npmjs **only if** the `NPM_TOKEN` repository secret exists
-(an npm access token for the `ursuciprian` account). Adding that secret is the decision to publish
-Reflex publicly: npm versions cannot be withdrawn after 72 hours.
+Once: add the `NPM_TOKEN` repository secret (an npm access token with publish rights on the
+`@ursuciprian` scope). Then per release: bump `version` in `package.json` and `CHANGELOG.md`, merge,
+and tag: `git tag vX.Y.Z && git push origin vX.Y.Z`. `.github/workflows/publish.yml` checks the tag
+matches `package.json`, runs the self-checks and runs `npm publish --access public --provenance`.
+npm versions cannot be withdrawn after 72 hours, so tag deliberately.
 
 ## 3. Install the hooks (shadow mode)
 
@@ -294,7 +301,8 @@ team.
 ## Uninstall
 
 ```sh
-gh api repos/ursuciprian/reflex/contents/install.sh -H 'Accept: application/vnd.github.raw' | bash -s -- --uninstall
+reflex uninstall                    # every hook, the package, the link and config.json
+#   or: curl -fsSL https://raw.githubusercontent.com/ursuciprian/reflex/main/install.sh | bash -s -- --uninstall
 #   or, from a checkout:  node install.mjs --agent all --uninstall
 rm -rf ~/.local/state/reflex        # optional: logs, the context layer's chunk store, bundles, reviews
 ```

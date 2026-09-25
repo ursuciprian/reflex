@@ -33,12 +33,12 @@ All notable changes to Reflex are documented here. The format follows
   16 context outputs, 20 instruction prompts); offline self-checks for every component.
 - `report.mjs`: decision summary, replay under a candidate policy, allow calibration, Prometheus
   Pushgateway export, and `dashboards/reflex.json` for Grafana.
-- `install.sh` / `install.mjs`: one command installs the package (public npm registry when published
-  there, otherwise GitHub Packages with a `read:packages` token) and wires up every supported agent
-  found on the machine, in shadow mode, with `--mode enforce` and `--allow` to tighten later.
-  `--keychain` records where the TypeSafe key lives; `bin/reflex` is the installed CLI.
-- `publish.yml` publishes a `v*` tag to GitHub Packages, and to npmjs when the `NPM_TOKEN` secret
-  exists; `ci.yml` runs the offline self-checks on every pull request (Node 18 and 22, Python 3.9
+- Install with `curl -fsSL …/install.sh | bash` or `npx` / `pnpm dlx` / `bunx` / `yarn dlx
+  @ursuciprian/reflex setup`: the package is copied to `~/.local/share/reflex`, the `reflex` command
+  linked, the TypeSafe key optionally stored in the macOS Keychain, and every supported agent hooked
+  in shadow mode, with `--mode enforce` and `--allow` to tighten later. `--keychain` records where
+  the key lives; `reflex uninstall` removes everything.
+- `publish.yml` publishes a `v*` tag to npm with provenance (`NPM_TOKEN` secret); `ci.yml` runs the offline self-checks on every pull request (Node 18 and 22, Python 3.9
   and 3.12).
 - `LICENSE` (MIT), `SECURITY.md`, `CONTRIBUTING.md`, this changelog and issue templates.
 

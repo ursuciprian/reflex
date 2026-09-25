@@ -1,16 +1,10 @@
 name: publish
 
-# Publish @ursuciprian/reflex when a version tag is pushed (v0.2.0 ...).
-# The tag must match package.json's version. The same tarball goes to:
-#   GitHub Packages  always, with the workflow's own GITHUB_TOKEN; installing needs a token
-#                    with read:packages and read access to this repository
-#   npmjs            only when the NPM_TOKEN repository secret exists (an npm access token for
-#                    the `ursuciprian` account); public, anonymous installs. Adding that secret
-#                    is the decision to publish Reflex publicly: npm versions cannot be withdrawn.
-#
-# Each publish gets its own setup-node step. setup-node writes an `@ursuciprian:registry=` line
-# into .npmrc, and npm resolves a scoped package's registry from that line before `--registry`,
-# so one .npmrc cannot serve both registries.
+# Publish @ursuciprian/reflex to the public npm registry when a version tag is pushed (v0.2.0 ...).
+# The tag must match package.json's version. Needs the NPM_TOKEN repository secret: an npm access
+# token (Automation or granular, publish rights on the @ursuciprian scope). npm versions cannot be
+# withdrawn after 72 hours, so tag deliberately. --provenance links the published tarball to this
+# workflow run, which npm shows on the package page.
 
 on:
   push:
@@ -18,13 +12,11 @@ on:
 
 permissions:
   contents: read
-  packages: write
+  id-token: write   # npm provenance
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    env:
-      HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -33,31 +25,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          registry-url: https://registry.npmjs.org
       - name: Tag matches package version
         run: test "v$(node -p 'require("./package.json").version')" = "$GITHUB_REF_NAME"
       - name: Offline selfchecks
         run: npm test
         env:
           REFLEX_DATA_DIR: ${{ runner.temp }}/reflex
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          registry-url: https://npm.pkg.github.com
-          scope: "@ursuciprian"
-      - name: Publish to GitHub Packages
-        run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: actions/setup-node@v4
-        if: env.HAS_NPM_TOKEN == 'true'
-        with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-          scope: "@ursuciprian"
-      - name: Publish to npmjs
-        if: env.HAS_NPM_TOKEN == 'true'
-        run: npm publish --access public
+      - name: Publish to npm
+        run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
