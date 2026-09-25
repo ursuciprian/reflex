@@ -1,0 +1,59 @@
+name: Surprising gate decision
+description: The gate passed, asked or denied something it should not have
+labels: ["golden-set"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A decision Reflex got wrong becomes a case in `setup/tool-gate/golden.json`. Paste the
+        command and the context you saw; the maintainer can reduce it from there. Redact anything
+        you do not want public — the command alone is usually enough.
+  - type: textarea
+    id: command
+    attributes:
+      label: The command
+      description: Exactly what the agent asked to run.
+      render: sh
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: >
+        Working directory, the branch / AWS profile / kube context / terraform workspace it was in,
+        and what the agent said it was doing.
+    validations:
+      required: true
+  - type: dropdown
+    id: got
+    attributes:
+      label: What Reflex did
+      options: [pass, ask, deny, allow (REFLEX_ALLOW=on)]
+    validations:
+      required: true
+  - type: dropdown
+    id: wanted
+    attributes:
+      label: What it should have done
+      options: [pass, ask, deny, allow (REFLEX_ALLOW=on)]
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why that is wrong
+      description: What makes the command safe or dangerous here.
+    validations:
+      required: true
+  - type: textarea
+    id: trace
+    attributes:
+      label: reflex check output
+      description: "`reflex check \"<the command>\" --cwd <the directory>` — shows the rule that fired, the source and Jev's raw answers."
+      render: sh
+  - type: textarea
+    id: setup
+    attributes:
+      label: Version and agent
+      description: "`reflex version`, which agent (Claude Code, Codex, pi, omp, opencode, Hermes), `REFLEX_MODE` and `REFLEX_ALLOW`."

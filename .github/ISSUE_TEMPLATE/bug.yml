@@ -1,0 +1,42 @@
+name: Bug report
+description: Something does not install, run or load
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The exact commands, from a clean shell where possible.
+      render: sh
+    validations:
+      required: true
+  - type: textarea
+    id: where
+    attributes:
+      label: Which agent and hook
+      description: >
+        Claude Code, Codex, pi, oh-my-pi, opencode, Hermes or `bin/reflex-sh`, and what
+        `install.mjs` wrote for it.
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Version and environment
+      description: "`reflex version`, `node --version`, OS, and the `REFLEX_*` variables you set."
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: >
+        From `~/.local/state/reflex/decisions.jsonl` or the agent's own output. **Redact secrets and
+        paths you would rather not publish** — logs already redact credential shapes, not filenames.

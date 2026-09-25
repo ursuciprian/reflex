@@ -1,0 +1,41 @@
+name: ci
+
+# The offline self-checks: no API key, no network, no paid calls. The live evals
+# (npm run eval*) cost tokens and are not deterministic, so they stay out of CI.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  selfcheck:
+    name: selfcheck (node ${{ matrix.node }}, python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["18", "22"]
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Syntax check
+        run: |
+          for f in *.mjs router/*.mjs adapters/*.js bin/reflex bin/reflex-review; do
+            node --check "$f" || exit 1
+          done
+          sh -n bin/reflex-sh
+          bash -n install.sh
+      - name: Offline selfchecks
+        run: npm test
+        env:
+          REFLEX_DATA_DIR: ${{ runner.temp }}/reflex
