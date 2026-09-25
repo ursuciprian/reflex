@@ -8,6 +8,22 @@ All notable changes to Reflex are documented here. The format follows
 
 ### Added
 
+- Injection guard (`guard.mjs`, `setup/injection/`): tool results from the web, MCP servers, files
+  outside the project and network commands are scanned for prompt injection (deterministic
+  detectors in both engines; with Jev, one request of three typed questions per chunk) and a policy
+  turns the result into pass, warn or block. Warn adds a note for the agent; block removes the
+  offending text where the agent lets a hook rewrite results (Claude Code `updatedToolOutput`, pi and
+  oh-my-pi `tool_result`, opencode `tool.execute.after`) and sends the strongest signal available
+  elsewhere (Codex `decision: block`, Hermes a note on the next turn).
+- Taint: after a warn or block in enforce mode, the gate is stricter for the rest of that session
+  (network egress asks, calibrated allow is off, lower ask thresholds via the policy flag
+  `taintStrict`). New `tainted` rules in `rules.json` (`rules-v10`) and taint gates in
+  `tool-gate-v5` (a user `policy.json` from an earlier setup keeps its own gates; see the GUIDE).
+- Credentials pasted into a prompt are blocked in enforce mode (Claude Code, Codex, pi, oh-my-pi,
+  opencode), named by key type and never logged; `setup/redact.json` gains `names`.
+- `reflex scan <file|->` checks text by hand; `npm run eval-injection` runs a 43-case golden set
+  (precision, recall, exit 1 on a missed high-severity injection); `reflex doctor` probes each
+  installed guard hook; `REFLEX_GUARD` / `"guard"` set the guard's mode on its own.
 - Local setup without a TypeSafe account or key; explicit `--engine local|jev` and a setup preview.
 - `reflex status` and `reflex doctor`, including JSON output, synthetic hook checks and separate
   evidence of real hook events.
