@@ -1,7 +1,12 @@
 name: publish
 
-# Publish @ursuciprian/reflex to GitHub Packages when a version tag is pushed (v0.2.0 ...).
-# The tag must match package.json's version.
+# Publish @ursuciprian/reflex when a version tag is pushed (v0.2.0 ...).
+# The tag must match package.json's version. Published to two registries:
+#   npmjs          needs the NPM_TOKEN repository secret (an npm access token for the
+#                  `ursuciprian` account, Automation kind is enough); anonymous installs
+#   GitHub Packages uses the workflow's own GITHUB_TOKEN; a token is needed to install from it
+# Both are the same tarball, so `npm i -g @ursuciprian/reflex` works without any login.
+
 on:
   push:
     tags: ["v*"]
@@ -29,7 +34,11 @@ jobs:
         run: npm test
         env:
           REFLEX_DATA_DIR: ${{ runner.temp }}/reflex
-      - name: Publish
-        run: npm publish
+      - name: Publish to npmjs
+        run: npm publish --registry https://registry.npmjs.org --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish to GitHub Packages
+        run: npm publish --registry https://npm.pkg.github.com
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
