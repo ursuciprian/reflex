@@ -3,6 +3,7 @@
 ## Contents
 
 1. [How a command is decided](#how-a-command-is-decided)
+   - [Subgoal dedup](#subgoal-dedup)
 2. [Testing](#testing)
 3. [Rolling out: shadow, tune, enforce](#rolling-out-shadow-tune-enforce)
    - [Calibrated allow](#calibrated-allow)
@@ -111,6 +112,75 @@ echo '{"agent":"my-bot","command":"terraform apply","cwd":"/infra/prod"}' | node
 # {"effective":"ask","decision":"ask","reason":"reflex (jev): changes production","source":"jev","policy":"tool-gate-v2"}
 echo '{"agent":"my-bot","call_id":"42","exit_code":0}' | node gate.mjs --record
 ```
+
+### Subgoal dedup
+
+Before an agent spawns a subagent, the adapter sends the subgoal instead of a command:
+`{agent, subgoal, session_id, call_id, cwd}`, or `subgoals: [...]` for a batch. A call that also
+carries a `command` is judged as a command.
+
+| Agent | Tool (hook) | Subgoal |
+|---|---|---|
+| Claude Code | `Agent` / `Task` (`PreToolUse`, matcher `Bash\|Task\|Agent`) | `agent: <subagent_type>`, description, prompt |
+| Codex CLI | `spawn_agent` (`PreToolUse`, matcher `^(Bash\|spawn_agent)$`, Codex 0.155+) | `agent: <agent_type>`, task name, message (or its text items) |
+| oh-my-pi | `task` (`tool_call`) | per task: `agent: <agent>`, task, the batch's shared context cut to 200 characters |
+| opencode | `task` (`tool.execute.before`) | `agent: <subagent_type>`, description, prompt |
+| Hermes | `delegate_task` (`pre_tool_call`, its own entry without `fail_closed`) | per task: goal, context cut to 300 characters |
+
+pi has no subagents. Codex's `SubagentStart` hook is not used: its input has no task text and it
+cannot block. Resumes (Claude Code `resume`, opencode `task_id`) and Hermes control actions
+(`list`, `steer`, `stop`) are not checked. A subagent that spawns its own subagents (Claude Code,
+Codex) is compared only with its own earlier ones.
+
+Reflex keeps the subgoals of each session in `subgoals.jsonl` in the data directory, and asks Jev
+one `choice` question per new subgoal (`setup/tool-gate/subgoals.json`). The options are the
+last 20 earlier subgoals of the same agent and session that count, plus `none`:
+
+- one whose spawn **ran** (a `ran` record from the post hook), or
+- one still **pending**: written when its own check started, with no record yet, less than
+  `pendingSeconds` (300) ago. Every subgoal is written first and then compared only with the
+  rows before it, so spawns in the same message, and tasks in the same batch, see each other: of
+  two identical ones, the first passes and the second is the duplicate.
+
+A spawn Reflex denied is marked dropped at once; one the user rejected, another hook blocked or
+that failed (a `denied` or `failed` record) is never offered either, since it has no result to
+reuse. Long options keep their first 400 and last 200 characters. The question is "does this
+repeat one of them: same task, same scope, same kind of answer?" Follow-ups, other parts of the
+problem, reviews of earlier work and retries that say why the first attempt failed count as
+`none`.
+
+If the chosen option's probability is at least `duplicateAt` (0.6), that subgoal is a duplicate.
+A single spawn is denied, with a reason that names the earlier subgoal and tells the agent to
+reuse its result:
+
+```
+reflex (jev): duplicates a subgoal already launched in this session at 22:24 UTC (p 0.67):
+"agent: Explore\nFind auth flow\nExplain how login works end to end …". Reuse that result instead of starting it again
+```
+
+A batch loses only its duplicate tasks where the tool input can be trimmed: oh-my-pi runs the
+`task` call with the rest and appends to its result which tasks were not started and why. Hermes
+cannot be told which tasks a trimmed call dropped, so a Hermes batch with a duplicate is blocked
+with the list ("Start the others again without task 2"), and all its tasks are dropped, so the
+resend passes. A batch whose every task is a duplicate is denied.
+
+- **Modes:** as elsewhere. In shadow mode the check runs in the background, and duplicates are
+  logged as `deny` but not applied.
+- **Failures:** dedup saves work rather than guarding safety, so a Jev error or an internal error
+  always passes, and the Hermes entry is not fail-closed.
+- **What is stored:** `subgoals.jsonl` holds each subgoal once, redacted and cut to 2,000
+  characters, because later checks need the text. The trace keeps only a 120-character title and a
+  hash per check, never the earlier subgoals offered as options.
+- **Report:** `report.mjs` counts these checks on their own `subgoals` line.
+
+The same text again (ignoring case, spacing and a batch's shared context line) is a duplicate
+without asking Jev: Jev scores an option identical to the new subgoal low (0.2–0.3), apparently
+reading it as the new subgoal itself. On hand-made pairs with `subgoals-v3`, reworded duplicates
+scored 0.67–0.78 on the matching option, and ten legitimate follow-ups (tests for the same code,
+another part, a review, a retry that says why, a narrower scope) scored at most 0.05.
+
+ponytail: each check reads the last 2 MB of `subgoals.jsonl` and `feedback.jsonl` and takes no lock
+(each batch is one append).
 
 ## Testing
 
@@ -306,6 +376,8 @@ and [confidence](https://docs.typesafe.ai/confidence).
   terraform workspace, git branch), and the agent's last message and last five commands, also
   redacted and truncated, and the first 16 KB of a local script the command runs (a make recipe,
   an npm script), redacted, never a credentials file such as `.env`. Read-only, rule and fast-lane commands never leave the machine.
+  For subgoal dedup: the new subagent's task and the session's earlier ones, redacted and
+  truncated to 2,000 characters (600 per earlier subgoal).
 - **Redaction** covers AWS keys, GitHub / GitLab / Slack / OpenAI-style tokens, bearer and basic
   auth headers, `*SECRET*=`, `*TOKEN*=`, `*PASSWORD*=`, `--password x`, credentials in URLs,
   private key blocks and JWTs. It is a pattern list, not DLP: extend it when you see a new shape.
@@ -344,7 +416,7 @@ and [confidence](https://docs.typesafe.ai/confidence).
   credentials: Reflex supplements them.
 - Claude Code does not report a Bash exit code to hooks; Reflex records `ran` (exit 0) or
   `failed` from `PostToolUse` / `PostToolUseFailure`.
-- Only shell tools are gated (`Bash`, pi/omp `bash`, opencode `bash`, Hermes `terminal`). File-edit
+- Only shell tools are gated (`Bash`, pi/omp `bash`, opencode `bash`, Hermes `terminal`), plus the subagent tools for dedup. File-edit
   tools, MCP tools, omp's `eval` and Hermes' `execute_code` go through each agent's own permissions.
 - Codex and opencode hooks cannot open a prompt, so an `ask` blocks with a reason telling the agent
   to get your confirmation. Codex hooks cannot allow either (an allow falls through), so `allow`

@@ -23,6 +23,13 @@ and probabilities in well under a second — instead of a large LLM.
 
 All of them call the same decision core with the same rules, questions, policy and logs.
 
+**Subgoal dedup.** Agents sometimes spawn a subagent for work they already delegated earlier in
+the session, and pay for it twice. Before Claude Code's `Agent` (`Task`) tool, Codex's
+`spawn_agent`, the `task` tool of oh-my-pi or opencode, or Hermes' `delegate_task`, Reflex asks
+Jev whether each new subgoal repeats one launched earlier in the same session, including spawns
+still in flight. If it does, in enforce mode, the spawn (or just that task of a batch) is denied
+with a reason naming the earlier subgoal, so the agent reuses that result instead.
+
 ```
 agent wants to run a command
    │
@@ -89,7 +96,7 @@ week, `node report.mjs` shows the decisions, and `node install.mjs --mode enforc
 | `adapters/` | `pi.ts` (pi and oh-my-pi extension), `opencode.js` (opencode plugin) |
 | `bin/reflex-sh` | Drop-in `bash -c` for agents without hooks |
 | `policy.mjs` | Policy evaluator: ordered gates over answers, no `eval`, no domain knowledge |
-| `setup/tool-gate/` | `rules.json`, `questions.json`, `policy.json`, `golden.json` — all behaviour lives here; `fixtures/` holds the scripts the golden set runs |
+| `setup/tool-gate/` | `rules.json`, `questions.json`, `policy.json`, `golden.json`, `subgoals.json` — all behaviour lives here; `fixtures/` holds the scripts the golden set runs |
 | `eval.mjs` | Runs the golden set through the real gate; exits 1 on any missed risk |
 | `report.mjs` | Summary, replay under a candidate policy, allow calibration from your approvals, Prometheus Pushgateway export |
 | `install.mjs` | Adds / removes Reflex in each agent's config (`--agent claude,codex,pi,omp,opencode,hermes,all`) |

@@ -71,8 +71,8 @@ absolute path of the Node that ran `install.mjs`; pass `--node /path/to/node` to
 
 | Agent | What `install.mjs` does | After installing |
 |---|---|---|
-| Claude Code | `~/.claude/settings.json`: `PreToolUse` hook on `Bash` (`gate.mjs --claude`), `PostToolUse` / `PostToolUseFailure` / `PermissionDenied` hooks (`--claude-post`), and permission rules that make Claude Code ask before editing the Reflex checkout, its logs or its own settings | restart sessions |
-| Codex CLI | `~/.codex/hooks.json`: `PreToolUse` + `PostToolUse` on `^Bash$` | open Codex, run `/hooks` and **trust** the Reflex hooks — untrusted hooks do not run |
+| Claude Code | `~/.claude/settings.json`: `PreToolUse` hook on `Bash\|Task\|Agent` (`gate.mjs --claude`; `Task\|Agent` is subgoal dedup), `PostToolUse` / `PostToolUseFailure` / `PermissionDenied` hooks on the same tools (`--claude-post`), and permission rules that make Claude Code ask before editing the Reflex checkout, its logs or its own settings | restart sessions |
+| Codex CLI | `~/.codex/hooks.json`: `PreToolUse` + `PostToolUse` on `^(Bash\|spawn_agent)$` (`spawn_agent` is subgoal dedup) | open Codex, run `/hooks` and **trust** the Reflex hooks — untrusted hooks do not run |
 | pi | `~/.pi/agent/extensions/reflex.ts` | restart pi |
 | oh-my-pi | `~/.omp/agent/extensions/reflex.ts` | restart omp |
 | opencode | `~/.config/opencode/plugins/reflex.js` | restart opencode |

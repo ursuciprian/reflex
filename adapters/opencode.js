@@ -17,6 +17,18 @@ function gate(flag, payload) {
 
 export const Reflex = async ({directory}) => ({
   "tool.execute.before": async (input, output) => {
+    if (input.tool === "task") {
+      // Subgoal dedup: a subagent asked to repeat work already delegated in this session.
+      const a = output.args ?? {};
+      if (!a.prompt || a.task_id) return;   // task_id resumes earlier work on purpose
+      let d;
+      try {
+        d = JSON.parse(gate("--decide", {agent: "opencode", subgoal: [a.subagent_type && `agent: ${a.subagent_type}`, a.description, a.prompt]
+          .filter(Boolean).join("\n"), cwd: directory, session_id: input.sessionID, call_id: input.callID}));
+      } catch { return; }   // dedup saves work; it never blocks when the gate cannot run
+      if (d.effective === "deny") throw new Error(d.reason);
+      return;
+    }
     if (input.tool !== "bash") return;
     let d;
     try {
@@ -32,6 +44,8 @@ export const Reflex = async ({directory}) => ({
     if (d.effective === "ask") throw new Error(`${d.reason}. Needs human approval: ask the user to confirm before running it.`);
   },
   "tool.execute.after": async (input, output) => {
+    // A task that ran is a launched subgoal: dedup offers only those.
+    if (input.tool === "task") return void gate("--record", {agent: "opencode", event: "ran", session_id: input.sessionID, call_id: input.callID});
     if (input.tool !== "bash") return;
     gate("--record", {agent: "opencode", event: "ran", session_id: input.sessionID, call_id: input.callID,
                       exit_code: output?.metadata?.exit ?? null});
