@@ -18,10 +18,13 @@ All notable changes to Reflex are documented here. The format follows
 - Taint: after a warn or block in enforce mode, the gate is stricter for the rest of that session
   (network egress asks, calibrated allow is off, lower ask thresholds via the policy flag
   `taintStrict`). New `tainted` rules in `rules.json` (`rules-v10`) and taint gates in
-  `tool-gate-v5` (a user `policy.json` from an earlier setup keeps its own gates; see the GUIDE).
+  `tool-gate-v5`; `reflex setup` adds the gates, params and flags a user `policy.json` from an
+  earlier setup lacks, and says which, without changing or reordering the user's own.
 - Credentials pasted into a prompt are blocked in enforce mode (Claude Code, Codex, pi, oh-my-pi,
   opencode), named by key type and never logged; `setup/redact.json` gains `names`.
-- `reflex scan <file|->` checks text by hand; `npm run eval-injection` runs a 43-case golden set
+- `reflex report` summarises the guard: results by source, outcome and attack, tainted sessions and
+  blocked credential prompts, as counts.
+- `reflex scan <file|->` checks text by hand; `npm run eval-injection` runs a 53-case golden set
   (precision, recall, exit 1 on a missed high-severity injection); `reflex doctor` probes each
   installed guard hook; `REFLEX_GUARD` / `"guard"` set the guard's mode on its own.
 - Local setup without a TypeSafe account or key; explicit `--engine local|jev` and a setup preview.

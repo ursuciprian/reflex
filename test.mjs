@@ -59,6 +59,25 @@ try {
   success(cli(["setup", "--agents", picks]));
   assert.equal(read(settings).mode, "enforce", "reinstall preserves mode");
   assert.equal(read(policy).params.askAt.default, 1.1, "reinstall preserves policy");
+  // A policy seeded by an earlier setup (no tainted-* gates, taint params or flag) gains them; the
+  // user's own gates, their order and values stay as they were; a second setup adds nothing.
+  const older = read(policy);
+  older.gates = older.gates.filter(g => !g.id.startsWith("tainted-"));
+  [older.gates[0], older.gates[1]] = [older.gates[1], older.gates[0]];
+  older.gates.push({id: "mine", label: "Mine", test: "blast >= 9", outcome: "ask", rule: "my own gate"});
+  for (const p of ["taintAskAt", "taintExfilAt", "taintOnTask"]) delete older.params[p];
+  delete older.flags.taintStrict;
+  writeFileSync(policy, JSON.stringify(older));
+  const mergedOut = success(cli(["setup", "--agents", picks]));
+  assert.match(mergedOut, /policy: added param taintAskAt, param taintExfilAt, param taintOnTask, flag taintStrict, gate tainted-exfil, gate tainted-blast, gate tainted-off-task/);
+  const merged = read(policy), bundledGates = read(join(root, "setup/tool-gate/policy.json")).gates.map(g => g.id);
+  assert.deepEqual(merged.gates.filter(g => !g.id.startsWith("tainted-")).map(g => g.id), older.gates.map(g => g.id), "the user's gates keep their order");
+  const at = id => merged.gates.findIndex(g => g.id === id);
+  assert.ok(at("tainted-exfil") === at(bundledGates[bundledGates.indexOf("tainted-exfil") - 1]) + 1 && at("tainted-blast") === at("tainted-exfil") + 1,
+    "new gates go where the bundled policy has them");
+  assert.equal(merged.params.askAt.default, 1.1);
+  assert.equal(merged.flags.taintStrict.default, true);
+  assert.doesNotMatch(success(cli(["setup", "--agents", picks])), /policy: added/, "a second setup adds nothing");
   const moduleCheck = `import assert from 'node:assert/strict'; import * as g from ${JSON.stringify(join(packageRoot, "gate.mjs"))};
     assert.equal(g.load('policy.json').params.askAt.default, 1.1);
     let calls=0; globalThis.fetch=()=>{calls++; throw Error('network forbidden')};
@@ -106,6 +125,11 @@ try {
     await hooks['tool.execute.after']({tool:'edit',sessionID:'g',callID:'w4',args:{}},local);
     assert.equal(local.output,injected);
     await assert.rejects(()=>hooks['chat.message']({sessionID:'g'},{message:{},parts:[{type:'text',text:'key AKIAABCDEFGHIJKLMNOP'}]}),/AWS access key id/);
+    // a subagent's session: its taint is kept under the root session, which the gate reads for the parent
+    const {tainted}=await import(${JSON.stringify(join(packageRoot, "gate.mjs"))});
+    const kid=await Reflex({directory:${JSON.stringify(scratch)},client:{session:{get:async({path})=>({data:path.id==='kid'?{id:'kid',parentID:'mom'}:{id:path.id}})}}});
+    await kid['tool.execute.after']({tool:'webfetch',sessionID:'kid',callID:'k1',args:{url:'https://x.io'}},{title:'',output:injected,metadata:{}});
+    assert.ok(tainted('mom') && !tainted('kid'), 'opencode: a subagent taints its root session');
     const {stripTypeScriptTypes}=await import('node:module');
     if (stripTypeScriptTypes) {
       const {default:install}=await load(stripTypeScriptTypes(readFileSync(${JSON.stringify(join(scratch,".pi/agent/extensions/reflex.ts"))},'utf8')));
@@ -162,7 +186,23 @@ try {
   const data = join(env.XDG_STATE_HOME, "reflex"); mkdirSync(data, {recursive:true});
   writeFileSync(join(data,"trace.jsonl"), JSON.stringify({ts:new Date(Date.now()-3600000).toISOString(),call_id:'unknown',source:'local',decision:'ask',emitted:'ask'})+'\n');
   writeFileSync(join(data,"feedback.jsonl"), '');
-  assert.match(success(cli(["report"])), /"unknown":1/);
+  const now = new Date().toISOString();
+  writeFileSync(join(data, "guard.jsonl"), [
+    {ts: now, kind: "result", session_id: "sess-a", source_kind: "web", outcome: "block", effective: "block", gate: "hidden", source: "jev", tainted: true,
+     chunks: [{id: "c0", addressed: 0.9, attack: "run_commands", severity: 2.9}]},
+    {ts: now, kind: "result", session_id: "sess-a", source_kind: "mcp", outcome: "warn", effective: "warn", gate: "phrases", source: "fallback", tainted: true, chunks: []},
+    {ts: now, kind: "result", session_id: "sess-b", source_kind: "shell", outcome: "pass", effective: "pass", source: "jev", tainted: false,
+     chunks: [{id: "c0", addressed: 0.02, attack: "none", severity: 0}]},
+    {ts: now, kind: "prompt", session_id: "sess-c", found: [{type: "AWS access key id", n: 1}], outcome: "block", effective: "block"},
+  ].map(r => JSON.stringify(r)).join("\n") + "\n");
+  const reported = success(cli(["report"]));
+  assert.match(reported, /"unknown":1/);
+  assert.match(reported, /guard\s+3 tool results judged · by source \{"web":1,"mcp":1,"shell":1\}/);
+  assert.match(reported, /outcome\s+\{"block":1,"warn":1,"pass":1\}.*fallbacks 1/);
+  assert.match(reported, /attacks\s+\{"run_commands":1\}.*rules \{"hidden":1,"phrases":1\}/);
+  assert.match(reported, /tainted\s+1 sessions/);
+  assert.match(reported, /credentials\s+1 prompts blocked, 0 seen in shadow · \{"AWS access key id":1\}/);
+  assert.doesNotMatch(reported, /sess-/, "the report names no session");
   const savedSettings = readFileSync(settings,"utf8");
   writeFileSync(settings, '{broken');
   assert.notEqual(cli(["doctor","--json"]).status,0);
