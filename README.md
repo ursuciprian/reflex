@@ -606,25 +606,38 @@ decision. The GUIDE has the full table, including `multilingual` and calibrated 
 
 Golden sets are small and hand-labelled. To see what Reflex does on real work, `reflex replay`
 runs the shell commands already in your local Claude Code, Codex, opencode or pi transcripts
-through the gate. It executes nothing and writes nothing. Here is one DevOps and GenAI engineer's
-last 7 days, local engine, Reflex v0.8.0:
+through the gate, the same way the Claude Code hooks and Codex hooks would. It executes nothing
+and writes nothing. Here is one DevOps and GenAI engineer's last 7 days, local engine, Reflex
+v0.9.0:
 
 | | Claude Code | Codex |
 |---|---|---|
-| Shell commands the agent ran | 13,594 | 700 |
-| Passed as read-only or fast lane, no API call | 7,216 (53 %) | 485 (69 %) |
-| Asked by a rule | 585 | 5 |
-| Denied by a rule | 37 | 0 |
-| Left to the engine | 5,756 | 210 |
-| Would reach a human per 100 commands (keyless, supervised) | 46.6 | 30.7 |
-| Estimated cost to send the rest to Jev | about $0.45 | about $0.015 |
+| Shell commands the agent ran | 13,743 | 700 |
+| Passed as read-only or fast lane, no API call | 7,066 (51 %) | 517 (74 %) |
+| Asked by a rule | 597 | 5 |
+| Denied by a rule | 32 | 0 |
+| Left to the engine | 6,048 | 178 |
+| Would reach a human per 100 commands (keyless, supervised) | 48.4 | 26.1 |
+| Estimated cost to send the rest to Jev | about $0.47 | about $0.01 |
 
-The rules that fired most were `tamper` (549, changes near agent or Reflex settings),
-`force-push-main` (22), `secret-read` and `secret-file-read` (28), `rm-root` (11) and
-`secret-exfil` (7). Not every hit was right: the replay showed rules over-matching a branch
-named `...-on-master`, read-only `jq` on settings files and text inside `python3 - <<EOF`
-scripts. That is what replay is for; those rules are being tightened for the next release.
-Run it on your own history before you switch to enforce mode:
+With the local engine every command a rule does not settle goes to a person, so the last rows
+are the upper bound for a human in the loop. With Jev or System 2 answering most of them,
+autonomous coding agents get fewer permission prompts.
+
+The rules that fired most on Claude Code were `tamper` (531), `secret-exfil` (27), `secret-read`
+(18), `force-push-main` (17), `secret-file-read` (16) and `rm-root` (11). 524 of the 531 `tamper`
+hits ran inside a Reflex checkout while Reflex itself was being developed (edits to the gate,
+`REFLEX_*` variables set for test runs), which is the rule doing its job; outside that checkout
+it fired 7 times. Not every hit was right. The replay found `secret-file-read` reading the jq
+filter `.env` as a `.env` file, `secret-read` counting a keychain lookup whose output goes to
+`/dev/null` as printing the key, and reads through `/usr/bin/grep` or `/usr/bin/git` missing the
+fast path. Those are fixed for the next release, which on the same week brings Claude Code to
+7,973 commands passed without an API call (58 %) and 41.8 per 100 reaching a human; Codex is
+unchanged. What remains are rules matching test strings inside `python3 - <<EOF` programs and
+`node -e` scripts that carry a dangerous command as data (`rm-root`, `force-push-main`,
+`secret-exfil`). Those stay: the text could run, and an ask costs less than a miss. Replay is how
+these AI coding agent guardrails are tuned. Run it on your own history before you switch to
+enforce mode:
 
 ```bash
 reflex replay claude --since 7d

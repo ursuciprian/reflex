@@ -89,7 +89,7 @@ hook (see the table in the README). Each adapter turns the agent's event into th
 2. **Rules** (`rules.json`): regular expressions over the command plus its context
    (`cwd=`, `aws_profile=`, `kube_context=`, `tf_workspace=`, `git_branch=`). A rule fires when all
    of its patterns match. Rules are **enforced in shadow and enforce modes**, with off disabling the entire gate.
-   Shipped rules: `rm-root`, `prod-destroy`, `force-push-main`, `push-mirror` (deny); `tamper`, `destroy`, `secret-exfil` (for scripts), `ssh-local-command` (`-o ProxyCommand|LocalCommand|Match …`, a `-J` hop that is an option),
+   Shipped rules: `rm-root`, `prod-destroy`, `force-push-main`, `push-mirror` (deny); `tamper`, `destroy`, `force-push-unknown-branch` (a force push of `HEAD` or no ref where the branch is unknown), `secret-exfil` (for scripts), `ssh-local-command` (`-o ProxyCommand|LocalCommand|Match …`, a `-J` hop that is an option),
    and, checked even before read-only detection, `secret-read` (the API key, secret stores) and
    `secret-file-read` (`~/.ssh/id_*` but not `.pub`, `~/.aws/credentials`, `.netrc`, `.pgpass`, `.env` / `.env.*` files but not `.env.example` and other templates, `kubectl get secret(s)`) (ask). It fires only when the file is an argument of a command that reads, copies or sends it (`cat`, `less`, `head`/`tail`, `grep`/`rg`/`ag`, `jq`, `sed`/`awk`, `cp`/`scp`/`rsync` as the source, `base64`, `xxd`, `strings`, `od`, `nl`, `sort`, `uniq`, `cut`, `paste`, `fold`, `column`, `diff`, `comm`, `cmp`, `tac`, `rev`, `open`, `source`/`.`, `nc`, `tar`/`zip`, `curl -d/-F/-T/--data*`, a routed `mcp` call), at any command position (after `;`, `&&`, `|`, inside `$(…)`, backticks, `bash -c '…'`, `ssh host '…'`, `ssh host cmd …`), or is redirected in (`< ~/.aws/credentials`). A commit message, `echo`, or `cp .env.example .env` that only names the file passes. Known over-match: a `grep` whose search *pattern* is `.env` (`grep -rn '.env' src/`) asks. Any mutating command that touches the Reflex checkout, its setup files or its logs is also an `ask`, wherever the repo was cloned.
    Shell text that is data is not a command: the shell rules (`"shell": true`) skip a command that only reads and writes notes (`echo '… rm -rf / …' >> MEMORY.md`, `reflex check '…'`), and the program of a command that is only `python3 - <<'EOF' … EOF` (quoted delimiter, no wrapper or flags) when nothing in it could run, load, write or delete anything; the engine judges those instead. `tamper` (`"writes": true`) reads what a command changes, so `jq . ~/.claude/settings.json > /tmp/s.json` is a read, and a redirect, `mv`, `cp`, `tee`, `sponge`, `sed -i` or `yq -i` onto the file is not.
@@ -108,7 +108,7 @@ hook (see the table in the README). Each adapter turns the agent's event into th
    level.
 
    Rules with `"applies_to"` including `"script"` read up to 256 KB of each file. Those rules are
-   `rm-root`, `prod-destroy`, `force-push-main`, `push-mirror`, `destroy` and `tamper`, plus a
+   `rm-root`, `prod-destroy`, `force-push-main`, `force-push-unknown-branch`, `push-mirror`, `destroy` and `tamper`, plus a
    check for the Reflex checkout and logs. The file is read line by line, with the script's own
    `VAR=value` assignments expanded and whole-line `#` and `//` comments dropped, so a word on
    one line cannot combine with a verb on another. The script-only `secret-exfil` rule
