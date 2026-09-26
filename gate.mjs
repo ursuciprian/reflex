@@ -591,12 +591,18 @@ const writesView = ps => {
 const CD_STEP = Symbol("cd");
 function cdDirs(ps) {
   let dir = null, old = null;
-  const stack = [], scopes = [], home = s => s.replace(/^(\$HOME|\$\{HOME\})(?=\/|$)/, "~");
+  // D=/some/dir; cd $D: a variable an earlier assignment in the command set to a literal (never one
+  // a loop or read could set)
+  const vars = {}, all = ps.map(p => p.text).join("\n");
+  const sub = s => s.replace(/\$\{?(\w+)\}?/g, (v, n) => n in vars && !new RegExp(String.raw`\b(for|select)\s+${n}\b|\bread\b`).test(all) ? vars[n] : v);
+  const stack = [], scopes = [], home = s => sub(s).replace(/^(\$HOME|\$\{HOME\})(?=\/|$)/, "~");
   const go = to => { [old, dir] = [dir, /^[/~$]/.test(to) ? to : posix.join(dir ?? ".", to)]; };
   return ps.map(p => {
+    if (/^\s*(export\s+)?\w+=/.test(p.core))
+      for (const [, n, v] of p.core.matchAll(/(?:^|\s)(\w+)=(\S*)/g)) if (/^[\w./~@%+:,-]*$/.test(v) && n !== "HOME") vars[n] = v; else delete vars[n];
     const m = maskQuotes(p.text, "_"), count = re => (m.match(re) ?? []).length;
     for (let k = (m.match(/^[\s!{]*(\(\s*)+/)?.[0].match(/\(/g) ?? []).length; k > 0; k--) scopes.push([dir, old, stack.length]);
-    const cmd = p.core.replace(/^[\s({!]+|[\s)}]+$/g, "").replace(/^(builtin|command)\s+/, "")
+    const cmd = p.core.replace(/^[\s({!]+|[\s)}]+$/g, "").replace(/^((do|then|else)\s+)+/, "").replace(/^(builtin|command)\s+/, "")
       .match(/^(cd|pushd|popd)((?:\s+-[LPe@+-]*(?=\s))*)(?:\s+--)?(?:\s+(\S+))?$/);
     let here = dir;
     if (cmd) {
@@ -898,7 +904,7 @@ function scriptLines(body) {
   const expand = s => s.replace(/\$\{?(\w+)\}?/g, (v, name) => vars[name] ?? v);
   for (let pass = 0; pass < 3; pass++) for (const k in vars) vars[k] = expand(vars[k]);
   // and each line with the quoted parts of its words joined, as the shell joins them (m''ain)
-  const joined = l => { const j = l.replace(QUOTED_PART, "$2$4"); return j === l ? [l] : [l, j]; };
+  const joined = l => { const j = joinQuotes(l); return j ? [l, j] : [l]; };
   return {lines: lines.map(expand).flatMap(joined), skipped: lines.length < all.length};
 }
 
@@ -908,8 +914,11 @@ function nestedCheckout(cwd) {
   return false;
 }
 
-// A quoted part of a word: quotes with no space, operator or expansion inside, next to other word text.
-const QUOTED_PART = /(?<=[^\s;&|<>()])(['"])([^'"\s;&|<>()$`\\]*)\1|(['"])([^'"\s;&|<>()$`\\]*)\3(?=[^\s;&|<>()'"])/g;
+// A quoted part of a word: quotes with no space, operator, escape or expansion inside, next to other
+// word text, not escaped and not next to another quote. The text with those quotes dropped, or null
+// when there are none or dropping them leaves the quotes unbalanced (then it is not what the shell reads).
+const QUOTED_PART = /(?<=[^\s;&|<>()'"\\])(['"])([^'"\s;&|<>()$`\\]*)\1|(?<![\\'"])(['"])([^'"\s;&|<>()$`\\]*)\3(?=[^\s;&|<>()'"])/g;
+const joinQuotes = s => { const j = s.replace(QUOTED_PART, "$2$4"); return j !== s && (maskQuotes(j, "_") !== j || !/['"]/.test(j)) ? j : null; };
 /** Everything decided without Jev, or null when Jev has to judge. */
 export function precheck(command, cwd, env) {
   const rules = load("rules.json");
@@ -921,8 +930,8 @@ export function precheck(command, cwd, env) {
   const ruled = r => ({outcome: r.outcome, rule: r.rule, id: r.id, source: "rule", policy_version: rules.version});
   // The shell joins quoted parts of a word (m''ain, 'ma'in, ma"st"er are main and master): a rule
   // also reads the command with those quotes dropped.
-  const joined = command.replace(QUOTED_PART, "$2$4");
-  if (joined !== command) { const r = precheck(joined, cwd, env); if (r?.source === "rule") return r; }
+  const joined = joinQuotes(command);
+  if (joined) { const r = precheck(joined, cwd, env); if (r?.source === "rule") return r; }
   // Some rules must see reads too (printing an API key is a read).
   const bare = stripDataHeredocs(command), ctx = haystack.slice(bare.length);
   const early = checkRules(haystack, {rules: rules.rules.filter(r => r.before_read_only)}, bare);
@@ -1758,13 +1767,14 @@ async function selfcheck() {
   for (const c of ["cd ~/.claude && jq '.a=1' settings.json > s.tmp && mv s.tmp settings.json", "pushd ~/.config/reflex; echo x > config.json",
     "(cd ~/.codex && tee hooks.json)", `cd "$HOME/.claude" && echo "$X" > settings.json`, "cd ~ && cd .claude/hooks && rm gate.sh",
     "cd ~/.claude; cd /tmp; cd -; echo x > settings.json", "pushd ~/.codex && pushd /tmp && popd && tee config.toml", "cd -P ~/.claude && cp /tmp/s settings.json",
-    "cd ~/.claude 2>/dev/null && tee settings.json </tmp/x", "builtin cd ~/.codex; dd if=/tmp/x of=config.toml", "cd ~/.claude && (cd hooks && rm a.sh)",
+    "cd ~/.claude 2>/dev/null && tee settings.json </tmp/x", "D=~/.claude; cd $D && echo $X > settings.json", "if true; then cd ~/.codex; tee hooks.json; fi","builtin cd ~/.codex; dd if=/tmp/x of=config.toml", "cd ~/.claude && (cd hooks && rm a.sh)",
     "cd ~/.claude && (cd /tmp && ls) && tee settings.json", "cd ~/.config && cd reflex && tee config.json", "cd ~/.claude > ~/.claude/settings.json"])
     ok(pw(c) === "tamper", `tamper after cd: ${c}`);
   for (const c of ["cd ~/.claude && jq . settings.json > /tmp/x", "pushd ~/.config/reflex; jq . config.json > /tmp/x", "cd ~/.claude/hooks && cat x.sh > /tmp/y",
     "(cd ~/.claude && ls) && echo x > notes.txt", "(cd ~/.codex && cat hooks.json) > /tmp/h",
     "cd /w/.claude/worktrees/a && gh pr comment 6 --repo ursuciprian/reflex --body-file /tmp/b", "cd /tmp && npx -y -p @ursuciprian/reflex@0.3.0 reflex version",
-    "cd /tmp/x && curl -sL https://example.com/reflex/hooks.md -o pm.md"])
+    "cd /tmp/x && curl -sL https://example.com/reflex/hooks.md -o pm.md", "D=/tmp/logo; cd $D && python3 - <<'EOF'\nopen('a.svg', 'w').write('reflex')\nEOF",
+    "rtk proxy grep -n x bin/reflex; rtk proxy grep -n \"destructive-delete\\|\\\"prod\\\",\" setup/x.json"])
     ok(pw(c) !== "tamper", `not tamper, a read after cd: ${c}`);
   // ssh options after the host, timeout options, ip prefixes per iproute2 first match, a remote find
   for (const c of ["ssh -J a h -J b uptime", "ssh h -J b uptime", "ssh h -J b 'uptime'", "timeout -k1 5 ssh h uptime", "timeout -k 1 5 ssh h uptime",
