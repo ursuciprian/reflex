@@ -60,8 +60,8 @@ When you change rules, questions, policy or redaction:
   a refusal, prose, a spent budget, an open breaker) is `human`; the always-human class is data in
   `setup/tool-gate/escalation.json`, and `autonomy.mjs --selfcheck` proves it with a judge that
   approves everything.
-- **Errors fail towards `ask`.** In enforce mode every failure path — Jev down, timeout, unreadable
-  setup file, incomplete answer, adapter crash — ends in the policy fallback, never in a pass.
+- **Errors fail towards `ask`.** In enforce mode every failure path (Jev down, timeout, unreadable
+  setup file, incomplete answer, adapter crash) ends in the policy fallback, never in a pass.
 - **Nothing unread is allowed.** A script a command runs is inspected before the command is judged;
   code the judge never saw is never allow-eligible.
 - **Judged data is redacted first, and the redaction is shared.** `setup/redact.json` is read by

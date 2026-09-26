@@ -6,6 +6,12 @@ All notable changes to Reflex are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- README rewritten: feature overview, reproducible scenarios with real `reflex check` / `reflex scan`
+  output, measured results with their methods, and a comparison with other guardrails. The package
+  description and npm keywords follow it. The docs no longer use em dashes.
+
 ## [0.8.0] - 2026-09-26
 
 ### Added
