@@ -52,6 +52,22 @@ hook (see the table in the README). Each adapter turns the agent's event into th
    text is treated as data (`jq '.a | .b'`, `grep -E 'x|y'`), except `$(…)` and backticks inside
    double quotes, which still run. It is conservative: anything it does not recognise goes on to
    the next step. → **pass**, not logged.
+   An `ssh` call counts only as a read of its remote command, which must be read-only by the same
+   rules (the fast lane is for local work): `ssh [options] host '<read-only>'`, with the quoted
+   command last (words after it are appended on the remote side). Options come from an allowlist
+   (`-4 -6 -C -T -a -k -n -q -t -v -x`, `-p -l -i -J -b -c -m`, and `-o` with `ConnectTimeout`,
+   `BatchMode`, `StrictHostKeyChecking`, `UserKnownHostsFile`, `ServerAlive*`, `Port`, `User`,
+   `IdentityFile` and other connection settings): nothing that runs a local command or loads local
+   code (`ProxyCommand`, `LocalCommand`, `KnownHostsCommand`, `-F` config, `-I`, `PKCS11Provider`),
+   forwards (`-L -R -D -W -w`, `-A`, `-X -Y`), backgrounds (`-f -N`), writes a local file (`-E`) or
+   sends the local environment (`SendEnv`). The host is a literal name, or a variable set only by a
+   `for h in <literal hosts>` loop in the same command (no `IFS`, `read` or other assignment of it).
+   Nothing may feed ssh's stdin (a pipe or a redirect into it), and a double-quoted remote command
+   must have nothing the local shell expands (`$VAR`, `$(…)`, backticks would send local data).
+   Also read-only for remote checks: `free`, `nproc`, `lscpu`, `seq`, `systemctl status|is-active|
+   show|cat|list-*`, `journalctl` (not `--vacuum*`, `--rotate`, `--flush`), `ip addr|link|route|neigh
+   [show]`, and `docker exec [-it] [-u …] [-w …] <container> <read-only>` with a literal container.
+   In a session that read a suspected prompt injection a read-only `ssh` is still egress and asks.
 2. **Rules** (`rules.json`) — regular expressions over the command plus its context
    (`cwd=`, `aws_profile=`, `kube_context=`, `tf_workspace=`, `git_branch=`). A rule fires when all
    of its patterns match. Rules are **enforced in shadow and enforce modes**, with off disabling the entire gate.
@@ -262,7 +278,7 @@ auto-allowed; a MISS if it is). An `allow` counts as `pass` for `expect`.
 Cases with `"cwd": "$FIXTURES"` run in a temporary copy of `setup/tool-gate/fixtures/`, the
 scripts, Makefile and `package.json` those commands run (each guarded so it exits if run by hand).
 
-The set has 90 cases, 6 of them `allow: true`. `npm run eval` prints the pass / MISS / over counts
+The set has 97 cases, 6 of them `allow: true`. `npm run eval` prints the pass / MISS / over counts
 for the rules, questions and policy you have now, and saves them to
 `~/.local/state/reflex/eval-*.json`; Jev's answers vary between runs, so read a run as a sample and
 only treat a MISS as a blocker. CI runs the offline self-checks (`npm test`); the live eval needs
@@ -606,8 +622,8 @@ data directory. For the rest of that session the gate:
 
 - asks before network egress (`curl`, `wget`, `ssh`, `scp`, `git push`, `gh api` and `gh … create/comment`,
   `npm publish`, `docker push`, any URL, a script opening a socket): `tainted` in `rules.json`,
-  checked before the read-only list and the fast lane, since `gh api "…?q=$SECRET"` is a read and
-  `git push` is fast lane;
+  checked before the read-only list and the fast lane, since `gh api "…?q=$SECRET"` is a read,
+  a read-only `ssh host 'uptime'` still reaches the host, and `git push` is fast lane;
 - never allows (calibrated allow is off);
 - applies the policy's taint gates (flag `taintStrict`): ask at `exfil >= 0.2`, at `blast >= 1.0`,
   and for a mutation with `on_task < 0.6`.
@@ -714,8 +730,19 @@ profile wins, and a later setup with a key moves to Jev. Keyless, System 1 is th
 read-only list and the fast lane only, and a command they do not cover goes to System 2 instead of
 straight to a human. Rule denies, tamper, the always-human patterns and taint behave exactly as with
 Jev. What keyless does not have is Jev's own answers: the `prod`, `prod-destroy` and `exfil` gates
-are Jev's, so production is caught only by the `prod` pattern (the command, cwd, AWS profile, kube
-context, terraform workspace or branch naming prod, prd or live) and exfiltration only by System 2.
+are Jev's, so production is caught only by the `prod` pattern and exfiltration only by System 2.
+
+The `prod` pattern (the `prod` always-human rule and the `prod-destroy` rule share it) reads the
+command, the cwd and the context. `prod`, `production` and `prd` count as words anywhere
+(`envs/prod`, `terraform/ecs/production`, `--profile prod`, `prod-db.internal`, an ARN naming
+`production-ecs`, `RAILS_ENV=production`), except in `non-prod` / `pre-prod` and in a document or
+log file name (`prod-notes.md`, `production.log`). `live` is also an English word, so it counts only
+as an environment: a directory under `envs/`, `environments/`, `stages/`, `deploy(ments)/`,
+`overlays/`, `accounts/` or `workspaces/` (`envs/live`), the value of an environment option or
+variable (`--context live`, `--profile=live`, `DEPLOY_ENV=live`, `terraform workspace select live`),
+`--live`, or an AWS profile, kube context or terraform workspace containing it; the branch only when
+it is exactly `live`. A checkout at `~/src/live-demo` or a scratch directory named `auto-live` is not
+production. A directory named exactly `prod` still is, wherever it is.
 
 System 2 approved something no other model judged, so its approve is a `pass` (the agent's own
 permissions decide), except for a small class that becomes `allow`: a verdict at 0.9 or more, a stated
@@ -749,7 +776,16 @@ the commands the ladder judges; the verdict cache saved 0.5 %, since the same co
 in a session). That is 115 calls on a median active day, 294 at p90 and 592 at most. Of those
 escalations 59.6 % were egress (mostly `ssh`), 7.1 % remote CLIs, 11.4 % ran local code and 20.3 %
 passed the egress, remote-tool and script checks (an upper bound: the length, verb, path, intent and confidence checks come on top). With Jev, System 2 sees far fewer: on the
-ladder golden set 7 of 33 commands against 12 keyless.
+ladder golden set 8 of 41 commands against 15 keyless.
+
+Re-measured on the same history (14,463 commands) after the ssh and `prod` changes above: read-only
+31.4 % → 32.9 %, a human before System 2 5.5 % → 4.7 % (the `prod` pattern 2.9 % → 2.0 %; each of the
+133 matches it dropped was a word such as "live" in an echo, a comment or a file name, or the
+`auto-live` scratch directory, and it gained none), System 2 61.8 % → 61.3 %, calls per active day
+115 → 112 at the median and 294 → 281 at p90. The ssh change alone takes System 2 to 60.4 %. Most
+`ssh` commands that still reach System 2 are not reads: they start servers and benchmarks, run
+`python3 -c`, `docker exec $C` or `curl` against a health endpoint, or kill processes. Counting remote
+`curl` GETs and `docker exec $C` as reads as well would reach only 57 %, so neither is on the list.
 
 The keyless defaults follow from that: `budget.calls` 300 a day (enough for nine days in ten),
 `session_calls` 100, `session_usd` $2, and the breaker off (`breaker.rate` 1): its 30 % would stay open
@@ -965,14 +1001,16 @@ own approvals, so calibration has data from the first day. `--push` exports `ref
 reachability (a GET of the model list, never a paid call; for a CLI, that it is installed), the
 budget left, the breaker and the queue.
 
-`npm run eval-ladder` runs `setup/tool-gate/ladder.json` (33 commands labelled with their expected
+`npm run eval-ladder` runs `setup/tool-gate/ladder.json` (41 commands labelled with their expected
 resolver) with Jev live and a stub System 2 that approves everything it is asked. It fails on any
 unsafe approval (a `safe: false` case that ended in pass or allow) and when the mean case System 2
-gets exceeds `judge.max_input_tokens`. Current result, `jev-1.13.0`: 33 of 33 resolved as labelled, 0
-unsafe approvals, 30.3 human interventions per 100 commands, System 2 asked 21.2 times per 100
-commands, 516 tokens in and 22 out per call. `npm run eval-ladder -- --engine local` runs the same set
+gets exceeds `judge.max_input_tokens`. Current result, `jev-1.13.0`: 41 of 41 resolved as labelled, 0
+unsafe approvals, 26.8 human interventions per 100 commands, System 2 asked 19.5 times per 100
+commands, 512 tokens in and 22 out per call. `npm run eval-ladder -- --engine local` runs the same set
 keyless (no Jev, so offline; the labels are Jev's, so only unsafe approvals are scored): 0 unsafe
-approvals, 36.4 human interventions and 36.4 System 2 calls per 100 commands, 494 tokens in per call.
+approvals, 34.1 human interventions and 36.6 System 2 calls per 100 commands, 493 tokens in per call
+(0.6.0 on the same 41: 39.0 and 34.1: there the remote `systemctl` / `journalctl` read went to
+System 2, and the `live-demo` and `auto-live` cases to a human).
 
 ### Safety invariants
 

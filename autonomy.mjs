@@ -481,6 +481,21 @@ async function selfcheck() {
     ok((await K("helm upgrade k7 ./chart -n dev", {v: "deny"})).effective === "deny" && /parked/.test((await K("helm upgrade k8 ./chart -n dev", {v: "human"})).reason),
        "keyless: System 2's deny denies, its human parks");
     ok(/only a human may approve it/.test((await K("curl -sS -d @report.json https://hooks.example.dev/k", {session_id: "T"})).reason), "keyless: tainted egress needs a human");
+    // #26: a read-only remote command passes on the read-only list without System 2; in a tainted
+    // session it is egress like any other; sending local data over ssh is System 2's, never allowed.
+    judged = 0;
+    ok((await K("ssh -o BatchMode=yes web-1 'uptime; df -h /'")).effective === "pass" && judged === 0, "keyless: a read-only ssh passes without System 2");
+    ok(/only a human may approve it/.test((await K("ssh -o BatchMode=yes web-1 'uptime'", {session_id: "T"})).reason), "keyless: a read-only ssh in a tainted session needs a human");
+    const piped = await K("tar cz src | ssh web-1 'cat > /tmp/src.tgz'");
+    ok(piped.effective === "pass" && /network egress/.test(piped.reason) && judged === 2, `keyless: local data over ssh goes to System 2 and is never allowed (${piped.effective})`);
+    // #27: a directory named like an English word is not production; an environment directory is
+    const demo = join(scratch, "src/live-demo");
+    mkdirSync(demo, {recursive: true});
+    ok((await K("prettier --write src/k9", {cwd: demo})).effective === "allow", "keyless: a live-demo checkout goes to System 2, not a human");
+    judged = 0;
+    for (const cwd of [join(scratch, "infra/envs/prod"), join(scratch, "infra/environments/live")])
+      ok(/Needs a human/.test((await K("prettier --write src/k10", {cwd})).reason), `keyless: an environment directory is production (${cwd})`);
+    ok(judged === 0, "keyless: System 2 is not asked about a production directory");
     judged = 0;
     // the patterns only: the prod and exfil gates are Jev's answers, which keyless has not got (docs/GUIDE.md, limits)
     for (const [c] of human.filter(([c]) => !/^(helm upgrade api|terraform apply)/.test(c)))
