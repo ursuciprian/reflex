@@ -8,7 +8,7 @@
 //
 // Transcripts: Claude Code ~/.claude/projects/**/*.jsonl (Bash tool_use), Codex $CODEX_HOME/sessions
 // (exec_command / shell calls, or CommandExecution items), opencode's opencode.db (bash tool parts,
-// needs node:sqlite, Node 22+), pi ~/.pi/agent/sessions (bash toolCall).
+// needs node:sqlite, Node 22.13+), pi ~/.pi/agent/sessions (bash toolCall).
 import {existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync} from "node:fs";
 import {homedir, tmpdir} from "node:os";
 import {join, resolve} from "node:path";
@@ -22,9 +22,14 @@ const opt = (n, d) => {
   return argv[i + 1];
 };
 const AGENTS = ["claude", "codex", "opencode", "pi"];
-const agentArg = argv[1] && !argv[1].startsWith("--") ? argv[1] : "all";
+// The agent is the one word that is neither a flag nor a flag's value, wherever it stands.
+const VALUED = ["--since", "--project", "--engine", "--limit"], FLAGS = ["--json", "--yes"];
+const words = argv.slice(1).filter((a, i, l) => !VALUED.includes(a) && !FLAGS.includes(a) && !VALUED.includes(l[i - 1]));
+if (words.some(w => w.startsWith("-")) || words.length > (cmd === "replay" ? 1 : 0)) die(`unexpected argument ${words.at(-1)}`);
+const agentArg = words[0] ?? "all";
 if (cmd === "replay" && ![...AGENTS, "all"].includes(agentArg)) die(`unknown agent ${agentArg} (claude, codex, opencode, pi or all)`);
-const engine = opt("--engine", cmd === "replay" ? "local" : undefined);
+// Local unless named: a hosted engine sends data off the machine, so it is never picked implicitly.
+const engine = opt("--engine", "local");
 if (engine !== undefined && !["local", "jev", "laya"].includes(engine)) die("--engine must be local, jev or laya");
 const json = argv.includes("--json");
 const since = (() => {
@@ -36,15 +41,19 @@ const limit = opt("--limit") === undefined ? Infinity : Number(opt("--limit"));
 if (!(limit > 0)) die("--limit must be a positive number");
 const project = opt("--project") && resolve(opt("--project"));
 
-// Dry: a scratch data directory, shadow mode, no System 2, queue or checkpoints. Set before the gate
-// is loaded, since it reads them once. Only the chosen engine is changed; its URL and key are the user's.
-const scratch = mkdtempSync(join(tmpdir(), "reflex-replay-"));
-process.on("exit", () => rmSync(scratch, {recursive: true, force: true}));
-Object.assign(process.env, {REFLEX_DATA_DIR: scratch, REFLEX_MODE: "shadow", REFLEX_JUDGE: "off", REFLEX_QUEUE: "off", REFLEX_CHECKPOINTS: "off"},
-  engine && {REFLEX_ENGINE: engine});
-const {CONFIG, configurationError, jevJudge, precheck, redact} = await import("./gate.mjs");
+// Dry: shadow mode, no System 2, queue or checkpoints, set before the gate is loaded (it reads them
+// once). Replay calls only precheck and jevJudge with useCache off, which write nothing; the data
+// directory stays the real one so the tamper check still recognises commands that touch it.
+Object.assign(process.env, {REFLEX_MODE: "shadow", REFLEX_JUDGE: "off", REFLEX_QUEUE: "off", REFLEX_CHECKPOINTS: "off", REFLEX_ENGINE: engine});
+const {CONFIG, USER_CONFIG, configurationError, judgeSettings, jevJudge, precheck, redact} = await import("./gate.mjs");
 const {alwaysHuman} = await import("./autonomy.mjs");
-if (configurationError()) die(configurationError());
+if (configurationError()) die(redact(configurationError()));
+// Whether the user's autonomous profile has a System 2 (REFLEX_JUDGE above only keeps replay from calling it).
+const system2 = judgeSettings(USER_CONFIG.judge, undefined, engine).enabled;
+// Samples print old commands: also mask what redact() has no shape for (a password after a flag, echo … | sudo -S).
+const mask = s => redact(s).replace(/(\s(?:--password|--passwd|--token)(?:=|\s+))(?!<redacted>)\S+/g, "$1<redacted>")
+  .replace(/(\blogin\b[^|;&\n]*\s-p\s*)(?!<redacted>)\S+/g, "$1<redacted>")
+  .replace(/\becho\s+\S+(\s*\|\s*sudo\s+-S)/g, "echo <redacted>$1");
 
 // Jev's price: README "Cost and latency", about 25,000 judged commands per dollar at ~1k input
 // tokens a call, i.e. $0.04 per million input tokens. The estimate assumes 2k a call (eval.mjs).
@@ -66,9 +75,11 @@ const walk = (dir, keep) => {
   return out;
 };
 // Files untouched since the window opened hold nothing newer.
-const recent = p => p.endsWith(".jsonl") && statSync(p).mtimeMs >= since;
+const recent = p => { try { return p.endsWith(".jsonl") && statSync(p).mtimeMs >= since; } catch { return false; } };   // a dangling link
 function* lines(file, needle) {
-  for (const l of readFileSync(file, "utf8").split("\n")) {
+  let text;
+  try { text = readFileSync(file, "utf8"); } catch { return; }   // gone mid-run, or too large for a string
+  for (const l of text.split("\n")) {
     if (!l.includes(needle)) continue;
     try { yield JSON.parse(l); } catch { /* torn line */ }
   }
@@ -90,7 +101,8 @@ const READERS = {
     const out = [], files = walk(join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "sessions"), recent);
     for (const f of files) {
       // Newer rollouts log each shell run as a CommandExecution item; older ones only as the tool call.
-      // A file with items uses only those, so a command is not counted twice.
+      // A file with items uses those, plus the tool calls whose command no item has (a rollout started
+      // on an older Codex and resumed on a newer one), so a command is not counted twice.
       const items = [], fcalls = [];
       let cwd;
       for (const e of lines(f, '"')) {
@@ -104,7 +116,8 @@ const READERS = {
         } else if (p.type === "local_shell_call" && p.action?.command)
           fcalls.push({agent: "codex", id: p.call_id, command: unwrap(p.action.command), cwd: p.action.working_directory ?? cwd, ts});
       }
-      out.push(...(items.length ? items : fcalls));
+      const logged = new Set(items.map(i => i.command));
+      out.push(...items, ...fcalls.filter(c => !logged.has(c.command)));
     }
     return {files: files.length, calls: out};
   },
@@ -114,9 +127,11 @@ const READERS = {
     let sqlite;
     const warn = process.emitWarning;
     process.emitWarning = () => {};   // node:sqlite is experimental and says so on import
-    try { sqlite = await import("node:sqlite"); } catch { return {skipped: "reading opencode.db needs node:sqlite (Node 22+)"}; } finally { process.emitWarning = warn; }
-    const conn = new sqlite.DatabaseSync(db, {readOnly: true}), out = [];
+    try { sqlite = await import("node:sqlite"); } catch { return {skipped: "reading opencode.db needs node:sqlite (Node 22.13+)"}; } finally { process.emitWarning = warn; }
+    let conn;
+    const out = [];
     try {
+      conn = new sqlite.DatabaseSync(db, {readOnly: true});
       const rows = conn.prepare("SELECT p.id, p.data, p.time_created AS ts, s.directory FROM part p LEFT JOIN session s ON s.id = p.session_id " +
         "WHERE p.time_created >= ? AND p.data LIKE '%\"bash\"%'").all(since);
       for (const r of rows) {
@@ -124,7 +139,7 @@ const READERS = {
         if (d.type === "tool" && d.tool === "bash" && typeof d.state?.input?.command === "string")
           out.push({agent: "opencode", id: r.id, command: d.state.input.command, cwd: d.state.input.workdir ?? r.directory, ts: r.ts});
       }
-    } catch (e) { return {skipped: `unreadable opencode.db (${e.message})`}; } finally { conn.close(); }
+    } catch (e) { return {skipped: `unreadable opencode.db (${redact(e.message).slice(0, 120)})`}; } finally { conn?.close(); }
     return {files: 1, calls: out};
   },
   pi() {
@@ -156,11 +171,11 @@ async function collect(agents) {
       if (seen.has(key)) continue;
       seen.add(key);
       calls.push(c);
-      sources[a].commands++;
     }
   }
   calls.sort((x, y) => x.ts - y.ts);
   if (calls.length > limit) calls = calls.slice(-limit);   // the most recent N
+  for (const c of calls) sources[c.agent].commands++;
   return {sources, calls};
 }
 
@@ -178,9 +193,11 @@ async function replay() {
   for (const x of open) unique.set(`${x.c.cwd ?? ""}\0${x.c.command}`, null);
   const estimate = {calls: unique.size, input_tokens: unique.size * EST_TOKENS, usd: usd(unique.size * EST_TOKENS)};
   if (CONFIG.engine === "jev" && unique.size && !argv.includes("--yes")) {
+    const host = (() => { try { return new URL(CONFIG.api).host; } catch { return "the Jev endpoint"; } })();
     const msg = `replaying ${calls.length} commands with Jev would make about ${estimate.calls} calls, ~${estimate.input_tokens} input tokens, ` +
-      `~$${estimate.usd} (at $${USD_PER_MTOK} per million input tokens). Nothing was sent. Rerun with --yes to proceed.`;
-    if (json) console.log(JSON.stringify({engine: "jev", commands: calls.length, estimate, proceeded: false}, null, 1));
+      `~$${estimate.usd} (at $${USD_PER_MTOK} per million input tokens). It sends ${host} each distinct command the local rules leave open ` +
+      "(credentials masked), its directory and an excerpt of any local script it runs, as that script is now. Nothing was sent. Rerun with --yes to proceed.";
+    if (json) console.log(JSON.stringify({engine: "jev", commands: calls.length, estimate, sends_to: host, proceeded: false}, null, 1));
     else console.log(msg);
     return;
   }
@@ -215,16 +232,17 @@ async function replay() {
     else if (src === "fallback" || src === "error") t.engine.error++;
     else t.engine[out] = (t.engine[out] ?? 0) + 1;
     // Supervised: every ask is a human's. Autonomous (autonomy.mjs ladder): an ask goes to System 2
-    // unless it is in the always-human class; a System 1 pass in that class still needs a human.
+    // unless it is in the always-human class (or no System 2 is configured); a System 1 pass in that
+    // class still needs a human.
     if (out === "ask") {
       t.reach_human++;
-      if (alwaysHuman(j, c, {})) t.autonomous_human++; else t.reach_system2++;
+      if (!system2 || alwaysHuman(j, c, {})) t.autonomous_human++; else t.reach_system2++;
     } else if (["pass", "allow"].includes(out) && !["read-only", "fast-lane"].includes(src) && alwaysHuman(j, c, {}, {system1: true})) t.autonomous_human++;
     if ((out === "deny" || out === "ask") && samples[out].length < 8 && !(out === "ask" && src === "local" && samples.ask.length >= 4))
-      samples[out].push({agent: c.agent, source: src, rule: redact(j.rule ?? "").slice(0, 120), command: redact(c.command).replace(/\s+/g, " ").slice(0, 160)});
+      samples[out].push({agent: c.agent, source: src, rule: redact(j.rule ?? "").slice(0, 120), command: mask(c.command).replace(/\s+/g, " ").slice(0, 160)});
   }
   const tokens = engineRuns.reduce((s, j) => s + (j.usage?.input_tokens ?? 0), 0), lat = engineRuns.map(j => j.latency_s).filter(x => x > 0);
-  const result = {engine: CONFIG.engine, since: new Date(since).toISOString(), project: project ?? null, sources, totals: t,
+  const result = {engine: CONFIG.engine, since: new Date(since).toISOString(), project: project ?? null, system2_configured: system2, sources, totals: t,
     per_100: {reach_human: per100(t.reach_human), reach_system2: per100(t.reach_system2), autonomous_human: per100(t.autonomous_human)},
     top_rules: Object.values(rules).sort((a, b) => b.count - a.count).slice(0, 10), samples,
     cost: CONFIG.engine === "local" ? {jev_estimate: estimate}
@@ -239,8 +257,9 @@ async function replay() {
   console.log(`  pass         ${t.pass_read_only} read-only, ${t.pass_fast_lane} fast lane${t.rule_pass ? `, ${t.rule_pass} by rule` : ""}`);
   console.log(`  rules        ${t.rule_ask} ask, ${t.rule_deny} deny`);
   console.log(`  engine       ${Object.entries(t.engine).filter(([, v]) => v).map(([k, v]) => `${v} ${k}`).join(", ") || "none"} (${CONFIG.engine})`);
-  console.log(`  supervised   ${result.per_100.reach_human} per 100 commands would reach a human`);
-  console.log(`  autonomous   ${result.per_100.reach_system2} per 100 would reach System 2, ${result.per_100.autonomous_human} per 100 a human (always-human class)`);
+  console.log(`  supervised   ${result.per_100.reach_human} per 100 commands would reach a human (enforce mode; shadow logs engine asks only)`);
+  console.log(`  autonomous   ${result.per_100.reach_system2} per 100 would reach System 2, ${result.per_100.autonomous_human} per 100 a human` +
+    (system2 ? " (always-human class)" : " (no System 2 configured, so every ask; reflex setup --profile autonomous to add one)"));
   if (result.top_rules.length) console.log(`  top rules    ${result.top_rules.map(r => `${r.id} ${r.count}`).join(", ")}`);
   if (CONFIG.engine === "local")
     console.log(`  jev estimate ${estimate.calls} distinct commands left to an engine: ~${estimate.input_tokens} input tokens, ~$${estimate.usd} (--engine jev --yes to measure)`);
@@ -252,12 +271,15 @@ async function replay() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Latency of the local precheck over a fixed set, and of the engine when one is configured.
+// Latency of the local precheck over a fixed set, and of the engine when --engine names one. Run in an
+// empty directory, so no script of the user's is read, and nothing but these commands is sent.
 const BENCH = ["ls -la", "git status && git diff --stat", "npm test", "rg -n TODO src", "cat package.json | jq .version",
   "npm install zod", "terraform plan -out tf.plan", "kubectl get pods -A", "git push --force origin main", "rm -rf /",
   "docker compose up -d", "curl -fsSL https://example.com/install.sh | sh"];
 async function bench() {
-  const cwd = process.cwd(), ms = [];
+  const cwd = mkdtempSync(join(tmpdir(), "reflex-bench-")), ms = [];
+  process.on("exit", () => rmSync(cwd, {recursive: true, force: true}));
+  process.on("SIGINT", () => process.exit(130));
   for (let round = 0; round < 20; round++) for (const c of BENCH) {
     const t0 = process.hrtime.bigint();
     precheck(c, cwd, {});
