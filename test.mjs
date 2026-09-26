@@ -469,4 +469,73 @@ try {
     assert.match(success(cli3(["setup", "--profile", "autonomous", ...agents2, "--dry-run"], {env: Object.fromEntries([["TYPESAFE_API_KEY", ["test", "key", process.pid].join("-")]])})), /engine jev/);
     console.log("keyless autonomous onboarding checks OK");
   } finally { stub.kill(); }
+  // reflex replay / bench over synthetic Claude Code and Codex transcripts: nothing runs, nothing is
+  // written to the data directory, credentials are masked, and Jev is called only with --yes.
+  {
+    const home = join(scratch, "replay-home"), proj = join(home, "proj"), data = join(scratch, "replay-data"), canary = join(home, "ran");
+    const now = new Date().toISOString(), old = new Date(Date.now() - 30 * 864e5).toISOString();
+    const token = ["ghp", "R".repeat(36)].join("_");
+    const renv = {...env, HOME: home, CODEX_HOME: join(home, ".codex"), XDG_DATA_HOME: join(home, "share"), REFLEX_DATA_DIR: data};
+    const tool = (id, name, input, timestamp = now) => JSON.stringify({type: "assistant", cwd: proj, timestamp,
+      message: {role: "assistant", content: [{type: "tool_use", id, name, input}]}});
+    mkdirSync(join(home, ".claude/projects/-proj"), {recursive: true});
+    mkdirSync(proj);
+    writeFileSync(join(home, ".claude/projects/-proj/a.jsonl"), [tool("t1", "Bash", {command: "ls -la"}),
+      tool("t2", "Bash", {command: "git push --force origin main"}), tool("t3", "Bash", {command: `curl -H "Authorization: token ${token}" https://api.github.com/user`}),
+      tool("t4", "Bash", {command: `touch ${canary}`}), tool("t5", "Bash", {command: "npm install zod"}, old),
+      tool("t6", "Read", {file_path: "/etc/hosts"}), "{torn"].join("\n"));
+    // a resumed session repeats earlier calls: counted once
+    writeFileSync(join(home, ".claude/projects/-proj/b.jsonl"), [tool("t1", "Bash", {command: "ls -la"}), tool("t2", "Bash", {command: "git push --force origin main"})].join("\n"));
+    const day = join(home, ".codex/sessions/2026/09/26"), line = (type, payload) => JSON.stringify({timestamp: now, type, payload});
+    mkdirSync(day, {recursive: true});
+    writeFileSync(join(day, "rollout-old.jsonl"), [line("session_meta", {cwd: proj}),
+      line("response_item", {type: "function_call", name: "exec_command", call_id: "c1", arguments: JSON.stringify({cmd: "git push -f origin master", workdir: proj})}),
+      line("response_item", {type: "function_call", name: "shell", call_id: "c2", arguments: JSON.stringify({command: ["bash", "-lc", "cat README.md"]})})].join("\n"));
+    // newer rollouts log CommandExecution items too: only those count, not the tool call beside them
+    writeFileSync(join(day, "rollout-new.jsonl"), [line("turn_context", {cwd: proj}),
+      line("response_item", {type: "function_call", name: "exec_command", call_id: "c3", arguments: JSON.stringify({cmd: "git status"})}),
+      line("event_msg", {type: "item_completed", item: {type: "CommandExecution", id: "i1", command: ["/bin/zsh", "-lc", "git status"], cwd: proj}})].join("\n"));
+    const replay = (args, e = renv) => new Promise(res => {
+      const p = spawn(process.execPath, [join(root, "bin/reflex"), ...args], {cwd: root, env: e}); let out = "", err = "";
+      p.stdout.on("data", d => out += d); p.stderr.on("data", d => err += d);
+      p.on("close", status => res({status, out, err}));
+    });
+    const r = JSON.parse((await replay(["replay", "all", "--since", "7d", "--json"])).out);
+    assert.ok(r.engine === "local" && r.sources.claude.commands === 4 && r.sources.codex.commands === 3 && r.sources.opencode.skipped, JSON.stringify(r.sources));
+    const t = r.totals;
+    assert.ok(t.commands === 7 && t.pass_read_only === 3 && t.pass_fast_lane === 1 && t.rule_deny === 2 && r.top_rules[0].id === "force-push-main" &&
+      t.reach_human === t.rule_ask + t.engine.ask && r.cost.jev_estimate.calls >= 1, JSON.stringify(r));
+    const text = await replay(["replay", "claude"]);
+    assert.ok(text.status === 0 && /commands\s+4/.test(text.out) && /force push/.test(text.out), text.out + text.err);
+    assert.ok(![r, text.out].some(o => JSON.stringify(o).includes(token)), "credentials are masked in replay output");
+    assert.ok(!existsSync(canary) && !existsSync(data), "replay runs nothing and writes no trace, cache or queue");
+    assert.equal(JSON.parse((await replay(["replay", "claude", "--project", join(home, "elsewhere"), "--json"])).out).totals.commands, 0);
+    assert.equal(JSON.parse((await replay(["replay", "codex", "--limit", "1", "--json"])).out).totals.commands, 1);
+    // Jev: an estimate and nothing sent without --yes; with it, tokens and spend from `usage`
+    const seen = [];
+    const stub = createServer(async (req, res) => {
+      let b = "";
+      for await (const c of req) b += c;
+      const body = JSON.parse(b);
+      seen.push(req.headers.authorization);
+      res.end(JSON.stringify({usage: {input_tokens: 1000}, answers: Object.fromEntries(Object.entries(body.questions).map(([k, q]) =>
+        [k, q.type === "noul" ? {type: "noul", noul: 0.02} : q.type === "score" ? {type: "score", score: 0.2, confidence: 0.9} : {type: "choice", choice: "local"}]))}));
+    });
+    await new Promise(ok => stub.listen(0, "127.0.0.1", ok));
+    try {
+      const jenv = {...renv, REFLEX_API_URL: `http://127.0.0.1:${stub.address().port}/v1/systemone`, TYPESAFE_API_KEY: ["replay", "test", process.pid].join("-")};
+      const dry = JSON.parse((await replay(["replay", "all", "--engine", "jev", "--json"], jenv)).out);
+      assert.ok(dry.proceeded === false && dry.estimate.calls >= 1 && seen.length === 0, JSON.stringify(dry));
+      const paid = await replay(["replay", "all", "--engine", "jev", "--yes", "--json"], jenv), pj = JSON.parse(paid.out);
+      assert.ok(pj.cost.calls === dry.estimate.calls && seen.length === dry.estimate.calls && pj.cost.input_tokens === 1000 * seen.length &&
+        pj.cost.usd > 0 && pj.totals.engine.error === 0, JSON.stringify(pj));
+      assert.ok(!paid.out.includes(jenv.TYPESAFE_API_KEY) && !paid.err.includes(jenv.TYPESAFE_API_KEY), "the key is never printed");
+      const b = JSON.parse((await replay(["bench", "--engine", "jev", "--json"], jenv)).out);
+      assert.ok(b.precheck_ms.p50 >= 0 && b.engine_ms.calls >= 1 && b.engine_ms.errors === 0 && b.spend.usd_per_1000_calls > 0, JSON.stringify(b));
+    } finally { stub.close(); }
+    const local = JSON.parse((await replay(["bench", "--engine", "local", "--json"])).out);
+    assert.ok(local.precheck_ms.runs > 0 && !local.engine_ms, JSON.stringify(local));
+    assert.ok(!existsSync(canary) && !existsSync(data), "bench and a Jev replay write nothing either");
+    console.log("replay and bench checks OK");
+  }
 } finally { rmSync(scratch, {recursive: true, force: true}); }

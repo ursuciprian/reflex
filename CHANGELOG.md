@@ -6,6 +6,18 @@ All notable changes to Reflex are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `reflex replay [claude|codex|opencode|pi|all]`: what the gate would have done with the shell commands
+  already in local session transcripts (Claude Code, Codex, opencode via `node:sqlite`, pi). Counts
+  read-only and fast-lane passes, rule asks and denies, engine decisions, asks per 100 commands
+  (supervised) and System 2 versus human (autonomous), the top rules and a masked sample.
+  `--since`, `--project`, `--limit`, `--json`. Nothing is executed and nothing is written: a scratch
+  data directory, shadow mode, no System 2, queue or checkpoints. `--engine jev` prints a cost
+  estimate and calls Jev only with `--yes`; then tokens and spend come from `usage`.
+- `reflex bench`: precheck latency p50/p95 on a fixed command set, plus one Jev or Laya call per
+  uncovered command when that engine is configured, with tokens and cost per 1,000 calls.
+
 ## [0.8.0] - 2026-09-26
 
 ### Added

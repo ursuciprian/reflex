@@ -6,6 +6,7 @@
    - [Subgoal dedup](#subgoal-dedup)
 2. [Testing](#testing)
 3. [Rolling out: shadow, tune, enforce](#rolling-out-shadow-tune-enforce)
+   - [Replay and bench](#replay-and-bench)
    - [Calibrated allow](#calibrated-allow)
 4. [Changing behaviour](#changing-behaviour)
 5. [Metrics](#metrics)
@@ -332,6 +333,53 @@ To test enforce behaviour without switching your whole setup, start one session 
 4. **Watch the ask outcomes.** In enforce mode `report.mjs` scores each emitted ask as approved
    (the command ran), rejected (explicit denial feedback), pending or unknown. Missing feedback after ten minutes is unknown and excluded from calibration. An ask that is nearly always approved is friction: tune it.
    A deny someone keeps working around is a missing fast-lane pattern.
+
+### Replay and bench
+
+Before a week of shadow mode, `reflex replay` shows what the gate would have done with the shell
+commands your agents already ran. It reads the local session transcripts, runs each command
+through the gate's checks and prints counts. It never executes a command, and it writes nothing:
+the data directory is a scratch one deleted on exit, the mode is shadow, and System 2, the queue
+and checkpoints are off. The trace, the answer cache and the approval queue are untouched.
+
+```sh
+reflex replay claude --since 7d                  # local engine, free
+reflex replay codex --since 30d --project ~/work/api
+reflex replay all --json                         # claude, codex, opencode and pi
+reflex replay claude --engine jev                # prints an estimate, sends nothing
+reflex replay claude --engine jev --yes          # the real Jev calls; tokens and spend from usage
+reflex bench                                     # precheck p50/p95; a Jev or Laya call when configured
+```
+
+| Agent | Where | What counts as a command |
+|---|---|---|
+| Claude Code | `~/.claude/projects/**/*.jsonl` (subagents included) | `Bash` tool_use |
+| Codex | `$CODEX_HOME/sessions/**/*.jsonl` | `CommandExecution` items; in older rollouts `exec_command`, `shell` and `local_shell_call` |
+| opencode | `~/.local/share/opencode/opencode.db` | `bash` tool parts; needs `node:sqlite` (Node 22+), else skipped with a note |
+| pi | `~/.pi/agent/sessions/**/*.jsonl` | `bash` toolCall |
+
+A call id counts once, so a resumed session that copies earlier calls does not double them.
+`--since` takes `7d`, `12h` or `30m` (default 7d), `--project` keeps commands whose cwd is under a
+directory, `--limit N` keeps the most recent N.
+
+The output: commands; passes by the read-only list and the fast lane; rule asks and denies; what
+the engine decided for the rest (engine local: an ask for each, as in the hook); asks per 100
+commands, which is what reaches a human in the supervised profile; and, for the autonomous
+profile, how many of those asks would go to System 2 and how many stay with a human (the
+always-human class). Then the rules that fired most, a sample of denied and asked commands with
+credentials masked by `redact()`, and the spend. With engine local that is an estimate for Jev:
+distinct uncovered commands (a repeat in the same directory is asked once, as the answer cache
+would), about 2k input tokens each, at $0.04 per million. With `--engine jev --yes` it is the
+measured tokens from `usage`, the spend at that price, and Jev's latency p50 and p95.
+
+What replay cannot see: the environment at the time (AWS profile, kube context, branch) is not in
+a transcript, so it is left empty and rules keyed on it do not fire; there is no stated intent, so
+Jev never allows; and a local script the command runs is read as it is now, not as it was.
+
+`reflex bench` times the local precheck over twelve fixed commands, 20 rounds, and prints p50 and
+p95. With engine jev or laya (configured, or `--engine`) it also sends the commands the local
+rules leave open, one call each, and prints latency, input tokens and the cost per 1,000 calls.
+Both take `--json`.
 
 ### Calibrated allow
 
