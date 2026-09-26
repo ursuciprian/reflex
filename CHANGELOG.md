@@ -25,7 +25,22 @@ All notable changes to Reflex are documented here. The format follows
 - `journalctl --rot`, `--flu`, `--syn` and other unique prefixes of writing options were read-only
   (getopt_long expands them). No long option may be a prefix of one that writes.
 - A loop word like `a@-F` made a host that is an option (`for h in a@-F; do ssh $h …`).
-- `ssh h cat .env` (unquoted) now hits the secret-file rule like `ssh h 'cat .env'`.
+- `ssh h cat .env` (unquoted) now hits the secret-file rule like `ssh h 'cat .env'`, and so do
+  `nl`, `sort`, `uniq`, `cut`, `paste`, `fold`, `column`, `diff`, `comm`, `cmp`, `tac` and `rev`.
+- `case x in x) touch y;; esac` and `for i do touch y; done` were read-only: the whole segment was
+  taken for a loop or case header. A header is now only a header; a case arm's command is judged.
+- `awk -f`, `sed -f` (and gawk `-i`/`-E`/`-l`) run a program the gate never sees; `yq -i`/`-s` and
+  `xxd in out` / `xxd -r` write files; `nvidia-smi -f` writes a log. None is read-only now.
+- A quoted option was invisible to the flag checks (`sed "-i"`, `gh api '--method=DELETE'`,
+  `nvidia-smi -"pm" 1`, `journalctl "--rotate"`): quotes around an option word are dropped first.
+- A quoted heredoc fed to an unquoted ssh call counted as a plain word, so
+  `ssh h awk -f - <<'EOF'` passed its body to the host as a read.
+- New rule `ssh-local-command` (ask, before Jev): `ssh -o ProxyCommand|LocalCommand|
+  PermitLocalCommand|KnownHostsCommand|Match …` or a `-J` / `ProxyJump` hop that is an option. Jev
+  judged `ssh -J bastion,-oProxyCommand=/tmp/x.sh db-1 'uptime'` low risk in one eval run.
+- `--output` only counts as a write for `git` and `sort`: `aws … --output json`,
+  `journalctl --output=short-iso` and `systemctl --output=json` are reads again. `systemctl -t
+  service list-units` (options that take a value) is read-only.
 
 ## [0.8.0] - 2026-09-26
 
