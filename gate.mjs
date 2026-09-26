@@ -569,19 +569,20 @@ function roughPipelines(c) {
 const CD_WATCH = /(^|\/)(\.claude(\/(settings|hooks)\b.*)?|\.codex(\/(hooks|rules|config)\b.*)?|\.hermes(\/.*)?|\.config(\/(reflex|opencode)\b.*)?|\.local(\/state(\/.*)?)?|\.(pi|omp)(\/agent(\/.*)?)?|opencode(\/.*)?|reflex(\/.*)?)\/?$|\$|^~\/?$/i;
 const cdWatched = d => CD_WATCH.test(d) || [HERE, CONFIG.data, dirname(USER_CONFIG_FILE)].some(p => (d + "/").startsWith(p + "/") || p.startsWith(d.replace(/\/$/, "") + "/"));
 // A cd, pushd or popd the directory tracking below reads writes nothing itself: its effect is the
-// resolved paths. One it cannot read is kept whole.
-const writesView = ps => {
+// resolved paths, each set on a line of its own so a rule cannot match across it and the command
+// text. One it cannot read is kept whole. `resolvedOnly`: only those lines.
+const writesView = (ps, resolvedOnly = false) => {
   const dirs = cdDirs(ps);
   return ps.map((p, i) => {
     const whole = !p.inert || /^[\s({!]*(cd|pushd|popd|for|select|case|while|until|if|export|local|declare|typeset|readonly|read|touch|mkdir)\b|^[\s({!]*\w+=/.test(p.core);
-    if (dirs[i] === CD_STEP) return p.targets.map(t => `> ${t}`).join(" ");
+    const view = resolvedOnly ? "" : dirs[i] === CD_STEP || !whole ? p.targets.map(t => `> ${t}`).join(" ") : p.text;
+    const at = typeof dirs[i] === "string" && cdWatched(dirs[i]) ? dirs[i] : null;
+    if (!at) return view;
     // the arguments of each command in the pipeline (not its name, not a URL) and the redirect targets
     const words = whole ? [...p.text.split("|").flatMap(s => s.replace(/[<>&;(){}]/g, " ").trim().split(/\s+/).slice(1)), ...p.targets]
       .flatMap(w => [w, w.replace(/^[^=]*=/, "")]).filter(w => !w.includes("://")) : p.targets;
-    const view = whole ? p.text : p.targets.map(t => `> ${t}`).join(" ");
-    const at = typeof dirs[i] === "string" && cdWatched(dirs[i]) ? dirs[i] : null;
-    return at ? `${view} ${words.map(w => w.replace(/["'\\]/g, "")).filter(w => w && !/^[-/~$]/.test(w)).map(w => `> ${posix.join(at, w)}`).join(" ")}` : view;
-  }).join(" ; ");
+    return `${view}\n${words.map(w => w.replace(/["'\\]/g, "")).filter(w => w && !/^[-/~$]/.test(w)).map(w => `> ${posix.join(at, w)}`).join(" ")}\n`;
+  }).filter(Boolean).join(" ; ");
 };
 // The directory each pipeline runs in, as far as the command line itself changes it: after
 // `cd ~/.claude &&`, `pushd ~/.config/reflex;` or inside `(cd ~/.codex && …)` a relative path names a
@@ -594,7 +595,7 @@ function cdDirs(ps) {
   // D=/some/dir; cd $D: a variable an earlier assignment in the command set to a literal (never one
   // a loop or read could set)
   const vars = {}, all = ps.map(p => p.text).join("\n");
-  const sub = s => s.replace(/\$\{?(\w+)\}?/g, (v, n) => n in vars && !new RegExp(String.raw`\b(for|select)\s+${n}\b|\bread\b`).test(all) ? vars[n] : v);
+  const sub = s => s.replace(/\$\{?(\w+)\}?/g, (v, n) => n in vars && !new RegExp(String.raw`\b(for|select)\s+${n}\b|(^|[;&|(\s])read\s[^;&|\n]*\b${n}\b`).test(all) ? vars[n] : v);
   const stack = [], scopes = [], home = s => sub(s).replace(/^(\$HOME|\$\{HOME\})(?=\/|$)/, "~");
   const go = to => { [old, dir] = [dir, /^[/~$]/.test(to) ? to : posix.join(dir ?? ".", to)]; };
   return ps.map(p => {
@@ -942,7 +943,7 @@ export function precheck(command, cwd, env) {
   // Quotes and backslashes are dropped, as the shell drops them: ~/.claude/'settings.json' is the file.
   // When the text hides what runs (a $, a heredoc), the whole command counts, plus the paths a cd
   // in it points relative ones at (cd "$HOME/.claude" && tee settings.json).
-  const ps = pipelines(command), writes = (ps ? writesView(ps) : `${bare} ; ${writesView(roughPipelines(bare))}`).replace(/["'\\]/g, "");
+  const ps = pipelines(command), writes = (ps ? writesView(ps) : `${bare} ; ${writesView(roughPipelines(bare), true)}`).replace(/["'\\]/g, "");
   // The checkout itself is protected wherever it was cloned, not only under a directory named reflex.
   // A git worktree or clone nested inside it is another checkout, unless the command climbs out (..).
   const inRepo = cwd && (cwd + "/").startsWith(HERE + "/") && !(nestedCheckout(cwd) && !/(^|[\s/'"=:])\.\.([\s/'";&|)]|$)/.test(command));
