@@ -377,7 +377,7 @@ autonomous profile, how many of those asks would go to System 2 and how many sta
 that fired most, a sample of denied and asked commands with credentials masked by `redact()` (and
 a password after `--password`, `--token` or `login -p`), and the spend. With engine local that is an estimate for Jev:
 distinct uncovered commands (a repeat in the same directory is asked once, as the answer cache
-would), about 2k input tokens each, at $0.04 per million. With `--engine jev --yes` it is the
+would), about 2k input tokens each, at $0.04 per million (TypeSafe publishes no price list; this matches a public third-party measurement; set `REFLEX_JEV_USD_PER_MTOK` to your contract price). With `--engine jev --yes` it is the
 measured tokens from `usage`, the spend at that price, and Jev's latency p50 and p95. `--yes`
 sends TypeSafe each distinct uncovered command (credentials masked), its directory and an excerpt
 of any local script it runs; the estimate says so before anything is sent.
