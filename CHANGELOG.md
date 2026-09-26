@@ -6,6 +6,52 @@ All notable changes to Reflex are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- A remote command over `ssh` is read-only (a local pass, no Jev or System 2 call, in both engines)
+  only when it is a provable read (#26): options from an allowlist with values that are neither
+  options nor globs, a literal host or a plain variable set only by a `for` loop over literal host
+  names that the call is inside, the quoted remote command last and read-only by the same rules (not
+  the fast lane), no redirect, heredoc or pipe reaching ssh's stdin, and in a double-quoted remote
+  command nothing the local shell expands. A session that read a suspected prompt injection still
+  asks about it, as egress. `scp`, `rsync`, `sftp`, uploads and piping local files are unchanged.
+- Read-only list: `free`, `nproc`, `lscpu`, `seq`, `systemctl` status and listing verbs,
+  `journalctl` (not `--vacuum*`, `--rotate`, `--flush`, `--cursor-file`, …), `ip addr|link|route|neigh
+  [show]` with display options only, and `docker exec [-t] [-u …] [-w …]` of a read-only command in a
+  literally named container.
+- The production pattern (`prod` always-human rule, `escalation-v2`; `prod-destroy` rule,
+  `rules-v12`) treats `live` as an environment only where it names one (`envs/live`,
+  `clusters/live`, `live/<region>`, `infrastructure-live`, `cd live`, `-chdir=live`, `live*.tfvars`,
+  `--context live`, `--kube-context=eks-live-1`, `-n live`, `-h live-db`, `DEPLOY_ENV=live`,
+  `terraform workspace select live`, `--live`, a profile, kube context or workspace containing it),
+  not as a word: a checkout at `~/src/live-demo` or a scratch directory named `auto-live` no longer
+  sends every uncovered command to a human (#27). `prod`, `production` and `prd` still count
+  anywhere, except in `non-prod` / `pre-prod` and in file names ending in a document, log, data or
+  image extension (`prod-notes.md`). Over 14,470 real commands it dropped 133 matches, all
+  incidental, and added none; every production case in the selfchecks and golden sets is still caught.
+  Its repetitions are bounded, so a long command cannot make it backtrack for long.
+- Measured keyless on the same history: read-only 31.4 % → 33.1 %, a human before System 2 5.5 % →
+  4.7 %, System 2 61.8 % → 61.0 %, calls per active day 115 → 112 (median) and 294 → 284 (p90). Most
+  `ssh` commands that still escalate are not reads (they start jobs, run code or call `curl`); see
+  docs/GUIDE.md.
+- Golden sets: `golden-v5` (97 cases) and `ladder-v2` (41) add remote reads, a secret expanded into
+  a remote command, a tainted read-only ssh, and production versus incidental directory names.
+
+### Security
+
+- `nvidia-smi` counted as read-only whatever its flags; `-pl` (power limit), `-r` / `--gpu-reset`,
+  `-pm`, clock locks, MIG and ECC settings change the GPU and now go through the gate.
+- The read-only list no longer passes `ssh` calls that 0.6.0 let through without a judgment: `-F`
+  (a config file can run a `ProxyCommand`), `-I` / `PKCS11Provider` (loads a local library),
+  `-o KnownHostsCommand` and `SendEnv`, agent and X11 forwarding (`-A`, `-X`), `-E` (writes a local
+  file), a host from an arbitrary variable (`h=-oProxyCommand=…; ssh $h '…'`), a local file or pipe
+  feeding ssh's stdin (`cat notes.txt | ssh h 'cat'`), and a local `$VAR` or `$(…)` expanded into a
+  double-quoted remote command (`ssh h "echo $TOKEN"`).
+- The read-only check follows the shell where 0.6.0 did not: a backslash-newline joins the lines
+  (`find . -de\⏎lete` was read as `-de lete`), `$'…'` is quoted text, and a word starting with `#`
+  comments out the rest of its line (a quote inside a comment no longer hides the next line). The
+  script rules join continued lines the same way.
+
 ## [0.6.0] - 2026-09-26
 
 ### Added
