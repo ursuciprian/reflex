@@ -6,6 +6,25 @@ All notable changes to Reflex are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Injection guard: a long paraphrased injection whose short last section was judged on its own
+  (golden case `paraphrase-past-eight-chunks`) passed about one run in three (#19). A piece under
+  1,000 characters now goes to Jev with the piece before it when both fit in a chunk (Jev's
+  `addressed` for that section: 0.45-0.56 alone, 0.62-0.72 with the page before it), and a new
+  policy gate, `jev-suspect`, warns when Jev names a serious attack (severity 1.8 or more) but is
+  only 0.25 or more sure the text speaks to an AI (param `suspectAt`; policy `injection-v3`).
+  Five live runs: 0 missed, precision 97 %, recall 100 %, no new false positive; input tokens on
+  the previous 53 cases 72,350 before, 71,807 after.
+
+### Added
+
+- Injection guard: text spaced out letter by letter (`I g n o r e   p r e v i o u s`) is read with
+  the single spaces taken out; a phrase addressed to an AI in it counts as hidden text and blocks.
+- Injection golden set (`injection-golden-v3`, 62 cases): paraphrases split across two chunks, on
+  one long line, at the top, middle and end of long pages, a letter-spaced override, and benign
+  letter-spaced headings, a long field guide on prompt injection and a long coding-agent README.
+
 ## [0.5.0] - 2026-09-25
 
 ### Added

@@ -536,7 +536,8 @@ signal:
   (U+E0000 to U+E007F, *ASCII smuggling*; emoji flags excepted), a phrase split by zero-width
   characters, HTML comments, CSS-hidden elements, `alt` / `title` / `aria-label` attributes,
   markdown comments, the text of `data:` URLs, base64 blobs (also URL-safe or wrapped over lines)
-  that decode to such text, and text spelled in a run of variation selectors. The phrases are
+  that decode to such text, text spelled in a run of variation selectors, and text spaced out
+  letter by letter (`I g n o r e   p r e v i o u s`, read with the single spaces taken out). The phrases are
   matched on the text as a reader takes it in: invisible characters and soft hyphens out,
   look-alike Cyrillic and Greek letters, full-width, mathematical and accented letters read as
   Latin, JSON `\u` escapes and HTML character references decoded. A phrase that needed a disguised
@@ -549,7 +550,9 @@ signal:
 
 **Jev** (engine `jev`): the result is cut into chunks with `context.mjs`'s `chunk()` (at most
 3,000 characters each; at most 24 per result, those with a detector hit first, 8 per request with
-the requests in parallel), and each request asks three questions per chunk (`setup/injection/questions.json`):
+the requests in parallel), and each request asks three questions per chunk (`setup/injection/questions.json`).
+A piece under 1,000 characters goes with the piece before it when both fit in one chunk: a short
+last section judged on its own has no page around it to show who it speaks to.
 
 | Question | Type | Meaning |
 |---|---|---|
@@ -571,9 +574,12 @@ task" can be judged. Chunks are redacted before they leave. Answers are cached b
 5. an address to an AI (override, role or `to_ai`) together with an action (`shell`, `secrets`,
    `exfil`): **block**.
 6. Jev: `addressed >= 0.5`, `severity >= 0.8`, an attack: **warn**.
-7. an address to an AI alone, or 12 or more invisible characters (with Jev, counted per chunk): **warn**.
+7. Jev: `addressed >= 0.25`, `severity >= 1.8`, an attack: **warn**. Jev is unsure the text speaks
+   to an AI but names a serious attack: a polite request to "have the helper you are using" paste a
+   key into a form scores 0.37 to 0.49. Text that quotes or reports an attack is judged attack none.
+8. an address to an AI alone, or 12 or more invisible characters (with Jev, counted per chunk): **warn**.
 
-With the local engine, steps 2 to 4 and 6 do not exist, so a security article quoting an injection
+With the local engine, steps 2 to 4, 6 and 7 do not exist, so a security article quoting an injection
 warns. A Jev error or an incomplete answer falls back to the detectors alone. A result longer than
 4 MB is read in part and is at least a **warn**.
 
@@ -629,18 +635,21 @@ curl -s https://example.com | reflex scan - --rewrite     # also print the clean
 npm run eval-injection                 # setup/injection/golden.json against the live API
 ```
 
-The golden set holds 53 results: 26 benign documents agents read every day (install guides that pipe
-`curl` to a shell, man pages, API docs, npm output, HTML with comments and hidden menus, OWASP pages
-and a blog post that quote injections, a GitHub issue that mentions `@claude` next to an install
-line, an `AGENTS.md` from another repo, accented, right-to-left and emoji text) and 27 injections
+The golden set holds 62 results: 29 benign documents agents read every day (install guides that pipe
+`curl` to a shell, man pages, API docs, npm output, HTML with comments and hidden menus, OWASP pages,
+a blog post and a long field guide that quote or describe injections, a long README of a coding
+agent, a GitHub issue that mentions `@claude` next to an install line, an `AGENTS.md` from another
+repo, letter-spaced headings, accented, right-to-left and emoji text) and 33 injections
 following published research (hidden-text pages, the GitHub MCP issue attack, MCP tool poisoning,
 Unicode tag and variation-selector smuggling, look-alike letters, JSON escapes, markdown image
 exfiltration, also reference-style, the rules-file backdoor, EchoLeak-style mail, fake role tags,
-paraphrased injections with no trigger words, one of them behind twelve chunks of benign text).
-Current result, `jev-1.13.0`: precision 96 %, recall 100 %, every expected outcome met (the
-`@claude` issue warns), 23 of 24 high-severity injections blocked and the last warned. With the
-local engine: precision 83 % (articles that quote injections warn or block), recall 93 % (the
-GitHub MCP issue attack and the long paraphrase, which have no trigger phrase, pass). A missed high-severity injection fails the run.
+paraphrased injections with no trigger words: behind twelve chunks of benign text, split across two
+chunks, on one long line, at the top, middle and end of long pages; letter-spaced text).
+Current result, `jev-1.13.0`, five runs: precision 97 %, recall 100 %, every expected outcome met
+(the `@claude` issue warns), 28 or 29 of 30 high-severity injections blocked and the rest warned.
+With the local engine: precision 81 % (articles that quote injections warn or block), recall 79 %
+(the GitHub MCP issue attack and the paraphrases, which have no trigger phrase, pass). A missed
+high-severity injection fails the run.
 
 **Logs.** `guard.jsonl` in the data directory: one line per inspected result (tool, source kind,
 hashes of the text and origin, length, signal counts, Jev's numbers per chunk, outcome, what was
@@ -652,9 +661,10 @@ attack, tainted sessions and blocked prompts, as counts.
 the agent; it does not make untrusted content safe, and the gate still judges every command the
 agent runs. The detectors are phrase lists and a handful of structural checks, so an injection
 phrased like ordinary prose passes them (Jev is there for that; the local engine has no answer to
-it), and text spaced out letter by letter is left to Jev. Jev sees at most 24 chunks of 3,000
+it), and text spaced out evenly letter by letter, with no wider gap between words, is left to Jev. Jev sees at most 24 chunks of 3,000
 characters per result; past that only the detectors read the rest, and past 4 MB nothing does
-(the result warns). A paraphrase split across two chunks is judged in halves. Hidden elements are found by their own `style` or `hidden`
+(the result warns). A paraphrase split across two chunks is judged in halves: in the golden set
+each half still reads as an instruction, but a split where neither does would pass. Hidden elements are found by their own `style` or `hidden`
 attributes, not by class names or stylesheets. A tool the source list does not name (a custom pi
 extension tool, an MCP tool in opencode that shares a built-in name) is not inspected. The agent has
 read the result before Codex and Hermes can do anything about it, and in Hermes the note arrives a
