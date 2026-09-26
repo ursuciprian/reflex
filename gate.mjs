@@ -1773,7 +1773,7 @@ async function selfcheck() {
     ok(pw(c) === "tamper", `tamper after cd: ${c}`);
   for (const c of ["cd ~/.claude && jq . settings.json > /tmp/x", "pushd ~/.config/reflex; jq . config.json > /tmp/x", "cd ~/.claude/hooks && cat x.sh > /tmp/y",
     "(cd ~/.claude && ls) && echo x > notes.txt", "(cd ~/.codex && cat hooks.json) > /tmp/h",
-    "cd /w/.claude/worktrees/a && gh pr comment 6 --repo ursuciprian/reflex --body-file /tmp/b", "cd /tmp && npx -y -p @ursuciprian/reflex@0.3.0 reflex version",
+    "cd /w/.claude/worktrees/a && gh pr comment 6 --repo ursuciprian/reflex --body-file /tmp/b", "cd /srv/app && npx -y -p @ursuciprian/reflex@0.3.0 reflex version",
     "cd /tmp/x && curl -sL https://example.com/reflex/hooks.md -o pm.md", "D=/tmp/logo; cd $D && python3 - <<'EOF'\nopen('a.svg', 'w').write('reflex')\nEOF",
     "rtk proxy grep -n x bin/reflex; rtk proxy grep -n \"destructive-delete\\|\\\"prod\\\",\" setup/x.json"])
     ok(pw(c) !== "tamper", `not tamper, a read after cd: ${c}`);
