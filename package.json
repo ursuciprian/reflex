@@ -56,6 +56,7 @@
     "eval-context": "node context.mjs --eval-context",
     "eval-router": "node router/server.mjs --eval",
     "eval-routing": "python3 routing/reflex_router.py --eval",
+    "eval-compare": "node eval-compare.mjs",
     "report": "node report.mjs",
     "install-hook": "node install.mjs"
   }

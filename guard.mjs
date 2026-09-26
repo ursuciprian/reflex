@@ -406,7 +406,7 @@ export async function inspect({tool, input = {}, texts = [], kind, task, mcp}, {
   const decideWith = (sp, answers = {}) => policy.decide({...Object.fromEntries(Object.entries(count(sp)).map(([k, v]) => [k, {score: v}])), ...answers});
   let groups = [{spans, d: decideWith(spans)}];
   // A command that also reads a credential file prints it: its output is judged here, never sent.
-  const wantJev = CONFIG.engine === "jev" && !configurationError() && joined.trim() && !(kind === "shell" && readsCredentials(commandOf(input))) &&
+  const wantJev = CONFIG.engine !== "local" && !configurationError() && joined.trim() && !(kind === "shell" && readsCredentials(commandOf(input))) &&
     (policy.policy.sources?.jev !== "signals" || spans.length);
   if (wantJev) {
     // Up to MAX_CHUNKS chunks, PER_REQUEST per request, the requests in parallel.

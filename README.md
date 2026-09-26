@@ -32,6 +32,9 @@ second, and a policy file you can edit turns those answers into a decision.
 - Redacts secrets before anything leaves the machine or is logged.
 - Shadow mode by default: deterministic rules enforce; other decisions are logged only.
 - Local engine by default for new setups: no API key and no hosted classification.
+- Experimental `--engine laya`: Jev's questions answered by a [Laya](https://huggingface.co/convaiinnovations/laya)
+  checkpoint on this machine, nothing sent anywhere. Measured far below Jev on every golden set, so
+  not recommended for enforcement ([GUIDE](docs/GUIDE.md#laya-local-system-1)).
 - `reflex doctor` checks installation; `reflex status` shows configuration and observed hook events.
 - Autonomous profile: uncertain commands go to a stronger model (System 2) before a human, and a
   human decides asynchronously through an approval queue, with task envelopes and git checkpoints.

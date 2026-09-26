@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import {cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync} from "node:fs";
 import {spawn, spawnSync} from "node:child_process";
+import {createServer} from "node:http";
 import {tmpdir} from "node:os";
 import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
@@ -27,6 +28,60 @@ try {
   ]) {
     const r = spawnSync(program, args, {cwd: root, env, stdio: "inherit", timeout: 60000});
     assert.equal(r.status, 0, `${program} ${args.join(" ")} failed: ${r.error ?? r.status}`);
+  }
+  // engine laya against a stub Laya server (no model, no download, no network): the Jev request
+  // shape, no key sent, the configured checkpoint named, and an outage handled like a Jev outage.
+  {
+    const seen = [];
+    const stub = createServer(async (req, res) => {
+      let b = "";
+      for await (const c of req) b += c;
+      if (req.url === "/health") return res.end(JSON.stringify({status: "ok", loaded: ["typed-decisions"], device: "cpu"}));
+      const body = JSON.parse(b);
+      seen.push({auth: req.headers.authorization, body});
+      res.end(JSON.stringify({usage: {input_tokens: 10}, answers: Object.fromEntries(Object.entries(body.questions).map(([k, q]) =>
+        [k, q.type === "noul" ? {type: "noul", noul: 0.02} : q.type === "score" ? {type: "score", score: 0.2, confidence: 0.9} : {type: "choice", choice: "local"}]))}));
+    });
+    await new Promise(r => stub.listen(0, "127.0.0.1", r));
+    const url = `http://127.0.0.1:${stub.address().port}/v1/systemone`;
+    const laya = {...env, REFLEX_ENGINE: "laya", REFLEX_API_URL: url, TYPESAFE_API_KEY: ["must", "not", "leave"].join("-")};
+    const run = (args, e) => new Promise(res => {
+      const p = spawn(process.execPath, args, {cwd: root, env: e}); let out = "";
+      p.stdout.on("data", d => out += d); p.stderr.on("data", d => out += d);
+      p.on("close", status => res({status, out}));
+    });
+    const check = async e => JSON.parse((await run(["gate.mjs", "--check", "npm install zod", "--cwd", scratch, "--intent", "add zod"], e)).out);
+    const up = await check(laya);
+    assert.ok(up.source === "jev" && up.decision === "pass" && seen.length === 1 && seen[0].auth === undefined && seen[0].body.model === "typed-decisions" &&
+      "mutates" in seen[0].body.questions && seen[0].body.state.call.command === "npm install zod", `laya: System 1 over the Jev shape, no key: ${JSON.stringify(up)}`);
+    const down = await check({...laya, REFLEX_API_URL: "http://127.0.0.1:9/v1/systemone"});
+    assert.ok(down.source === "fallback" && down.decision === "ask" && /laya unavailable/.test(down.rule), `laya down: the policy fallback, as for Jev: ${JSON.stringify(down)}`);
+    const doctor = JSON.parse((await run(["status.mjs", "--doctor", "--json"], laya)).out);
+    assert.ok(doctor.system1 === "Laya typed-decisions (local, running) + policy" && doctor.api_key === "not required", JSON.stringify(doctor.system1));
+    const dead = JSON.parse((await run(["status.mjs", "--doctor", "--json"], {...laya, REFLEX_API_URL: "http://127.0.0.1:9/v1/systemone"})).out);
+    assert.ok(dead.errors.some(e => /Laya server not reachable/.test(e)), "doctor reports a Laya outage");
+    assert.equal(JSON.parse((await run(["laya.mjs", "status", "--json"], laya)).out).running, true);
+    const unit = (await run(["laya.mjs", "service"], laya)).out, token = readFileSync(join(env.XDG_CONFIG_HOME, "reflex/laya.token"), "utf8").trim();
+    assert.ok(unit.includes("setup/laya/server.py") && unit.includes("--port") && !unit.includes("--host") && unit.includes(token) &&
+      !unit.includes(laya.TYPESAFE_API_KEY), "the unit: loopback default, the local token, never the TypeSafe key");
+    await check(laya);
+    assert.equal(seen.at(-1).auth, `Bearer ${token}`, "with a local token, Reflex sends it (and still not the TypeSafe key)");
+    const off = await check({...laya, REFLEX_API_URL: "https://laya.example/v1/systemone"});
+    assert.ok(off.source === "error" && /127\.0\.0\.1/.test(off.rule), `engine laya refuses a URL off this machine: ${JSON.stringify(off)}`);
+    // A pid file whose pid is not a Laya server (a crash, a reboot, a reused pid) is never signalled.
+    mkdirSync(join(env.XDG_STATE_HOME, "reflex"), {recursive: true});
+    writeFileSync(join(env.XDG_STATE_HOME, "reflex/laya.pid"), String(process.pid));
+    assert.match((await run(["laya.mjs", "stop"], laya)).out, /not running/, "stop leaves a process that is not the server alone");
+    rmSync(join(env.XDG_CONFIG_HOME, "reflex/laya.token"));
+    // Calibration covers only questions Reflex asks (`f`: every instruction fragment).
+    const asked = new Set(["f", ...["setup/tool-gate/questions.json", "setup/injection/questions.json", "routing/questions.json"].flatMap(f => Object.keys(read(join(root, f)).questions))]);
+    for (const [ck, qs] of Object.entries(read(join(root, "setup/laya/calibration.json")).checkpoints))
+      assert.ok(Object.keys(qs).every(q => asked.has(q)), `calibration.json ${ck}: ${Object.keys(qs).filter(q => !asked.has(q))}`);
+    assert.match((await run(["bin/reflex", "setup", "--engine", "laya", "--agents", "claude", "--dry-run"], {...laya, REFLEX_PREFIX: join(scratch, "laya-prefix")})).out,
+      /laya engine[\s\S]*laya\[serve\]==[\d.]+ in .*laya-venv[\s\S]*disk about [\d.]+ GB/, "setup --engine laya previews the Laya install");
+    assert.ok(!existsSync(join(scratch, "laya-prefix")), "the preview installs nothing");
+    await new Promise(r => stub.close(r));
+    assert.equal(spawnSync("python3", ["setup/laya/server.py", "--selfcheck"], {cwd: root, env, stdio: "inherit"}).status, 0, "laya server selfcheck");
   }
   // Start a genuinely fresh installation; the selfchecks above keep their own scratch state.
   delete env.REFLEX_ENGINE;

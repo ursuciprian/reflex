@@ -48,6 +48,7 @@ export const USER_CONFIG = (() => {
 // codex, no extra key), anthropic (Messages API), openai-compatible (any /v1/chat/completions
 // endpoint: OpenAI, Ollama, vLLM, LM Studio, LiteLLM, OpenRouter), none. A per-day cap of 200 calls
 // or $5 (price: USD per million input / output tokens, for the estimate; a CLI counts calls only).
+export const ENGINES = ["local", "jev", "laya"];
 export const JUDGE_BACKENDS = ["cli", "anthropic", "openai-compatible", "none"];
 // Spend is small by design: a case assembled to max_input_tokens, a JSON verdict in max_tokens, no
 // extended thinking, a verdict cache, optional cheaper tiers first (judge.tiers), per-day and
@@ -66,9 +67,18 @@ export const BACKEND_DEFAULTS = {cli: {cli: "claude", model: "sonnet"}, anthropi
   "openai-compatible": {}, none: {}};
 export const QUEUE_DEFAULTS = {ttl_hours: 24, notify: null};
 const ENGINE = ENV.REFLEX_ENGINE ?? flagValue("--engine", USER_CONFIG.engine ?? "jev");
+// engine laya: the same questions and policy as Jev, answered by a Laya checkpoint served on this
+// machine (setup/laya/server.py, `reflex laya start`); nothing leaves it and no key is needed.
+export const LAYA_DEFAULTS = {port: 8421, model: "typed-decisions"};
+export const LAYA_CHECKPOINTS = ["english", "multilingual", "typed-decisions"];
+export const layaUrl = port => `http://127.0.0.1:${port}/v1/systemone`;
+// The local token the Laya server requires (laya.mjs writes it); beside config.json, so every
+// process of this user finds it whatever its REFLEX_DATA_DIR.
+export const LAYA_TOKEN = () => join(dirname(USER_CONFIG_FILE), "laya.token");
+const LAYA = {...LAYA_DEFAULTS, ...USER_CONFIG.laya};
 export const CONFIG = {
-  api: ENV.REFLEX_API_URL ?? "https://api.typesafe.ai/v1/systemone",
-  model: ENV.REFLEX_MODEL ?? "jev-1.13.0",              // pinned so a decision can be reproduced
+  api: ENV.REFLEX_API_URL ?? (ENGINE === "laya" ? layaUrl(LAYA.port) : "https://api.typesafe.ai/v1/systemone"),
+  model: ENV.REFLEX_MODEL ?? (ENGINE === "laya" ? LAYA.model : "jev-1.13.0"),   // pinned so a decision can be reproduced
   // off | shadow | enforce. The environment wins, so one session can be switched for a test;
   // otherwise the --mode flag that install.mjs writes into each agent's hook command.
   mode: ENV.REFLEX_MODE ?? flagValue("--mode", USER_CONFIG.mode ?? "shadow"),
@@ -108,9 +118,22 @@ export const setupFile = f => !ENV.REFLEX_SETUP_DIR && CONFIG.setup === join(HER
   existsSync(join(policyDirectory, f)) ? join(policyDirectory, f) : join(CONFIG.setup, f);
 export const load = f => JSON.parse(readFileSync(setupFile(f), "utf8"));
 export function configurationError() {
-  return USER_CONFIG_ERROR ?? (!["local", "jev"].includes(CONFIG.engine) ? "engine must be local or jev"
+  return USER_CONFIG_ERROR ?? (!ENGINES.includes(CONFIG.engine) ? "engine must be local, jev or laya"
     : !["off", "shadow", "enforce"].includes(CONFIG.mode) ? "mode must be off, shadow or enforce"
-    : !["off", "shadow", "on"].includes(CONFIG.allow) ? "allow must be off, shadow or on" : ladderError());
+    : !["off", "shadow", "on"].includes(CONFIG.allow) ? "allow must be off, shadow or on" : layaError() ?? ladderError());
+}
+// engine laya promises that nothing leaves the machine: a loopback URL, a known checkpoint, a sane port.
+function layaError() {
+  if (CONFIG.engine !== "laya") return null;
+  const s = USER_CONFIG.laya ?? {}, url = (() => { try { return new URL(CONFIG.api); } catch { return null; } })();
+  const names = String(s.models ?? CONFIG.model).split(",").map(n => n.trim());
+  if (typeof s !== "object" || Array.isArray(s)) return "laya must be an object";
+  if (s.port !== undefined && !(Number.isInteger(s.port) && s.port > 0 && s.port < 65536)) return "laya.port must be a port number";
+  if (!url || url.protocol !== "http:" || !["127.0.0.1", "[::1]", "localhost"].includes(url.hostname)) return "engine laya: the server URL must be http on 127.0.0.1";
+  if (![CONFIG.model, ...names].every(n => LAYA_CHECKPOINTS.includes(n))) return `laya: the checkpoint must be one of ${LAYA_CHECKPOINTS.join(", ")}`;
+  if (s.device !== undefined && !["auto", "cpu", "mps", "cuda"].includes(s.device)) return "laya.device must be auto, cpu, mps or cuda";
+  if (s.noul !== undefined && !["choice", "native"].includes(s.noul)) return "laya.noul must be choice or native";
+  return null;
 }
 // Invalid ladder settings ask, like any invalid configuration: a typo must not turn System 2 into an approver.
 function ladderError() {
@@ -742,6 +765,13 @@ function apiKey() {
   throw new Error(`no API key: set TYPESAFE_API_KEY or keychain item "${CONFIG.keychain}"`);
 }
 
+// The TypeSafe key goes to TypeSafe only: never to the Laya URL, whatever the engine is switched to at run time.
+function authorization() {
+  if (CONFIG.engine !== "laya" && ENGINE !== "laya") return {Authorization: `Bearer ${apiKey()}`};
+  const token = readText(LAYA_TOKEN())?.trim();
+  return token ? {Authorization: `Bearer ${token}`} : {};
+}
+
 export async function ask(state, questions, {timeoutMs = CONFIG.timeoutMs} = {}) {
   const disabled = configurationError() ?? (CONFIG.engine === "local" ? "local engine: hosted classification is disabled" : null);
   if (disabled) return {answers: {}, usage: {}, error: disabled, latency_s: 0};
@@ -750,7 +780,7 @@ export async function ask(state, questions, {timeoutMs = CONFIG.timeoutMs} = {})
   for (let attempt = 0; ; attempt++) {
     try {
       const r = await fetch(CONFIG.api, {method: "POST", signal: AbortSignal.timeout(timeoutMs - (Date.now() - t0)),
-        headers: {Authorization: `Bearer ${apiKey()}`, "Content-Type": "application/json"},
+        headers: {...authorization(), "Content-Type": "application/json"},
         body: JSON.stringify({state, model: CONFIG.model, questions})});
       // 429 rate limited, 529 overloaded: one quick retry if the time budget allows
       if ((r.status === 429 || r.status === 529) && attempt === 0 && Date.now() - t0 < timeoutMs / 2) {
@@ -827,7 +857,7 @@ export async function jevJudge({command, cwd, env, session = {}, useCache = true
   if (!res.error && session.envelope?.user) res.answers = {...res.answers, envelope: {noul: 1}};
   if (!res.error && session.envelope?.repo) res.answers = {...res.answers, repo_envelope: {noul: 1}};
   const d = res.error
-    ? {outcome: policy.policy.fallback ?? "ask", rule: `jev unavailable (${res.error.slice(0, 80)})`}
+    ? {outcome: policy.policy.fallback ?? "ask", rule: `${CONFIG.engine === "laya" ? "laya" : "jev"} unavailable (${res.error.slice(0, 80)})`}
     : policy.decide(res.answers, policy.values());
   // Allow needs Jev to have seen everything that matters, fresh: a cached answer has lost on_task;
   // without a stated intent on_task is "yes" by default; redaction can hide a payload such as
@@ -835,7 +865,7 @@ export async function jevJudge({command, cwd, env, session = {}, useCache = true
   // Code the command runs that Jev did not see in full (unread, cut, redacted, a make target, a
   // package fetched or installed) makes its answer one about a name. Only an allow gate allows: a
   // policy whose default outcome is allow would otherwise allow whatever no gate caught.
-  const noAllow = res.error ? "no answer" : tainted ? "session read a suspected prompt injection" : cached ? "cached answer" : !session.intent ? "no stated intent"
+  const noAllow = res.error ? "no answer" : CONFIG.engine === "laya" ? "engine laya (experimental: allow is off)" : tainted ? "session read a suspected prompt injection" : cached ? "cached answer" : !session.intent ? "no stated intent"
     : d.path?.at(-1)?.outcome !== "yes" ? "not from an allow gate"
     : redact(command) !== command ? "redacted command"
     : scripts.some(s => s.partial) || script?.excerpt.length >= SCRIPT_BYTES ? "runs code Jev did not see in full"
@@ -893,7 +923,7 @@ export async function decide(call, {background = false, asker, judger} = {}) {
   const t = tainted(call.session_id);
   const egress = t && CONFIG.mode === "enforce" && !(quick?.source === "rule" && quick.outcome !== "pass") && taintedRule(call.command);
   if (egress) {
-    const j = CONFIG.engine === "jev" ? await jevJudge({command: call.command, cwd: call.cwd, env, session: callSession(call), asker, tainted: true}) : null;
+    const j = CONFIG.engine !== "local" ? await jevJudge({command: call.command, cwd: call.cwd, env, session: callSession(call), asker, tainted: true}) : null;
     const d = j?.outcome === "deny" ? j : {...egress, ...(j && {answers: j.answers, state: j.state, gate: j.gate})};
     return finish(d, call, d.outcome, {env, judger, egress: true});
   }

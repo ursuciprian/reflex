@@ -92,7 +92,7 @@ Options go after `bash -s --`, or after `setup`:
 |---|---|---|
 | `--agents claude,codex,…` | `all` found | which agents to hook |
 | `--mode shadow\|enforce\|off` | `shadow` | |
-| `--engine local\|jev` | saved choice, otherwise `local` | local rules or optional hosted classification |
+| `--engine local\|jev\|laya` | saved choice, otherwise `local` | local rules, optional hosted classification, or experimental local Laya ([GUIDE](GUIDE.md#laya-local-system-1)) |
 | `--dry-run` | | preview setup changes |
 | `--allow off\|shadow\|on` | `off` | see step 6 |
 | `--keychain NAME` | `typesafe-api-key` | Keychain item holding the key |

@@ -6,6 +6,33 @@ All notable changes to Reflex are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Experimental `--engine laya`: the tool gate, the injection guard, instructions, the tool router,
+  model routing and the context layer ask their questions of a [Laya](https://huggingface.co/convaiinnovations/laya)
+  checkpoint served on 127.0.0.1 (`setup/laya/server.py`, laya-serve's Jev-compatible app), so
+  nothing leaves the machine and no key is needed. `reflex setup --engine laya [--dry-run]` checks
+  Python >= 3.10, creates `~/.local/share/reflex/laya-venv`, installs `laya[serve]==0.3.20`, downloads
+  the checkpoint at a pinned revision and starts the server; `reflex laya start|stop|status|
+  install-service|uninstall-service` (pid file and log in the state directory; launchd or systemd
+  --user only on request). A server that is down is a Jev outage: the policy fallback, logged, and
+  `reflex doctor` / `status` report it. The wrapper splits multi-chunk states so each chunk's
+  questions see their chunk, reports truncation in `usage`, asks yes/no questions as a neutral
+  two-option choice (laya #156) and can apply per-question calibration (`setup/laya/calibration.json`,
+  off by default). Default checkpoint `typed-decisions`, raw. The server requires a random local token
+  and gets only the environment it needs; the TypeSafe key is never sent to it. With engine laya the
+  allow gate is off and the server URL must be on 127.0.0.1.
+- `npm run eval-compare -- --engines jev,laya:typed-decisions --runs 2`: every live golden set for
+  several System 1 engines in the same run, one table.
+- Measured head to head (GUIDE: Laya): zero-shot Laya is far below Jev on every golden set. Raw, it
+  has no tool-gate MISS but denies or asks about 33 of 97 cases Jev settles; calibrated, it misses a
+  deny Jev catches. `english` and calibrated checkpoints miss high-severity injections; instructions
+  2 to 9 of 20 against Jev's 20. Jev stays the recommendation for every decision.
+
+### Fixed
+
+- `eval-ladder` no longer crashes when System 1 settles every case (no `judge.jsonl`).
+
 ## [0.7.0] - 2026-09-26
 
 ### Changed
