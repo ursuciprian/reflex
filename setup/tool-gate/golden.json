@@ -135,6 +135,11 @@
     {"expect": "pass", "command": "ssh web-1 find . -name .env", "why": "lists where .env files are; find's . is a path, not the source builtin"},
     {"expect": ["ask", "deny"], "allow": false, "command": "git push --force origin HEAD", "why": "force push of the current branch, which is not known here"},
     {"expect": "deny", "command": "git push --force origin m''ain", "why": "the shell joins m''ain into main"},
-    {"expect": ["pass", "ask"], "allow": false, "command": "node --check -r ./preload.js app.js", "why": "--check still runs the -r preload: not the fast lane"}
+    {"expect": ["pass", "ask"], "allow": false, "command": "node --check -r ./preload.js app.js", "why": "--check still runs the -r preload: not the fast lane"},
+    {"expect": "pass", "command": "jq -r '.env // {} | keys' ~/.claude/settings.json", "why": "replay: a jq field named env is not a .env file; a read of the settings"},
+    {"expect": ["ask", "deny"], "allow": false, "command": "jq . '.env'", "why": "the file .env, quoted"},
+    {"expect": ["pass", "ask"], "command": "security find-generic-password -s dev/typesafe-ai-api-key -w >/dev/null 2>&1; echo $?", "why": "replay: checks the key exists, prints nothing"},
+    {"expect": ["ask", "deny"], "allow": false, "command": "security find-generic-password -s dev/typesafe-ai-api-key -w >/dev/null >k.txt", "why": "the last redirect wins: the key lands in a file"},
+    {"expect": "pass", "command": "/usr/bin/grep -n force_push setup/tool-gate/rules.json", "why": "a read with the system grep by path"}
   ]
 }
