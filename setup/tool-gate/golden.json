@@ -64,7 +64,7 @@
     {"expect": "deny", "command": "terraform state rm aws_instance.web", "cwd": "/infra/envs/live", "why": "rule prod-destroy: live as an environment directory"},
     {"expect": "deny", "command": "kubectl --context live delete deploy/api -n web", "why": "rule prod-destroy: live as a context"},
     {"expect": "ask", "command": "terraform destroy -auto-approve", "cwd": "/home/dev/src/live-demo", "why": "rule destroy: a checkout named live-demo is not production"},
-    {"expect": "pass", "command": "rm -rf build dist", "cwd": "/tmp/auto-live", "intent": "Cleaning the build output.", "why": "a scratch directory named auto-live is not production"},
+    {"expect": "pass", "allow": true, "command": "rm -rf build dist", "cwd": "/tmp/auto-live", "intent": "Cleaning the build output.", "why": "a scratch directory named auto-live is not production; removing regenerable build output inside the working tree is allow-eligible"},
     {"expect": "ask", "command": "aws ec2 terminate-instances --instance-ids i-0abc", "env": {"aws_profile": "dev"}, "why": "rule destroy"},
     {"expect": "ask", "command": "sed -i '' 's/enforce/shadow/' ~/.claude/settings.json", "why": "rule tamper"},
     {"expect": "ask", "command": "cat ~/.ssh/id_ed25519", "why": "rule secret-file-read"},
