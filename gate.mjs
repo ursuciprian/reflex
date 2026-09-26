@@ -177,13 +177,15 @@ const READ_ONLY = new Set(("ls cat head tail less wc grep egrep rg fd find tree 
   "md5 shasum sha256sum od strings nl fold paste comm exit return free nproc lscpu seq").split(" "));
 // Flags that make an otherwise read-only tool run a program or write a file.
 const UNSAFE_FLAGS = new RegExp([
-  String.raw`\bsed\b[^|;&]*(--in-place|\s-[a-zA-Z]*i|[;'"{}\s][wWe]\s|\/[a-zA-Z0-9]*[we]\s)`,
-  String.raw`\bawk\b.*(system|getline)`, String.raw`\bawk\b[^']*'[^']*[|>][^']*'`, String.raw`--pre\b`, String.raw`--(upload|receive)-pack`,
+  // sed: in place, a script file, or w / e after an address or as an s/// flag
+  String.raw`\bsed\b[^|;&]*(--in-place|\s-[a-zA-Z]*i|[;'"{}\s\d$,!][wWe](\s|['";}]|$)|\/[a-zA-Z0-9]*[we](\s|['";}]))`,
+  String.raw`\bawk\b.*(system|getline|@include|@load)`, String.raw`\bawk\b[^']*'[^']*[|>][^']*'`, String.raw`\bawk\b[^"]*"[^"]*[|>][^"]*"`,
+  String.raw`--pre\b`, String.raw`--(upload|receive)-pack`, String.raw`--hostname-bin\b`,
   String.raw`--post-renderer`, String.raw`--compress-program`, String.raw`\b(git|sort)\b[^|;&]*--output\b`, String.raw`--ext-diff`,
-  String.raw`\s-f(print|printf|ls)\b`, String.raw`\s-ok(dir)?\b`, String.raw`\bfd\b.*\s-[a-zA-Z]*[xX]\b`,
+  String.raw`\s-f(print0?|printf|ls)\b`, String.raw`\s-ok(dir)?\b`, String.raw`\bfd\b.*\s-[a-zA-Z]*[xX]\b`,
   String.raw`\b(sort|tree)\b[^|;&]*\s-o\b`, String.raw`--show-token`,
   // a program from a file (awk and sed -f, gawk -i/-E/-l), yq writing in place or split files
-  String.raw`\b[gm]?awk\b[^|;&]*\s(-[a-zA-Z]*[fEil]|--(file|exec|include|load))`, String.raw`\bsed\b[^|;&]*\s(-[a-zA-Z]*f|--file)`,
+  String.raw`\b[gm]?awk\b[^|;&]*\s(-[a-zA-Z]*[fEilL]|--(file|exec|include|load|source))`, String.raw`\bsed\b[^|;&]*\s(-[a-zA-Z]*f|--file)`,
   String.raw`\byq\b[^|;&]*\s(-[a-zA-Z]*[is]\b|--(inplace|split-exp))`,
 ].join("|"));
 const READ_ONLY_SUB = {
@@ -480,37 +482,102 @@ export function sessionContext(path, toolUseId) {
 
 // ---------------------------------------------------------------------------------------------
 // Deterministic layer: a rule fires when every pattern in `all` matches the command + context, or
-// the command alone (`bare`) for a rule marked "context": false.
+// the command alone (`bare`) for a rule marked "context": false. `views` gives a rule marked "shell"
+// or "writes" its own [haystack, bare] (see precheck); false skips the rule.
 const RX = new Map();
 const rx = p => RX.get(p) ?? RX.set(p, new RegExp(p, "i")).get(p);   // script rules run per line
-export function checkRules(haystack, rules, bare = haystack) {
+export function checkRules(haystack, rules, bare = haystack, views = {}) {
   for (const r of rules.rules) {
-    const text = r.context === false ? bare : haystack;
+    const view = r.shell ? views.shell : r.writes ? views.writes : undefined;
+    if (view === false) continue;
+    const [h, b] = view ?? [haystack, bare];
+    const text = r.context === false ? b : h;
     if (r.all.every(p => rx(p).test(text))) return {outcome: r.outcome, rule: r.rule, id: r.id};
   }
   return null;
 }
 export const fastPass = (cmd, rules) => readOnly(cmd, rules.pass.map(p => new RegExp(p, "i")));
 
+// The command cut into pipelines (split at && || ; & and newlines, never at |), each with the files
+// its redirects write and whether the rest of it is inert: read-only, or one of a few commands that
+// change nothing a rule protects. null when the text hides what runs or where it writes: an
+// expansion ($, `), a heredoc, a process substitution or unbalanced quotes.
+// `reflex check` only judges: the command it is given is data. (Not `node --check`, which still runs
+// -r / --import preloads, nor a file named gate.mjs, which could be anything.)
+const INERT = [/^(mkdir|touch)\s[^<>`$]*$/i, /^git\s+(add|commit)\b[^<>`$]*$/i, /^reflex\s+check(\s[^<>`$]*)?$/i];
+export function pipelines(command) {
+  const c = command.replace(/\\\n/g, "");
+  if (/[$`]|<<|<\(|>\(/.test(c)) return null;
+  const m = maskQuotes(c, "_");
+  if (m === c && /['"]/.test(c)) return null;
+  const out = [];
+  let last = 0;
+  const cut = end => {
+    const text = c.slice(last, end), mask = m.slice(last, end), targets = [];
+    // n>, >>, >|, &>, <> and >&file write; >&2 and 2>&1 only duplicate a descriptor
+    const core = text.split("");
+    for (const r of mask.matchAll(/(?:\d*|&)(?:<>|>>?\|?|>&)\s*([^\s;&|<>()]*)/g)) {
+      const t = text.slice(r.index + r[0].length - r[1].length, r.index + r[0].length).replace(/^(['"])(.*)\1$/, "$2");
+      if (!/^(\d+|-)$/.test(t)) targets.push(t);
+      for (let k = r.index; k < r.index + r[0].length; k++) core[k] = " ";
+    }
+    const rest = core.join("").trim();
+    if (rest) out.push({text: text.trim(), targets, core: rest, inert: readOnly(rest, INERT)});
+    else if (targets.length) out.push({text: text.trim(), targets, core: "", inert: false});
+  };
+  for (const s of m.matchAll(/&&|\|\||[;\n]|(?<![<>|&])&(?![>&])/g)) { cut(s.index); last = s.index + s[0].length; }
+  cut(c.length);
+  return out;
+}
+// What a pipeline changes: an inert one, only its redirect targets. A cd, an assignment or a loop
+// header can steer what a later step writes, and touch and mkdir create files, so those are kept whole.
+const writesView = ps => ps.map(p => p.inert && !/^[\s({!]*(cd|pushd|popd|for|select|case|while|until|if|export|local|declare|typeset|readonly|read|touch|mkdir)\b|^[\s({!]*\w+=/.test(p.core)
+  ? p.targets.map(t => `> ${t}`).join(" ") : p.text).join(" ; ");
+// Only inert pipelines writing notes (Markdown, text, logs, CSV) or nothing: there is no shell
+// command in it for a "shell" rule to find, whatever its quoted text says (echo '… rm -rf / …' >> MEMORY.md).
+const NOTES = /^(\/dev\/(null|stdout|stderr)|[^\s;&|<>]*\.(md|markdown|txt|rst|adoc|log|csv|tsv))$/i;
+const onlyNotes = ps => !!ps?.length && ps.every(p => p.inert && p.targets.every(t => NOTES.test(t)));
+
 // A quoted heredoc whose consumer only stores or prints text (a commit message, a PR body, a file
 // written by cat) is data, not a command: a PR body that mentions `git push --force origin main`
 // must not trip the force-push rule. Heredocs fed to a shell, an interpreter or ssh stay in.
 const DATA_CONSUMER = /(^|\s)(cat|jq|tee|git\s+(commit|tag|notes)\b[^\n]*|gh\s+(pr|issue|release|api)\b[^\n]*)\s[^\n]*$|(^|\s)cat$/;
+// `code`: also the program an interpreter reads from a heredoc (`python3 - <<'EOF'`) when it can
+// neither run a program nor write a file, so shell text in it (print("rm -rf /")) takes no effect.
+// Rules marked "shell" read that view; the rest still read the body. Only the whole command
+// `python3 - <<'EOF' … EOF`: the interpreter is the first word (no ssh, docker, env, sudo, flags or
+// assignments in front), the delimiter is quoted, and nothing comes before or after it.
+// ponytail: a keyword list, not a parser: a word that could run, write or delete anything (system,
+// subprocess, exec, eval, getattr, send, require, open(…, "w"), write, remove, …) keeps the body in,
+// and what is left out still goes to the engine, which sees the whole body.
+const INTERP_STDIN = /^\s*(\S*\/)?(python[\d.]*|node|ruby|perl|php)(\s+-)?\s*$/;
+const CODE_EFFECT = new RegExp([
+  String.raw`system|popen|spawn|exec|eval|passthru|proc_open|subprocess|child_process|\bpty\b|pexpect|ctypes|cffi|\bffi\b|open3|\bqx\b|%x|\x60|readpipe`,
+  String.raw`getattr|attrgetter|methodcaller|globals|\bvars\b|compile|importlib|runpy|inspect|pickle|marshal|\bFunction\s*\(|\bvm\b|\bsh\b|plumbum|invoke|fabric`,
+  String.raw`__(import|builtins|dict|subclasses|globals|getattribute|reduce|code|loader|spec)__|\bsend\b|\bdo\s*\(?\s*['"$]|require|\$\w+\s*\(|\bkill`,
+  String.raw`write|append|put_contents|\bopen\s*\([^)]*,(?!\s*['"]r[bt]?['"]\s*[,)])|\bopen\s*\(?\s*['"]\s*\||\bfile\s*=`,
+  String.raw`remove|unlink|rmtree|rmdir|rmSync|rename|os\.replace|shutil|chmod|\bfs\b|fileutils|\bFile\.`,
+].join("|"), "i");
 // A line scan with each terminator's next line found by a cursor, so a script full of `<<` (even
 // unterminated ones) stays linear.
-export function stripDataHeredocs(cmd) {
+export function stripDataHeredocs(cmd, code = false) {
   if (!cmd.includes("<<")) return cmd;
+  // what runs or captures an interpreter's output: its heredoc body then counts as a command
+  if (/\$\(|\x60|<\(|>\(|\beval\b/.test(cmd)) code = false;
   const lines = cmd.split("\n"), ends = new Map(), at = new Map(), out = [];
   lines.forEach((l, i) => { const t = l.trim(); if (/^\w+$/.test(t)) (ends.get(t) ?? ends.set(t, []).get(t)).push(i); });
   for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].includes("<<") && lines[i].match(/^(.*?)<<-?\s*(['"])(\w+)\2(.*)$/);
+    const m = lines[i].includes("<<") && lines[i].match(/^(.*?)<<-?\s*(['"]?)(\w+)\2(.*)$/);
     const list = m && ends.get(m[3]);
     let c = m ? at.get(m[3]) ?? 0 : 0;
     while (list && c < list.length && list[c] <= i) c++;
     if (m) at.set(m[3], c);
-    const [, before, , , after] = m || [];
+    const [, before, quote, , after] = m || [];
+    const last = m && before.replace(/.*[;&|(]\s*/, "").trimEnd(), body = () => lines.slice(i + 1, list[c]).join("\n");
     if (list?.[c] !== undefined && !/\|/.test(after) &&   // `cat <<'EOF' | bash` runs the body
-        DATA_CONSUMER.test(before.replace(/.*[;&|(]\s*/, "").trimEnd() + " ")) {
+        ((quote && DATA_CONSUMER.test(last + " ")) ||
+         (code && quote && INTERP_STDIN.test(before) && !after.trim() && lines.slice(0, i).every(l => !l.trim()) &&
+          lines.slice(list[c] + 1).every(l => !l.trim()) && !CODE_EFFECT.test(body())))) {
       out.push(`${before}<<DATA${after}`);
       i = list[c];
     } else out.push(lines[i]);
@@ -754,9 +821,17 @@ function scriptLines(body) {
   return {lines: lines.map(expand), skipped: lines.length < all.length};
 }
 
+// A directory with its own .git between the checkout and cwd (cwd included).
+function nestedCheckout(cwd) {
+  for (let d = resolve(cwd); d.startsWith(HERE + "/"); d = dirname(d)) if (existsSync(join(d, ".git"))) return true;
+  return false;
+}
+
 /** Everything decided without Jev, or null when Jev has to judge. */
 export function precheck(command, cwd, env) {
   const rules = load("rules.json");
+  // The shell deletes a backslash-newline: `git push --force \⏎ origin main` is one line.
+  command = command.replace(/\\\n/g, "");
   // Rules see the raw command (redaction could hide the very marker a rule looks for, such as
   // --secret-id=prod-db), minus heredoc bodies that are only data.
   const haystack = [stripDataHeredocs(command),`cwd=${cwd ?? ""}`, ...Object.entries(env).map(([k, v]) => `${k}=${v}`)].join(" ");
@@ -766,16 +841,25 @@ export function precheck(command, cwd, env) {
   const early = checkRules(haystack, {rules: rules.rules.filter(r => r.before_read_only)}, bare);
   if (early) return ruled(early);
   if (readOnly(command)) return {outcome: "pass", rule: "read-only", source: "read-only"};
+  // Tamper is about what the command changes: a pipeline that only reads the gate's files or an
+  // agent's settings (jq . ~/.claude/settings.json > /tmp/s.json) counts by its redirect targets alone.
+  // Quotes and backslashes are dropped, as the shell drops them: ~/.claude/'settings.json' is the file.
+  const ps = pipelines(command), writes = (ps ? writesView(ps) : bare).replace(/["'\\]/g, "");
   // The checkout itself is protected wherever it was cloned, not only under a directory named reflex.
-  const inRepo = cwd && (cwd + "/").startsWith(HERE + "/");
-  if (command.includes(HERE) || command.includes(CONFIG.data) || command.includes(dirname(USER_CONFIG_FILE)) ||
+  // A git worktree or clone nested inside it is another checkout, unless the command climbs out (..).
+  const inRepo = cwd && (cwd + "/").startsWith(HERE + "/") && !(nestedCheckout(cwd) && !/(^|[\s/'"=:])\.\.([\s/'";&|)]|$)/.test(command));
+  if (writes.includes(HERE) || writes.includes(CONFIG.data) || writes.includes(dirname(USER_CONFIG_FILE)) ||
       // an agent must not answer its own queue item, widen its own envelope or rewind the tree
       /\breflex\s+(setup|install|uninstall)\b/.test(command.replace(/["'\\]/g, "")) ||
       /\breflex\b[^\n;&|]*\b(queue|envelope|checkpoints)\b[^\n;&|]*\b(approve|deny|clear|set|restore)\b/.test(command.replace(/["'\\]/g, "")) ||
-      (inRepo && /\b(gate|policy|install|eval|report|instructions|context|autonomy|judge2|eval-ladder)\.mjs\b|\bsetup\/|\brouter\/|\brouting\/|\bbin\/reflex-|\badapters\/|\.git\/hooks/.test(command)))
+      (inRepo && /\b(gate|policy|install|eval|report|instructions|context|autonomy|judge2|eval-ladder)\.mjs\b|\bsetup\/|\brouter\/|\brouting\/|\bbin\/reflex-|\badapters\/|\.git\/hooks/.test(writes)))
     return ruled({outcome: "ask", rule: "touches the Reflex gate, its setup or its logs", id: "tamper"});
   const on = (r, what) => (r.applies_to ?? ["command"]).includes(what);
-  const hit = checkRules(haystack, {rules: rules.rules.filter(r => !r.before_read_only && on(r, "command"))}, bare);
+  // "shell" rules read commands: not the program of an interpreter heredoc that cannot run or write
+  // anything, and nothing at all when every pipeline is inert and writes only notes.
+  const code = onlyNotes(ps) ? null : stripDataHeredocs(command, true);
+  const views = {shell: code === null ? false : [code + ctx, code], writes: [writes + ctx, writes]};
+  const hit = checkRules(haystack, {rules: rules.rules.filter(r => !r.before_read_only && on(r, "command"))}, bare, views);
   if (hit) return ruled(hit);
   // The scripts it runs, before the fast lane: `npm test` is only as safe as the test script.
   const perLine = {rules: rules.rules.filter(r => on(r, "script") && !r.whole_script)};
@@ -1452,7 +1536,14 @@ async function selfcheck() {
     ["gh auth status --show-token", "M2 show-token"], ["uniq in out", "uniq writes out"],
     ["aws s3api get-object --bucket b --key k ~/.claude/settings.json", "get-object writes"],
     ["eval \"$X\"", "eval"], ["source ./x.sh", "source"], [". ./x.sh", "dot"],
+    // in place, to a second file, or a program from a file: each writes or runs what the command does not show
+    ["yq -i '.a=1' f.yaml", "yq -i"], ["yq --inplace '.a=1' f.yaml", "yq --inplace"], ["xxd -r -p h.txt f", "xxd -r"], ["xxd in.bin out.hex", "xxd outfile"],
+    ["sed -f p.sed f", "sed -f"], ["sed -n '1w /tmp/o' f", "sed 1w"], ["sed -n '1e touch x' f", "sed 1e"], ["sed 's/a/b/e' f", "sed s///e"],
+    ["awk -f p.awk f", "awk -f"], ["awk -i inplace '{print}' f", "gawk -i inplace"], [`awk "BEGIN{print 1 > \\"/tmp/x\\"}"`, "awk double-quoted redirect"],
+    [`awk '@include "x.awk"' f`, "awk @include"], ["find . -fprint0 /tmp/x", "find -fprint0"], ["rg --hostname-bin /tmp/x foo", "rg --hostname-bin"],
   ]) ok(!readOnly(cmd), `bypass: ${why}`);
+  ok(readOnly("yq '.a' f.yaml") && readOnly("awk -F: '{print $1}' f") && readOnly("sed -n '/x/,/y/p' f") && readOnly("sed -n '$p' f"),
+     "yq, awk -F and sed reads still pass");
   ok(readOnly(`jq -c '{a: .x | length, b: (.y // "z")}' ~/.local/state/reflex/trace.jsonl`), "jq filter with | and // is one command");
   ok(readOnly(`tail -n 4 t.jsonl | jq -c '{rule,source,emitted}'`) && !readOnly("echo x | source /dev/stdin"), "command words only outside quotes");
   ok(readOnly("grep -E 'deny|ask' f | wc -l") && readOnly(`echo "a; rm -rf x > y"`), "quoted | ; > are data");
@@ -1497,6 +1588,14 @@ async function selfcheck() {
   ok(rule("git push origin --mirror") === "push-mirror" && !fastPass("git push origin --mirror", rules), "mirror push");
   ok(rule("git push -fu origin main") === "force-push-main" && rule("git push origin :main") === "force-push-main" &&
      rule("git push origin --delete main") === "force-push-main", "force push variants");
+  // replay: a branch whose name only contains main or master is not main
+  for (const c of ["git push origin --delete feat/something-on-master", "git push origin --delete fix/main", "git push -f origin main-hotfix", "git push -f main-mirror feat/x"])
+    ok(rule(c) === null, `not main: ${c}`);
+  for (const c of ["git push origin --delete master", "git push origin +main", "git push -f origin main", "git push --force-with-lease origin main", "git push -d origin main",
+    "git push origin HEAD:main --force", "git push origin +HEAD:refs/heads/main", "git push --force origin HEAD:refs/heads/master", "git push -f origin 'main'",
+    "git push origin ':main'", `git push origin "+main"`, "git -C /repo push --force origin main", "git -c core.x=y push -f origin master", "git --no-pager push -f origin main:main"])
+    ok(rule(c) === "force-push-main", `force push or delete main: ${c}`);
+  ok(rule("git -C /repo push --mirror") === "push-mirror" && rule("git push -f", "git_branch=feat/main") === null, "git -C push --mirror; a branch named feat/main");
   ok(rule("echo $(rm -rf ~)") === "rm-root" && rule("x=`rm -rf /`") === "rm-root" && rule("bash -c 'rm -rf ~'") === "rm-root", "rm-root inside $(), backticks, quotes");
   ok(rule("rm -rf -- /") === "rm-root" && rule('rm --recursive --force "$HOME"') === "rm-root" && rule("rm -rf ${HOME}") === "rm-root", "rm-root variants");
   ok(rule("aws s3 rm s3://b --recursive", "aws_profile=prod01") === "prod-destroy" && rule("terraform state rm x", "cwd=/envs/live") === "prod-destroy", "prod variants");
@@ -1530,6 +1629,52 @@ async function selfcheck() {
   ok(!fastPass("ssh h 'mkdir -p x && go test ./...'", rules), "fast lane is local: a remote build is not read-only");
   ok(fastPass("git push -u origin feat/x", rules) && !fastPass("git push origin main", rules) &&
      !fastPass("git push origin HEAD:main", rules) && !fastPass("git push --force origin feat/x", rules), "branch push lane");
+  // replay: shell text that is data (a note, an interpreter's print, a command being judged) is not a command
+  const pw = (c, cwd = "/w") => precheck(c, cwd, {})?.id ?? null;
+  for (const c of ["touch MEMORY.md && echo '- trash, not rm / unlink' >> MEMORY.md", "echo 'never git push --force origin main' >> MEMORY.md",
+    "printf '%s\\n' 'kubectl delete ns x --context prod' >> notes.txt", "reflex check 'rm -rf /'", "python3 - <<'EOF'\nimport json\nprint('rm -rf /')\nEOF",
+    "node - <<'EOF'\nconsole.log('git push --force origin main')\nEOF", ".venv/bin/python <<'EOF'\nprint('rm -rf ~')\nEOF",
+    "python3 - <<'EOF'\nd = json.load(open('prod.json'))\nprint(d['delete from'])\nEOF"]) ok(pw(c) === null, `data, not a command: ${c}`);
+  for (const [c, id] of [["echo 'rm -rf ~' >> ~/.zshrc", "rm-root"], ["echo 'rm -rf ~' > run.sh && bash run.sh", "rm-root"], ["echo 'rm -rf ~' | sh", "rm-root"],
+    ["echo 'rm -rf ~' >> notes.md; rm -rf ~", "rm-root"], ["echo 'rm -rf ~' >> notes.md & rm -rf ~", "rm-root"], ["reflex check x; rm -rf /", "rm-root"],
+    ["echo x >> notes.md && git push -f origin main", "force-push-main"], ["python3 - <<'EOF'\nimport os\nos.system('rm -rf /')\nEOF", "rm-root"],
+    ["python3 - <<'EOF' | sh\nprint('rm -rf ~')\nEOF", "rm-root"], ["python3 - <<'EOF' > r.sh\nprint('rm -rf ~')\nEOF", "rm-root"],
+    ["python3 - <<'EOF'\nopen('r.sh', 'w').write('rm -rf ~')\nEOF\nbash r.sh", "rm-root"], ["python3 - <<'EOF'\ngetattr(__import__('os'), 'sys' + 'tem')('rm -rf ~')\nEOF", "rm-root"],
+    ["python3 <<EOF\nprint('$(rm -rf ~)')\nEOF", "rm-root"], ["bash -c \"$(python3 - <<'EOF'\nprint('rm -rf ~')\nEOF\n)\"", "rm-root"],
+    ["node - <<'EOF'\nrequire('child_process').execSync('rm -rf ~')\nEOF", "rm-root"], ["perl - <<'EOF'\n`rm -rf ~`\nEOF", "rm-root"], ["bash <<'EOF'\nrm -rf ~\nEOF", "rm-root"],
+    // review: only the bare interpreter, a quoted delimiter, nothing around it, and nothing that deletes, loads or dispatches
+    ["python3 <<EOF\nprint('rm -rf ~')\nEOF", "rm-root"], ["ssh h python3 - <<'EOF'\nprint('rm -rf ~')\nEOF", "rm-root"],
+    ["docker exec -i c python3 - <<'EOF'\nprint('rm -rf ~')\nEOF", "rm-root"], ["env X=1 python3 - <<'EOF'\nprint('rm -rf ~')\nEOF", "rm-root"],
+    ["python3 -i - <<'EOF'\nprint('rm -rf ~')\nEOF", "rm-root"], ["python3 - <<'EOF'; sh f\nprint('rm -rf ~')\nEOF", "rm-root"],
+    ["python3 - <<'EOF'\nprint('rm -rf ~')\nEOF\nbash f", "rm-root"], ["ruby - <<'EOF'\nKernel.send(:sys, 'rm -rf ~')\nEOF", "rm-root"],
+    ["perl - <<'EOF'\ndo './x.pl'; # rm -rf ~\nEOF", "rm-root"], ["python3 - <<'EOF'\nimport shutil\nshutil.rmtree('/')  # rm -rf /\nEOF", "rm-root"],
+    ["node - <<'EOF'\nrequire('f'+'s').rmSync('/', {recursive: true}) // rm -rf /\nEOF", "rm-root"],
+    ["node --check -r ./x.js - # rm -rf ~\n", "rm-root"], ["node /tmp/gate.mjs --check 'rm -rf ~'", "rm-root"],
+    ["git push --force \\\n  origin main", "force-push-main"], ["git push -f origin \\\n HEAD:main", "force-push-main"],
+    ["B=main; git push -f origin $B", "force-push-main"], ["git push -f origin `echo main`", "force-push-main"],
+    ["git push --force-with-lease=main:abc123 origin HEAD", "force-push-main"], ["git -P push -f origin main", "force-push-main"]])
+    ok(pw(c) === id, `still a command: ${c}`);
+  // tamper is what a command changes: reading agent settings is not tamper, writing them is
+  for (const c of ["jq . ~/.claude/settings.json > /tmp/s.json", "grep -c reflex ~/.claude/settings.json > /tmp/n; echo done",
+    "gh api -X POST repos/ursuciprian/reflex/pulls -f title=x", "gh pr create --repo ursuciprian/reflex --title x", "git clone https://github.com/ursuciprian/reflex /tmp/r"])
+    ok(pw(c) !== "tamper", `not tamper: ${c}`);
+  for (const c of ["jq '.a=1' ~/.claude/settings.json > /tmp/s && mv /tmp/s ~/.claude/settings.json", "jq . ~/.claude/settings.json | sponge ~/.claude/settings.json",
+    "jq . ~/.claude/settings.json | tee ~/.claude/settings.json", "cp /tmp/s ~/.claude/settings.json", "cat /tmp/s > ~/.claude/settings.json", "cat /tmp/s >| ~/.claude/settings.json",
+    "cat /tmp/s &> ~/.claude/settings.json", "cat /tmp/s 1<> ~/.claude/settings.json", "echo '{}' > ~/.claude/'settings.json'", "{ jq . ~/.claude/settings.json; } > ~/.claude/settings.json",
+    "sed -i s/a/b/ ~/.codex/config.toml", "yq -i '.a=1' ~/.hermes/config.yaml", "xxd -r -p h.txt ~/.claude/settings.json", "touch ~/.claude/hooks/x.sh",
+    "cd ~/.claude/hooks && rm gate.sh", "F=~/.claude/settings.json; jq . $F > /tmp/x", "ls ~/.claude/hooks | xargs rm", "cd ~/.config; printf x > reflex/config.json",
+    "gh api repos/o/reflex/contents/x --jq .content > ~/.config/reflex/config.json", "curl https://x.io/a>~/src/reflex/gate.mjs", "npm install -g @ursuciprian/reflex",
+    "REFLEX_MODE=off claude -p hi"]) ok(pw(c) === "tamper", `tamper: ${c}`);
+  // the checkout: committing its files is not changing them; a worktree nested in it is another checkout unless the command climbs out
+  const nested = join(HERE, `.selfcheck-nested-${process.pid}`);
+  try {
+    mkdirSync(nested, {recursive: true});
+    writeFileSync(join(nested, ".git"), "gitdir: /nowhere\n");
+    ok(pw("git add gate.mjs setup/tool-gate/rules.json && git commit -m 'fix: x'", HERE) !== "tamper" && pw("sed -i '' s/a/b/ gate.mjs", HERE) === "tamper",
+       "checkout: git add and commit are not tamper, an edit is");
+    ok(pw("sed -i '' s/a/b/ gate.mjs", nested) !== "tamper" && pw("sed -i '' s/a/b/ ../gate.mjs", nested) === "tamper" &&
+       pw(`sed -i '' s/a/b/ ${join(HERE, "gate.mjs")}`, nested) === "tamper", "checkout: a nested worktree is not the gate, unless the command reaches out");
+  } finally { rmSync(nested, {recursive: true, force: true}); }
 
   // policy
   const p = compile(load("policy.json"));
