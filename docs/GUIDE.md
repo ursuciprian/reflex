@@ -56,17 +56,24 @@ hook (see the table in the README). Each adapter turns the agent's event into th
    rules (the fast lane is for local work): `ssh [options] host '<read-only>'`, with the quoted
    command last (words after it are appended on the remote side). Options come from an allowlist
    (`-4 -6 -C -T -a -k -n -q -t -v -x`, `-p -l -i -J -b -c -m`, and `-o` with `ConnectTimeout`,
-   `BatchMode`, `StrictHostKeyChecking`, `UserKnownHostsFile`, `ServerAlive*`, `Port`, `User`,
-   `IdentityFile` and other connection settings): nothing that runs a local command or loads local
-   code (`ProxyCommand`, `LocalCommand`, `KnownHostsCommand`, `-F` config, `-I`, `PKCS11Provider`),
-   forwards (`-L -R -D -W -w`, `-A`, `-X -Y`), backgrounds (`-f -N`), writes a local file (`-E`) or
-   sends the local environment (`SendEnv`). The host is a literal name, or a variable set only by a
-   `for h in <literal hosts>` loop in the same command (no `IFS`, `read` or other assignment of it).
-   Nothing may feed ssh's stdin (a pipe or a redirect into it), and a double-quoted remote command
-   must have nothing the local shell expands (`$VAR`, `$(…)`, backticks would send local data).
+   `BatchMode`, `StrictHostKeyChecking`, `UserKnownHostsFile=/dev/null`, `ServerAlive*`, `Port`,
+   `User`, `IdentityFile` and other connection settings), with values that are neither options
+   (`-J -oProxyCommand=…`) nor globs: nothing that runs a local command or loads local code
+   (`ProxyCommand`, `LocalCommand`, `KnownHostsCommand`, `-F` config, `-I`, `PKCS11Provider`),
+   forwards (`-L -R -D -W -w`, `-A`, `-X -Y`), backgrounds (`-f -N`), writes a local file (`-E`, a
+   known-hosts file other than `/dev/null`) or sends the local environment (`SendEnv`). The host is a
+   literal name, or a plain variable set only by a `for h in <literal hosts>; do` loop the call is
+   inside (no `IFS`, `read`, `${h:=…}`, `unset` or other assignment of it). Nothing may feed ssh's
+   stdin: no redirect or heredoc into it, and no pipe that reaches it (into it, through a wrapper,
+   or into a loop, group or substitution around it). A double-quoted remote command must have
+   nothing the local shell expands (`$VAR`, `$(…)`, backticks would send local data).
    Also read-only for remote checks: `free`, `nproc`, `lscpu`, `seq`, `systemctl status|is-active|
-   show|cat|list-*`, `journalctl` (not `--vacuum*`, `--rotate`, `--flush`), `ip addr|link|route|neigh
-   [show]`, and `docker exec [-it] [-u …] [-w …] <container> <read-only>` with a literal container.
+   show|cat|list-*`, `journalctl` (not `--vacuum*`, `--rotate`, `--flush`, `--cursor-file`, …),
+   `ip [-br|-4|-6|-s|-d|-j|-p|-o|-c] addr|link|route|neigh [show]`, and `docker exec [-t] [-u …]
+   [-w …] <container> <read-only>` with a literal container name (no `-i`: nothing goes to its stdin).
+   The shell's own quoting is followed where it changes what runs: a backslash-newline joins the two
+   lines (`-de\⏎lete` is `-delete`), `$'…'` is quoted text, and a word starting with `#` comments out
+   the rest of its line.
    In a session that read a suspected prompt injection a read-only `ssh` is still egress and asks.
 2. **Rules** (`rules.json`) — regular expressions over the command plus its context
    (`cwd=`, `aws_profile=`, `kube_context=`, `tf_workspace=`, `git_branch=`). A rule fires when all
@@ -734,15 +741,18 @@ are Jev's, so production is caught only by the `prod` pattern and exfiltration o
 
 The `prod` pattern (the `prod` always-human rule and the `prod-destroy` rule share it) reads the
 command, the cwd and the context. `prod`, `production` and `prd` count as words anywhere
-(`envs/prod`, `terraform/ecs/production`, `--profile prod`, `prod-db.internal`, an ARN naming
-`production-ecs`, `RAILS_ENV=production`), except in `non-prod` / `pre-prod` and in a document or
-log file name (`prod-notes.md`, `production.log`). `live` is also an English word, so it counts only
-as an environment: a directory under `envs/`, `environments/`, `stages/`, `deploy(ments)/`,
-`overlays/`, `accounts/` or `workspaces/` (`envs/live`), the value of an environment option or
-variable (`--context live`, `--profile=live`, `DEPLOY_ENV=live`, `terraform workspace select live`),
-`--live`, or an AWS profile, kube context or terraform workspace containing it; the branch only when
-it is exactly `live`. A checkout at `~/src/live-demo` or a scratch directory named `auto-live` is not
-production. A directory named exactly `prod` still is, wherever it is.
+(`envs/prod`, `terraform/ecs/production`, `--profile prod`, `prod-db.internal`, `db.prod.example.org`,
+an ARN naming `production-ecs`, `RAILS_ENV=production`), except in `non-prod` / `pre-prod` and in a
+file name ending in a document, log, data or image extension (`prod-notes.md`, `production.log`,
+`prod.csv`). `live` is also an English word, so it counts only as an environment: a directory under
+`envs/`, `environments/`, `stages/`, `deploy(ments)/`, `overlays/`, `accounts/`, `workspaces/` or
+`clusters/` (`envs/live`), a Terragrunt-style `live/<region>` or `infrastructure-live`, `cd live`,
+`-chdir=live`, `live*.tfvars`, the value of an environment, context, profile, namespace or host
+option or variable (`--context live`, `--kube-context=eks-live-1`, `-n live`, `-h live-db.internal`,
+`DEPLOY_ENV=live`, `terraform workspace select live`), `--live`, or an AWS profile, kube context or
+terraform workspace containing it; the branch only when it is `live` or ends in `/live`. A checkout
+at `~/src/live-demo` or a scratch directory named `auto-live` is not production. A directory named
+exactly `prod` still is, wherever it is.
 
 System 2 approved something no other model judged, so its approve is a `pass` (the agent's own
 permissions decide), except for a small class that becomes `allow`: a verdict at 0.9 or more, a stated
@@ -778,14 +788,14 @@ escalations 59.6 % were egress (mostly `ssh`), 7.1 % remote CLIs, 11.4 % ran loc
 passed the egress, remote-tool and script checks (an upper bound: the length, verb, path, intent and confidence checks come on top). With Jev, System 2 sees far fewer: on the
 ladder golden set 8 of 41 commands against 15 keyless.
 
-Re-measured on the same history (14,463 commands) after the ssh and `prod` changes above: read-only
-31.4 % → 32.9 %, a human before System 2 5.5 % → 4.7 % (the `prod` pattern 2.9 % → 2.0 %; each of the
-133 matches it dropped was a word such as "live" in an echo, a comment or a file name, or the
-`auto-live` scratch directory, and it gained none), System 2 61.8 % → 61.3 %, calls per active day
-115 → 112 at the median and 294 → 281 at p90. The ssh change alone takes System 2 to 60.4 %. Most
-`ssh` commands that still reach System 2 are not reads: they start servers and benchmarks, run
-`python3 -c`, `docker exec $C` or `curl` against a health endpoint, or kill processes. Counting remote
-`curl` GETs and `docker exec $C` as reads as well would reach only 57 %, so neither is on the list.
+Re-measured on the same history (14,470 commands) after the ssh and `prod` changes above: read-only
+31.4 % → 33.1 %, a human before System 2 5.5 % → 4.7 % (the `prod` pattern 2.9 % → 2.0 %; each of the
+133 matches it dropped was a word such as "live" in an echo, a comment or a file name, a document
+file name, or the `auto-live` scratch directory, and it gained none), System 2 61.8 % → 61.0 %, calls
+per active day 115 → 112 at the median and 294 → 284 at p90. Most `ssh` commands that still reach
+System 2 are not reads: they start servers and benchmarks, run `python3 -c`, `docker exec $C` or
+`curl` against a health endpoint, or kill processes. Counting remote `curl` GETs and `docker exec
+$C` as reads as well would reach only 57 %, so neither is on the list.
 
 The keyless defaults follow from that: `budget.calls` 300 a day (enough for nine days in ten),
 `session_calls` 100, `session_usd` $2, and the breaker off (`breaker.rate` 1): its 30 % would stay open

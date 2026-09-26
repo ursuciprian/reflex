@@ -174,13 +174,14 @@ const READ_ONLY_SUB = {
   uniq: /^(-\S+\s*)*$/,          // flags only: `uniq in out` writes out
   // what a remote host is usually asked over ssh (#26)
   systemctl: /^((--\S+|-[a-zA-Z]+)\s+)*(status|is-active|is-enabled|is-failed|is-system-running|show|cat|list-units|list-unit-files|list-timers|list-dependencies)\b/,
-  journalctl: /^(?!.*--(vacuum|rotate|flush|sync|relinquish|smart-relinquish|setup-keys|update-catalog))/,
-  ip: /^((?!-(b|batch)\b)-\S+\s+)*(a|addr|address|l|link|r|route|n|neigh|neighbour)(\s+(show|list|get)\b.*)?\s*$/,
+  journalctl: /^(?!.*--(vacuum|rotate|flush|sync|relinquish|smart-relinquish|setup-keys|update-catalog|cursor-file))/,
+  // options from an allowlist: ip takes any prefix of -batch (-ba, -bat) as a batch file of commands
+  ip: /^((-(br|brief|4|6|s|stats|d|details|j|json|p|pretty|o|oneline|c|color))\s+)*(a|addr|address|l|link|r|route|n|neigh|neighbour)(\s+(show|list|get)\b.*)?\s*$/,
 };
-// `docker exec [-it] [-u user] [-w dir] container cmd`: as read-only as cmd. The container is a
-// literal name or a quoted one (masked to ""), never a bare $C, which word splitting could turn into
-// a container and a different command.
-const DOCKER_EXEC = /^exec\s+((-(it|ti|i|t)|--(interactive|tty)|(-[uw]|--(user|workdir))(\s+|=)[\w./:-]+)\s+)*([\w][\w.-]*|"")\s+(\S[\s\S]*)$/;
+// `docker exec [-t] [-u user] [-w dir] container cmd`: as read-only as cmd. The container is a
+// literal name, never $C or "$(…)", which could turn into options, a container and another command.
+// No -i: nothing is fed to the container's stdin.
+const DOCKER_EXEC = /^exec\s+((-t|--tty|(-[uw]|--(user|workdir))(\s+|=)[\w./:-]+)\s+)*(\w[\w.-]*)\s+(\S[\s\S]*)$/;
 // Loop and condition keywords wrap commands; the command after them is what runs.
 const KEYWORD = /^(do|then|else|elif|if|while|until|!|\{|\()\s+/;
 // Assignments that cannot turn a reader into a runner: shell-local lowercase names, short script
@@ -188,14 +189,22 @@ const KEYWORD = /^(do|then|else|elif|if|while|until|!|\{|\()\s+/;
 const SAFE_VAR = /^([a-z_][a-z0-9_]*|[A-Z]{1,3}|AWS_PROFILE|AWS_REGION|AWS_DEFAULT_REGION|KUBECONFIG)$/;
 const assignmentOk = a => SAFE_VAR.test(a.split("=")[0]);
 
-// Blank out quoted text, keeping the quote marks. Inside double quotes `$(` and backticks still
-// expand, so they are kept. Unbalanced quotes mean the mask cannot be trusted: return the input.
-// `fill` stands in for each blanked character; with one, the mask keeps the input's length, so
-// positions found in the mask cut the original.
+// Blank out quoted text and comments, keeping the quote marks. Inside double quotes `$(` and
+// backticks still expand, so they are kept; `$'…'` is quoted text with backslash escapes; a `#` that
+// starts a word comments out the rest of the line. Unbalanced quotes mean the mask cannot be
+// trusted: return the input. `fill` stands in for each blanked character; with one, the mask keeps
+// the input's length, so positions found in the mask cut the original.
 export function maskQuotes(s, fill = "") {
   let out = "", q = null;
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
+    if (q === "#") { if (ch === "\n") { q = null; out += ch; } else out += fill; continue; }
+    if (q === "$'") {
+      if (ch === "\\") { out += fill.repeat(Math.min(2, s.length - i)); i++; continue; }
+      out += ch === "'" ? ch : fill;
+      if (ch === "'") q = null;
+      continue;
+    }
     if (q === "'") { out += ch === "'" ? ch : fill; if (ch === "'") q = null; continue; }
     if (q === '"') {
       if (ch === "\\") { out += fill.repeat(Math.min(2, s.length - i)); i++; continue; }
@@ -206,10 +215,12 @@ export function maskQuotes(s, fill = "") {
       continue;
     }
     if (ch === "\\") { out += ch + (s[i + 1] ?? ""); i++; continue; }
+    if (ch === "#" && (i === 0 || /[\s;&|()]/.test(s[i - 1]))) { q = "#"; out += fill; continue; }
+    if (ch === "$" && s[i + 1] === "'") { q = "$'"; out += "$'"; i++; continue; }
     if (ch === "'" || ch === '"') q = ch;
     out += ch;
   }
-  return q ? s : out;
+  return q && q !== "#" ? s : out;
 }
 
 // `ssh [options] host 'cmd'` (#26): unquoted words (options, then one host), then the quoted remote
@@ -217,29 +228,44 @@ export function maskQuotes(s, fill = "") {
 const SSH_CALL = /\bssh((?:\s+[^\s'"`\\;&|<>()]+)+)\s+(?:'([^']*)'|"((?:[^"\\]|\\[\s\S])*)")(?=\s*($|[;&|\n)]))/;
 // Options from an allowlist. Left out: whatever runs a local command or loads local code
 // (ProxyCommand, LocalCommand, KnownHostsCommand, -F config, -I and PKCS11Provider), forwards (-L -R
-// -D -W -w, -A the agent, -X -Y, -K credentials), backgrounds (-f -N), writes a local file (-E),
-// sends local environment (SendEnv) or replaces the command (RemoteCommand, -s).
+// -D -W -w, -A the agent, -X -Y, -K credentials), backgrounds (-f -N), writes a local file (-E, a
+// known-hosts file other than /dev/null), sends local environment (SendEnv) or replaces the command
+// (RemoteCommand, -s). A value never starts with - (`-J -oProxyCommand=…`) or holds a glob.
 const SSH_FLAGS = /^-([46CTaknqtvx]*)([Jbcilmop]?)(.*)$/;
-const SSH_OPTION = new RegExp("^(AddressFamily|BatchMode|CheckHostIP|Compression|ConnectTimeout|ConnectionAttempts|HashKnownHosts|HostKeyAlias|" +
-  "IdentitiesOnly|IdentityFile|KbdInteractiveAuthentication|LogLevel|NumberOfPasswordPrompts|PasswordAuthentication|Port|" +
-  "PreferredAuthentications|PubkeyAuthentication|RequestTTY|ServerAliveCountMax|ServerAliveInterval|StrictHostKeyChecking|" +
-  "TCPKeepAlive|UpdateHostKeys|User|UserKnownHostsFile|VerifyHostKeyDNS)=[^=]*$", "i");
-// `for h in a b; do ssh $h '…'; done`: a variable host only a loop over literal host names sets.
-// Whatever else could set it (an assignment, read, export, the environment) or change how it splits
-// (IFS) refuses it: `h=-oProxyCommand=…` would run a local command.
-function loopHost(c, v) {
-  const lists = [...c.matchAll(new RegExp(String.raw`\bfor\s+${v}\s+in\s+([^;\n]*)`, "g"))].map(f => f[1].trim().split(/\s+/));
-  return lists.length > 0 && lists.every(l => l.every(w => /^[\w.@:][\w.@:-]*$/.test(w))) &&
-    !new RegExp(String.raw`\b${v}=|\bIFS=|\b(read|declare|typeset|local|export|readonly|getopts|mapfile|readarray|printf\s+-v)\b`).test(c);
+const SSH_OPTION = /^(AddressFamily|BatchMode|CheckHostIP|Compression|ConnectTimeout|ConnectionAttempts|HashKnownHosts|HostKeyAlias|IdentitiesOnly|IdentityFile|KbdInteractiveAuthentication|LogLevel|NumberOfPasswordPrompts|PasswordAuthentication|Port|PreferredAuthentications|PubkeyAuthentication|RequestTTY|ServerAliveCountMax|ServerAliveInterval|StrictHostKeyChecking|TCPKeepAlive|User|VerifyHostKeyDNS)=[^=]*$|^UserKnownHostsFile=\/dev\/null$/i;
+// `for h in a b; do ssh $h '…'; done`: a variable host only a loop over literal host names sets, and
+// the ssh call inside that loop. Whatever else could set it (an assignment, ${h:=…}, read, export,
+// the environment, a shell-managed name like $_) or change how it splits (IFS) refuses it:
+// `h=-oProxyCommand=…` would run a local command. `at`: where the call is in `c`.
+function loopHost(c, v, at) {
+  if (!/^([a-z][a-z0-9]*|[A-Z])$/.test(v) ||
+      new RegExp(String.raw`\b${v}=|\$\{${v}[^}]|\bIFS=|\b(read|declare|typeset|local|export|readonly|getopts|mapfile|readarray|printf\s+-v|eval|source|unset)\b`).test(c)) return false;
+  const mask = maskQuotes(c, "_"), loops = [...mask.matchAll(new RegExp(String.raw`\bfor\s+${v}\s+in\s+([^;\n]*)[;\n]\s*do\b`, "g"))];
+  if (!loops.length || !loops.every(f => f[1].trim().split(/\s+/).every(w => /^[\w.@:][\w.@:-]*$/.test(w)))) return false;
+  // inside: after the loop's `do`, before the `done` that closes it
+  return loops.some(f => {
+    let depth = 1;
+    for (const k of mask.slice(f.index + f[0].length, at).matchAll(/\b(do|done)\b/g)) if ((depth += k[1] === "do" ? 1 : -1) === 0) return false;
+    return f.index + f[0].length <= at;
+  });
 }
+// Could a pipe before `at` in the mask feed what runs there? Yes when no separator follows it (a
+// wrapper, a newline), when a loop, condition or group starts right after it, or when a subshell,
+// group or substitution opened after it is still open at `at`. ponytail: counts brackets, not the
+// grammar: `a | x; (ssh …)` is refused too.
+const piped = (mask, at) => [...mask.slice(0, at).matchAll(/(^|[^|])\|(?!\|)&?/g)].some(p => {
+  const t = mask.slice(p.index + p[0].length, at).trimStart(), n = re => (t.match(re) ?? []).length;
+  return !/[;&\n]/.test(t) || /^(for|while|until|if|select|case|[{(!])/.test(t) ||
+    n(/\(/g) > n(/\)/g) || n(/\{/g) > n(/\}/g) || n(/`/g) % 2 === 1;
+});
 // The remote command of an ssh call SSH_CALL found in c, or null when the call is not a read of it:
-// an option outside the allowlist or holding a variable, a host that is neither a literal name nor a
-// loopHost, anything feeding ssh's stdin (a pipe; a redirect never matches SSH_CALL or leaves a
-// segment that is not read-only), or a double-quoted command with something the local shell expands
-// ($VAR, $(…), `…` would send local data to the host). Quotes are checked against the mask: an ssh
-// inside quoted text is undefined (data, or a `"$(ssh …)"` the $(…) step reads on its own), and a
-// match that starts outside quotes but ends inside them is refused. `whole`: the command a loop
-// variable is looked up in.
+// an option outside the allowlist or holding a variable or glob, a host that is neither a literal
+// name nor a loopHost, anything feeding ssh's stdin (a pipe that reaches it; a redirect or heredoc
+// never matches SSH_CALL or leaves a segment that is not read-only), or a double-quoted command with something the local shell expands ($VAR, $(…), `…`
+// would send local data to the host). Quotes are checked against the mask: an ssh inside quoted text
+// is undefined (data, or a `"$(ssh …)"` the $(…) step reads on its own), and a match that starts
+// outside quotes but ends inside them is refused. `whole`: the command a loop variable is looked up
+// in; the call is found in it by its text.
 function sshCall(c, m, whole) {
   const mask = maskQuotes(c, "_"), q = m[2] === undefined ? '"' : "'", end = m.index + m[0].length - 1;
   const body = m[2] ?? m[3], open = end - body.length - 1;
@@ -247,16 +273,17 @@ function sshCall(c, m, whole) {
   if (!body || mask === c) return null;
   if (mask.slice(m.index, m.index + 3) !== "ssh") return undefined;
   if (mask[open] !== q || mask[end] !== q) return null;
-  if (/(^|[^|])\|&?$/.test(mask.slice(0, m.index).replace(/[^;&|\n(`]*$/, ""))) return null;
+  if (piped(mask, m.index)) return null;
   const words = m[1].trim().split(/\s+/), host = words.at(-1), v = host.match(/^([\w.-]+@)?\$\{?(\w+)\}?$/)?.[2];
-  if (words.slice(0, -1).some(w => /[${}]/.test(w)) || !(v ? loopHost(whole, v) : /^[\w.%@:[\]-]+$/.test(host))) return null;
+  if (words.slice(0, -1).some(w => /[${}*?[\]]|^-.*(\s|\/-)|^-\S*=-/.test(w))) return null;
+  if (!(v ? whole.includes(m[0]) && loopHost(whole, v, whole.indexOf(m[0])) : /^[\w.%@:-]+$/.test(host) && !/(^|@)-/.test(host))) return null;
   let i = 0;
   for (; i < words.length && words[i].startsWith("-"); i++) {
     const f = words[i].match(SSH_FLAGS);
     if (!f || !(f[1] || f[2]) || (!f[2] && f[3])) return null;
     if (!f[2]) continue;
     const v = f[3] || words[++i];
-    if (v === undefined || (f[2] === "o" && !SSH_OPTION.test(v))) return null;
+    if (v === undefined || /^-|\/-/.test(v) || (f[2] === "o" && !SSH_OPTION.test(v))) return null;
   }
   if (words.length !== i + 1) return null;
   if (q === "'") return body;
@@ -265,13 +292,16 @@ function sshCall(c, m, whole) {
 
 // `extra` adds segment patterns that are safe but not read-only (rules.json "pass": builds, mkdir).
 // `whole`: the command a $(…) was cut from, where an ssh loop variable is set.
-export function readOnly(cmd, extra = [], depth = 0, whole = cmd) {
+export function readOnly(cmd, extra = [], depth = 0, whole = null) {
   if (depth > 3) return false;
-  let c = cmd.replace(/\\\n/g, " ")
-    // A quoted heredoc body is data. An unquoted one is expanded by the shell, so it stays and is checked.
-    .replace(/<<-?\s*(['"])(\w+)\1([^\n]*)\n[\s\S]*?\n\s*\2\s*(?=\n|$)/g, "$3")
-    .replace(/[0-9&]?>{1,2}\s*\/dev\/null\b/g, "")
+  // The shell deletes a backslash-newline: `-de\⏎lete` is -delete.
+  let c = cmd.replace(/\\\n/g, "")
+    // A quoted heredoc body is data. An unquoted one is expanded by the shell, so it stays and is
+    // checked. A word stays in its place, so an ssh call it feeds is not one SSH_CALL matches.
+    .replace(/<<-?\s*(['"])(\w+)\1([^\n]*)\n[\s\S]*?\n\s*\2\s*(?=\n|$)/g, "_heredoc_$3")
+    .replace(/[0-9&]?>{1,2}\s*\/dev\/null\b|<\s*\/dev\/null\b/g, "")
     .replace(/[0-9]>&[0-9]/g, "");
+  whole ??= c;
   // `ssh host 'cmd'` is only as safe as cmd, which must be read-only itself (the fast lane is for
   // local work). See sshCall for what else the call must not do.
   for (let at = 0, m; (m = c.slice(at).match(SSH_CALL));) {
@@ -285,7 +315,7 @@ export function readOnly(cmd, extra = [], depth = 0, whole = cmd) {
   // `$(...)` is only as safe as what runs inside it. What it prints is unknown words: "X%" is no name
   // (DOCKER_EXEC takes no container from it).
   for (let m; (m = c.match(/\$\(([^()`]*)\)/));) {
-    if (!readOnly(m[1], extra, depth + 1, whole)) return false;
+    if (!readOnly(m[1], extra, depth + 1, whole) || (/\bssh\b/.test(m[1]) && piped(maskQuotes(c, "_"), m.index))) return false;
     c = c.replace(m[0], "X%");
   }
   // Tool-level dangers are checked on the raw text, quotes included (conservative).
@@ -546,7 +576,7 @@ function pmScripts(pm, tokens) {
 // Quotes are masked line by line with whole-line comments dropped first: an apostrophe in a
 // comment ("# don't") must not hide the lines after it.
 function segments(text) {
-  const c = stripDataHeredocs(text).replace(/\\\n/g, " ").split("\n").map(l => /^\s*#/.test(l) ? "" : l).join("\n");
+  const c = stripDataHeredocs(text).replace(/\\\n/g, "").split("\n").map(l => /^\s*#/.test(l) ? "" : l).join("\n");
   const m = c.split("\n").map(l => maskQuotes(l, "_")).join("\n"), out = [];
   let last = 0;
   for (const x of m.matchAll(/&&|\|\||\$\(|[;&|\n()`]|(?<!\$)\{|\}/g)) { out.push(c.slice(last, x.index)); last = x.index + x[0].length; }
@@ -645,7 +675,7 @@ export function localScripts(command, cwd, depth = 0) {
 // commands, and the rules' backtracking on them could outrun the hook's timeout. The script then
 // counts as partly seen. Variables are expanded to a fixed point (E=prod; DB=$E-orders).
 function scriptLines(body) {
-  const all = stripDataHeredocs(body).replace(/\\\n/g, " ").split("\n").filter(l => !/^\s*(#|\/\/)/.test(l));
+  const all = stripDataHeredocs(body).replace(/\\\n/g, "").split("\n").filter(l => !/^\s*(#|\/\/)/.test(l));
   const lines = all.filter(l => l.length <= LONG_LINE), vars = {};
   for (const l of lines) {
     const a = l.match(/^\s*(?:export\s+|local\s+|readonly\s+)?(\w+)=(["']?)([^"'\s;]*)\2/);
@@ -1252,14 +1282,26 @@ async function selfcheck() {
     ["h=-oProxyCommand=id; ssh $h 'uptime'", "a variable host"], ["IFS=-; for h in a-Fx; do ssh $h 'uptime'; done", "IFS"],
     ["for h in a b; do read h; ssh $h 'uptime'; done", "a reassigned loop variable"], ["for h in $(cat hosts); do ssh $h 'uptime'; done", "hosts from a command"],
     ["for h in a -oProxyCommand=x; do ssh $h 'uptime'; done", "an option in the host list"], ["echo 'ssh h '; rm -rf ~/x #'", "a match across quotes"],
+    ["cat notes.txt | for h in a; do ssh $h 'cat'; done", "a pipe into a loop"], ["cat notes.txt | if true; then ssh h 'cat'; fi", "a pipe into an if"],
+    ["cat notes.txt |\nssh h 'cat'", "a pipe, then a newline"], ["ssh h 'cat' <<'EOF'\nlocal data\nEOF", "a heredoc into ssh"],
+    ["for _ in a; do echo -oProxyCommand=x; ssh $_ 'uptime'; done", "$_"], ["ssh $h 'uptime'; for h in a; do true; done", "ssh outside the loop"],
+    ["echo ${h:=-oProxyCommand=x}; for h in a; do ssh $h 'uptime'; done", "${h:=…}"], ["echo 'for h in a;'; ssh $h 'uptime'", "a loop in quoted text"],
+    ["ssh [-]Fx 'uptime'", "a glob"], ["ssh -i x* h 'uptime'", "a glob value"], ["ssh -J -oProxyCommand=x h 'uptime'", "a value that is an option"],
+    ["ssh -J ssh://-oProxyCommand=x h 'uptime'", "an option in a jump URL"], ["ssh user@-oProxyCommand 'uptime'", "a host that is an option"],
+    ["ssh -o UserKnownHostsFile=~/.zshrc h 'uptime'", "a known-hosts file ssh writes"],
   ]) ok(!readOnly(cmd), `ssh: ${why}`);
+  ok(!readOnly("find . -de\\\nlete") && !readOnly("sed -\\\ni s/a/b/ f") && !readOnly("echo $'\\'' ; touch x ; echo \\'") &&
+     !readOnly("echo x # '\ntouch x\n# '") && readOnly("ls # it's a comment\ncat f") && readOnly("ssh h 'uptime' < /dev/null"),
+     "backslash-newline joins, $'…' and # comments are masked, stdin from /dev/null");
   ok(readOnly("ssh -n -p 2222 -l ops -i ~/.ssh/id_ed25519 -oBatchMode=yes -tt h 'df -h'") && readOnly(`ssh h "grep -c \\"x\\" /var/log/syslog"`) &&
      readOnly("for h in web-1 web-2; do printf '%s: ' $h; ssh ops@$h 'uptime' 2>&1 | tail -1; done") && readOnly(`for h in a b; do echo "$h: $(ssh $h 'nproc')"; done`),
      "ssh: allowed options, escaped double quotes, a loop over literal hosts");
-  ok(readOnly("ssh h 'systemctl is-active api; journalctl -u api -n 20 --no-pager; free -g; ip -br addr'") && readOnly("docker exec -it api tail -n 50 /var/log/app.log") &&
+  ok(readOnly("ssh h 'systemctl is-active api; journalctl -u api -n 20 --no-pager; free -g; ip -br addr'") && readOnly("docker exec -t api tail -n 50 /var/log/app.log") &&
      !readOnly("journalctl --vacuum-time=1d") && !readOnly("ip -batch cmds") && !readOnly("ip route add default via 10.0.0.1") && !readOnly("systemctl restart api") &&
      !readOnly("docker exec $C tail f") && !readOnly("docker exec $(docker ps -q) tail f") && !readOnly("docker exec api rm -rf /tmp/x") &&
-     !readOnly("docker exec -e X=1 api tail f"), "remote reads: systemctl, journalctl, ip, docker exec");
+     !readOnly("docker exec -e X=1 api tail f") && !readOnly("ip -ba addr") && !readOnly("journalctl --cursor-file f -n 1") &&
+     !readOnly('docker exec "$C" ls') && !readOnly('docker exec "$(echo -d)" ls reboot') && !readOnly("docker exec -i api cat < notes.txt"),
+     "remote reads: systemctl, journalctl, ip, docker exec");
   ok(!readOnly("cat > /tmp/x.json <<'EOF'\n{\"a\": 1}\nEOF"), "writes to /tmp are writes");
   ok(!readOnly("python3 - <<'PY'\nprint(1)\nPY") && !readOnly("cat > ~/.zshrc <<EOF\nx\nEOF"), "heredoc into python / home");
   ok(readOnly("export AWS_PROFILE=dev; aws s3 ls"), "export");
@@ -1347,7 +1389,10 @@ async function selfcheck() {
     ["terraform workspace select live && terraform destroy", ""], ["kubectl --context live delete pod x", ""], ["kubectl delete pod x", "kube_context=eks-live-1"],
     ["helm uninstall a --kube-context=live", ""], ["DEPLOY_ENV=live kubectl delete pod x", ""], ["aws s3 rm s3://b --recursive --profile prod", ""],
     ["terraform destroy", "tf_workspace=live"], ["terraform destroy", "git_branch=production"], ["psql -h prod-db.internal -c 'DROP TABLE t'", ""],
-    ["RAILS_ENV=production rails runner 'User.delete_all' && psql -c 'DELETE FROM users'", ""]])
+    ["RAILS_ENV=production rails runner 'User.delete_all' && psql -c 'DELETE FROM users'", ""], ["psql -h db.prod.example.org -c 'DROP TABLE t'", ""],
+    ["aws s3 rm s3://acme-prod.csv-exports --recursive", ""], ["kubectl -n live delete pod x", ""], ["kubectl --context eks-live-1 delete pod x", ""],
+    ["psql -h live-db.internal -c 'DROP TABLE t'", ""], ["terraform -chdir=live destroy", ""], ["cd live && terraform destroy", ""],
+    ["terraform destroy", "cwd=/infra/live/eu-west-1"], ["terraform destroy", "cwd=/repo/infrastructure-live/app"], ["terraform destroy -var-file=live.tfvars", ""]])
     ok(rule(cmd, ctx) === "prod-destroy", `prod: ${cmd} ${ctx}`);
   ok(fastPass("go test ./...", rules) && fastPass("npm run smoke", rules), "fast lane");
   ok(fastPass("mkdir -p out && go test ./... 2>&1 | tail -5", rules), "fast lane mixes with reads");
