@@ -40,7 +40,7 @@ Reference: [HTTP API](https://docs.typesafe.ai/api), [models and limits](https:/
 
 Hooks and plugins inherit the environment the agent was started with. Either:
 
-- **Environment** — `export TYPESAFE_API_KEY=...` in the shell profile you start Claude Code from
+- **Environment**: `export TYPESAFE_API_KEY=...` in the shell profile you start Claude Code from
   (or load it from your password manager there); or
 - **macOS Keychain** (no key in any file):
 
@@ -140,8 +140,8 @@ absolute path of the Node that ran `install.mjs`; pass `--node /path/to/node` to
 
 | Agent | What `install.mjs` does | After installing |
 |---|---|---|
-| Claude Code | `~/.claude/settings.json`: `PreToolUse` hook on `Bash\|Task\|Agent` (`gate.mjs --claude`; `Task\|Agent` is subgoal dedup), `PostToolUse` / `PostToolUseFailure` / `PermissionDenied` hooks on the same tools (`--claude-post`), a `PermissionRequest` hook on the same tools (`--claude-prompted`, which only records that Claude Code showed its own dialog — it never answers it), a `UserPromptSubmit` hook for conditional instructions (`instructions.mjs --claude`), the injection guard (`guard.mjs --claude` on `PostToolUse` for web, MCP, `Read` and `Bash` results; `guard.mjs --claude-prompt` on `UserPromptSubmit`), and permission rules that make Claude Code ask before editing the Reflex checkout, its logs, your personal instruction fragments (`~/.config/reflex`) or its own settings | restart sessions |
-| Codex CLI | `~/.codex/hooks.json`: `PreToolUse` + `PostToolUse` on `^(Bash\|spawn_agent)$` (`spawn_agent` is subgoal dedup), `UserPromptSubmit` (`instructions.mjs --codex`), and the injection guard (`guard.mjs --codex` on `PostToolUse` for `^Bash$\|^mcp__`, `guard.mjs --codex-prompt` on `UserPromptSubmit`) | open Codex, run `/hooks` and **trust** the Reflex hooks — untrusted hooks do not run |
+| Claude Code | `~/.claude/settings.json`: `PreToolUse` hook on `Bash\|Task\|Agent` (`gate.mjs --claude`; `Task\|Agent` is subgoal dedup), `PostToolUse` / `PostToolUseFailure` / `PermissionDenied` hooks on the same tools (`--claude-post`), a `PermissionRequest` hook on the same tools (`--claude-prompted`, which only records that Claude Code showed its own dialog; it never answers it), a `UserPromptSubmit` hook for conditional instructions (`instructions.mjs --claude`), the injection guard (`guard.mjs --claude` on `PostToolUse` for web, MCP, `Read` and `Bash` results; `guard.mjs --claude-prompt` on `UserPromptSubmit`), and permission rules that make Claude Code ask before editing the Reflex checkout, its logs, your personal instruction fragments (`~/.config/reflex`) or its own settings | restart sessions |
+| Codex CLI | `~/.codex/hooks.json`: `PreToolUse` + `PostToolUse` on `^(Bash\|spawn_agent)$` (`spawn_agent` is subgoal dedup), `UserPromptSubmit` (`instructions.mjs --codex`), and the injection guard (`guard.mjs --codex` on `PostToolUse` for `^Bash$\|^mcp__`, `guard.mjs --codex-prompt` on `UserPromptSubmit`) | open Codex, run `/hooks` and **trust** the Reflex hooks; untrusted hooks do not run |
 | pi | `~/.pi/agent/extensions/reflex.ts` (gate on `tool_call`, instructions on `before_agent_start`, injection guard on `tool_result` and `input`) | restart pi |
 | oh-my-pi | `~/.omp/agent/extensions/reflex.ts` (same file) | restart omp |
 | opencode | `~/.config/opencode/plugins/reflex.js` (gate on `tool.execute.before`, instructions on `chat.message` + `experimental.chat.system.transform`, injection guard on `tool.execute.after` and `chat.message`) | restart opencode |
@@ -326,7 +326,7 @@ All optional.
 | Variable | Default | Meaning |
 |---|---|---|
 | `REFLEX_ENGINE` | saved choice, otherwise `jev` for legacy direct hooks | `local` disables hosted classification; new setup saves `local` |
-| `TYPESAFE_API_KEY` | — | API key (or use the Keychain item) |
+| `TYPESAFE_API_KEY` | none | API key (or use the Keychain item) |
 | `REFLEX_MODE` | installed `--mode`, else `shadow` | `off` · `shadow` (rules enforce, Jev logs only) · `enforce` |
 | `REFLEX_ALLOW` | installed `--allow`, else `off` | `off` · `shadow` (log `would_allow`) · `on` (clearly safe commands skip the agent's prompt; enforce mode only) |
 | `REFLEX_MODEL` | `jev-1.13.0` | Pinned model; `jev-latest` follows TypeSafe's current version |
@@ -402,7 +402,7 @@ for TLS on Python builds without a CA bundle.
    (their `model_name`s in LiteLLM's `model_list`), each model's `tier`, `price_in` (USD per
    million input tokens) and tags (`first_party`, `frontier`, `tools`).
 3. Put the module next to the proxy's `config.yaml` (copy, symlink, or a Docker bind mount of the
-   file next to `/app/config.yaml`) and add the callback — see `routing/litellm-config.example.yaml`.
+   file next to `/app/config.yaml`) and add the callback; see `routing/litellm-config.example.yaml`.
    A copy or a mount also needs `policy.json`, `questions.json` and `setup/redact.json` mounted and
    named by the variables below; a symlink into this repo finds them itself:
 
@@ -425,7 +425,7 @@ for TLS on Python builds without a CA bundle.
 | `REFLEX_ROUTING_QUESTIONS` | `routing/questions.json` next to the module | The three Jev questions |
 | `REFLEX_REDACT` | `setup/redact.json` beside the module's directory | Secret patterns shared with the gate; without it routing is skipped (requests keep their model) |
 | `REFLEX_DATA_DIR` | `~/.local/state/reflex` | Where `routing.jsonl` is written (inside Docker, mount a volume) |
-| `TYPESAFE_API_KEY` / `REFLEX_KEYCHAIN_SERVICE` | — / `typesafe-api-key` | Same key lookup as the gate; the Keychain is not reachable from a container, so use the variable there |
+| `TYPESAFE_API_KEY` / `REFLEX_KEYCHAIN_SERVICE` | none / `typesafe-api-key` | Same key lookup as the gate; the Keychain is not reachable from a container, so use the variable there |
 | `REFLEX_MODEL`, `REFLEX_API_URL` | as the gate | Jev model and endpoint |
 
 ## Optional: context layer (pi and oh-my-pi)
@@ -440,7 +440,7 @@ variables:
 | `REFLEX_CHUNK_DAYS` / `REFLEX_CHUNK_MB` | `7` / `200` | Context-layer chunk store: delete chunks unused for this many days, then the least recently used beyond this size |
 | `REFLEX_CACHE_READ` / `REFLEX_CACHE_WRITE` | `0.1` / `1.25` | Prompt-cache read and write price as a fraction of uncached input, for the rebuild-or-keep decision |
 | `REFLEX_CONTEXT` | set by `install.mjs` | Path to `context.mjs` for the pi / omp context extension |
-| `REFLEX_REVIEWER` | — | Reviewer command for `bin/reflex-review`, e.g. `codex exec -s read-only -` |
+| `REFLEX_REVIEWER` | none | Reviewer command for `bin/reflex-review`, e.g. `codex exec -s read-only -` |
 
 ## Optional: Grafana
 

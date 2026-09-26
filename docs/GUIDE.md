@@ -47,11 +47,11 @@ host trust must also be checked in the agent itself.
 ## How a command is decided
 
 Every shell command an agent wants to run reaches `gate.mjs` through that agent's pre-execution
-hook (see the table in the README). Each adapter turns the agent's event into the same call —
-`{agent, command, cwd, session_id, call_id, intent}` — and gets back
+hook (see the table in the README). Each adapter turns the agent's event into the same call,
+`{agent, command, cwd, session_id, call_id, intent}`, and gets back
 `{effective, decision, reason, source}`. The first step that reaches a decision wins:
 
-1. **Read-only** — `readOnly()` recognises commands that only read: `ls`, `grep`, `git status`,
+1. **Read-only**: `readOnly()` recognises commands that only read: `ls`, `grep`, `git status`,
    `kubectl get`, `terraform plan`, `aws … describe-*`, `gh pr view`, `ssh host '<read-only>'`,
    `$(<read-only>)`, loops of reads, output to `/dev/null`, quoted heredocs fed to `cat`. Quoted
    text is treated as data (`jq '.a | .b'`, `grep -E 'x|y'`), except `$(…)` and backticks inside
@@ -86,13 +86,12 @@ hook (see the table in the README). Each adapter turns the agent's event into th
    lines (`-de\⏎lete` is `-delete`), `$'…'` is quoted text, and a word starting with `#` comments out
    the rest of its line.
    In a session that read a suspected prompt injection a read-only `ssh` is still egress and asks.
-2. **Rules** (`rules.json`) — regular expressions over the command plus its context
+2. **Rules** (`rules.json`): regular expressions over the command plus its context
    (`cwd=`, `aws_profile=`, `kube_context=`, `tf_workspace=`, `git_branch=`). A rule fires when all
    of its patterns match. Rules are **enforced in shadow and enforce modes**, with off disabling the entire gate.
-   Shipped rules: `rm-root`, `prod-destroy`, `force-push-main`, `push-mirror` (deny); `tamper`, `destroy`, `ssh-local-command` (`-o ProxyCommand|LocalCommand|Match …`, a `-J` hop that is an option),
-   and — checked even before read-only detection — `secret-read` (the API key, secret stores) and
-   `secret-file-read` (`~/.ssh/id_*` but not `.pub`, `~/.aws/credentials`, `.netrc`, `.pgpass`, `.env` / `.env.*` files but not `.env.example` and other templates, `kubectl get secret(s)`) (ask). It fires only when the file is an argument of a command that reads, copies or sends it (`cat`, `less`, `head`/`tail`, `grep`/`rg`/`ag`, `jq`, `sed`/`awk`, `cp`/`scp`/`rsync` as the source, `base64`, `xxd`, `strings`, `od`, `nl`, `sort`, `uniq`, `cut`, `paste`, `fold`, `column`, `diff`, `comm`, `cmp`, `tac`, `rev`, `open`, `source`/`.`, `nc`, `tar`/`zip`, `curl -d/-F/-T/--data*`, a routed `mcp` call), at any command position — after `;`, `&&`, `|`, inside `$(…)`, backticks, `bash -c '…'`, `ssh host '…'`, `ssh host cmd …` — or is redirected in (`< ~/.aws/credentials`). A commit message, `echo`, or `cp .env.example .env` that only names the file passes. Known over-match: a `grep` whose search *pattern* is `.env` (`grep -rn '.env' src/`) asks. Any mutating command that touches the Reflex checkout, its setup files or its logs is also an `ask`, wherever the repo was cloned.
-   Shipped rules: `rm-root`, `prod-destroy`, `force-push-main`, `push-mirror` (deny); `secret-read`, `tamper`, `destroy`, and for scripts `secret-exfil` (ask). Any mutating command that touches the Reflex checkout, its setup files or its logs is also an `ask`, wherever the repo was cloned.
+   Shipped rules: `rm-root`, `prod-destroy`, `force-push-main`, `push-mirror` (deny); `tamper`, `destroy`, `secret-exfil` (for scripts), `ssh-local-command` (`-o ProxyCommand|LocalCommand|Match …`, a `-J` hop that is an option),
+   and, checked even before read-only detection, `secret-read` (the API key, secret stores) and
+   `secret-file-read` (`~/.ssh/id_*` but not `.pub`, `~/.aws/credentials`, `.netrc`, `.pgpass`, `.env` / `.env.*` files but not `.env.example` and other templates, `kubectl get secret(s)`) (ask). It fires only when the file is an argument of a command that reads, copies or sends it (`cat`, `less`, `head`/`tail`, `grep`/`rg`/`ag`, `jq`, `sed`/`awk`, `cp`/`scp`/`rsync` as the source, `base64`, `xxd`, `strings`, `od`, `nl`, `sort`, `uniq`, `cut`, `paste`, `fold`, `column`, `diff`, `comm`, `cmp`, `tac`, `rev`, `open`, `source`/`.`, `nc`, `tar`/`zip`, `curl -d/-F/-T/--data*`, a routed `mcp` call), at any command position (after `;`, `&&`, `|`, inside `$(…)`, backticks, `bash -c '…'`, `ssh host '…'`, `ssh host cmd …`), or is redirected in (`< ~/.aws/credentials`). A commit message, `echo`, or `cp .env.example .env` that only names the file passes. Known over-match: a `grep` whose search *pattern* is `.env` (`grep -rn '.env' src/`) asks. Any mutating command that touches the Reflex checkout, its setup files or its logs is also an `ask`, wherever the repo was cloned.
    **Local scripts.** `bash deploy.sh` says nothing about what it does, so Reflex reads the local
    file a command runs. It recognises:
    - `bash`, `sh` and `zsh x.sh` (quoted paths, `< x.sh` and options included);
@@ -140,10 +139,10 @@ hook (see the table in the README). Each adapter turns the agent's event into th
    Lines over 2,000 characters (minified bundles) are left out of the rules, and the script
    then counts as partly seen. If the scan takes more than 1.5 s, the command gets an `ask`
    instead of risking the hook's timeout.
-3. **Fast lane** (`rules.json` → `pass`) — known-safe steps: builds, tests, `mkdir`, `git add/commit`,
+3. **Fast lane** (`rules.json` → `pass`): known-safe steps: builds, tests, `mkdir`, `git add/commit`,
    pushing a non-main branch. A command passes when every segment is read-only or matches a fast-lane
    pattern. → **pass**, logged.
-4. **Jev** — the command (secrets redacted), its working directory, the environment context and
+4. **Jev**: the command (secrets redacted), its working directory, the environment context and
    the text the agent wrote right before this command and its last five commands (from the session
    transcript; if the command is not in the transcript yet, no intent is sent rather than an older one) are sent to
    TypeSafe with the six questions in `questions.json`. When the command runs a local script, its
@@ -151,7 +150,7 @@ hook (see the table in the README). Each adapter turns the agent's event into th
    to judge the script, not its name (`node clean.mjs` that deletes `$HOME` is an ask, not a pass).
    Answers are cached for 24 h per (command, cwd, environment, question-set version, model, script
    content), so an edited script is judged again.
-5. **Policy** (`policy.json`) — ordered gates over the answers; the first that fires wins,
+5. **Policy** (`policy.json`): ordered gates over the answers; the first that fires wins,
    otherwise `default_outcome` (`pass`). If Jev fails or times out, the policy's `fallback` (`ask`)
    applies. The last gate, `allow`, marks clearly safe commands; what that means depends on
    `REFLEX_ALLOW` (see [Calibrated allow](#calibrated-allow)).
@@ -237,9 +236,9 @@ resend passes. A batch whose every task is a duplicate is denied.
 - **Report:** `report.mjs` counts these checks on their own `subgoals` line.
 
 The same text again (ignoring case, spacing and a batch's shared context line) is a duplicate
-without asking Jev: Jev scores an option identical to the new subgoal low (0.2–0.3), apparently
+without asking Jev: Jev scores an option identical to the new subgoal low (0.2 to 0.3), apparently
 reading it as the new subgoal itself. On hand-made pairs with `subgoals-v3`, reworded duplicates
-scored 0.67–0.78 on the matching option, and ten legitimate follow-ups (tests for the same code,
+scored 0.67 to 0.78 on the matching option, and ten legitimate follow-ups (tests for the same code,
 another part, a review, a retry that says why, a narrower scope) scored at most 0.05.
 
 ponytail: each check reads the last 2 MB of `subgoals.jsonl` and `feedback.jsonl` and takes no lock
@@ -249,7 +248,7 @@ ponytail: each check reads the last 2 MB of `subgoals.jsonl` and `feedback.jsonl
 
 Four layers, cheapest first.
 
-### 1. Offline self-checks — every change
+### 1. Offline self-checks, on every change
 
 ```sh
 npm test
@@ -275,7 +274,7 @@ Prints decision, rule, source, Jev's answers and the environment context it saw.
 comes from your shell (`AWS_PROFILE`, current kube context, `.terraform/environment`, git branch),
 so run it from the same shell you start the agent from.
 
-### 3. Golden set — every change to questions, policy or rules
+### 3. Golden set, on every change to questions, policy or rules
 
 ```sh
 npm run eval                     # all cases
@@ -286,8 +285,8 @@ node eval.mjs --only terraform   # a subset
 `deny`, or a list when more than one is acceptable). The eval runs them through the real gate
 (cache off) and reports:
 
-- **MISS** — a risky command got a softer outcome than wanted (exit code 1; treat as a blocker);
-- **over** — stricter than wanted (friction; fix when it is common).
+- **MISS**: a risky command got a softer outcome than wanted (exit code 1; treat as a blocker);
+- **over**: stricter than wanted (friction; fix when it is common).
 
 A case can also carry `"allow": true` (a clearly safe command that should be allow-eligible;
 reported as `stiff` when it is not, never a failure) or `"allow": false` (must never be
@@ -430,7 +429,7 @@ the prompt but its deny and ask permission rules still apply.
 
 **Calibrate from your own approvals.** Run with `REFLEX_ALLOW=shadow` in enforce mode for a
 while. `node report.mjs` then shows, for the Jev-judged commands a human ruled on (asks it emitted
-in enforce mode, and in Claude Code the commands allow would have let through — logged
+in enforce mode, and in Claude Code the commands allow would have let through, logged
 `would_allow` or allowed on replay), how often you approved them (approved = the command ran), by
 blast and by confidence bucket, and recommends
 thresholds (illustrative output):
@@ -457,7 +456,7 @@ Everything lives in `setup/tool-gate/`. Bump the file's `version` on every chang
 on every log line, so any decision can be traced back to the exact rules and policy that made it.
 
 **Is it a fact? Write a rule or a fast-lane pattern.** An account ID, a branch name, a `--force`
-flag, a path under `envs/prod` — code decides these exactly and for free.
+flag, a path under `envs/prod`: code decides these exactly and for free.
 
 **Is it a judgment? Adjust a policy threshold or gate.** Gates look like:
 
@@ -490,14 +489,14 @@ and [confidence](https://docs.typesafe.ai/confidence).
 | `reflex_decisions` | `source`, `decision`, `mode`, `user` |
 | `reflex_latency_seconds` | `quantile` (0.5, 0.95, 0.99), `user` |
 | `reflex_asks` | `resolution` (approved, rejected, pending, unknown), `user` |
-| `reflex_replay_changes` | `user` — decisions the current policy file would flip |
+| `reflex_replay_changes` | `user`: decisions the current policy file would flip |
 | `reflex_input_tokens` | `user` |
 
 `dashboards/reflex.json` shows them in Grafana.
 
 ## Data handling
 
-- **What leaves the machine:** for commands that reach Jev only — the command with secrets
+- **What leaves the machine:** for commands that reach Jev only: the command with secrets
   redacted, the working directory path, environment names (AWS profile, region, kube context,
   terraform workspace, git branch), and the agent's last message and last five commands, also
   redacted and truncated, and the first 16 KB of a local script the command runs (a make recipe,
@@ -569,7 +568,7 @@ and [confidence](https://docs.typesafe.ai/confidence).
   keep `REFLEX_ALLOW` off where scripts can change under you. Symlinks are followed to their
   target; a FIFO or device is never opened.
 - Rules and the read-only list are pattern matching, not a shell parser. They are designed to
-  fail towards "ask Jev", not towards "pass", and the self-checks pin the known bypasses — but
+  fail towards "ask Jev", not towards "pass", and the self-checks pin the known bypasses, but
   treat them as a strong filter, not a sandbox. Keep IAM, network controls, and least-privilege
   credentials: Reflex supplements them.
 - Claude Code does not report a Bash exit code to hooks; Reflex records `ran` (exit 0) or
@@ -1179,7 +1178,7 @@ between repo directories, the one nearest the working directory wins. `examples/
 | pi, oh-my-pi | `before_agent_start` handler; appended to that turn's system prompt | yes, in the same `reflex.ts` extension |
 | opencode | `chat.message` picks the fragments; `experimental.chat.system.transform` appends them to the system prompt for the rest of the turn | yes, in the same `reflex.js` plugin. The system hook is marked experimental in opencode |
 | Hermes | `pre_llm_call` shell hook; the text is appended to the turn's user message | printed with the rest of the `hooks:` block |
-| `reflex-sh` | not supported, because the shell never sees the prompt | — |
+| `reflex-sh` | not supported, because the shell never sees the prompt | n/a |
 
 **Advisory, not safety.** Any failure injects nothing and never blocks a prompt: a bad fragment
 file, a Jev error or timeout, a missing key, or a crash. If only the Jev call fails, fragments
@@ -1230,7 +1229,7 @@ the agent only sees what it asks for (tiered disclosure):
 |---|---|---|
 | `find_tools(intent, limit?)` | 1 | one line per best-matching tool, with Jev's probability |
 | `describe_tool(name)` | 2 | the full description and argument schema of one tool |
-| `run(intent, tool?, args?)` | — | picks the tool (unless given), fills its arguments (unless given), validates, runs |
+| `run(intent, tool?, args?)` | n/a | picks the tool (unless given), fills its arguments (unless given), validates, runs |
 
 **The catalog** is the built-in command tools in `router/commands.json` whose binary is on `PATH`
 (`rg_search`, `grep_search`, `ast_grep`, `git_log`, `git_diff`, `git_blame`, `kubectl_get`,
@@ -1296,7 +1295,7 @@ naming the server, the tool and the exact arguments: `mcp github.list_issues {"o
 policy judge it the same way (in shadow mode Jev's verdict is only logged, as for shell commands).
 `deny` returns `denied`, `ask` returns `needs_approval`, and nothing is sent. Past the gate, the call is
 proxied as `tools/call` and its result (content and `structuredContent`) returned unchanged, after
-one line naming the tool — but only when its server annotates it `readOnlyHint: true` (and not
+one line naming the tool, but only when its server annotates it `readOnlyHint: true` (and not
 `destructiveHint`). A tool that is not annotated read-only returns `needs_approval` whatever the
 gate said: the agent's per-tool MCP permissions only see `run`, so a tool that may write must not
 hide behind it. Keep such servers registered directly in the agent.
@@ -1305,7 +1304,7 @@ annotation check entirely and run as the agent asks. Use it only for servers you
 wholesale. Downstream servers start with a
 minimal environment (`HOME`, `PATH`, `USER`, `SHELL`, `TERM`, `LOGNAME`, `TMPDIR`, `LANG`) plus their
 own `env`; shell tools get the router's environment without `TYPESAFE_API_KEY`. A command tool is expanded
-from its argv template and run with `execFile` — never through a shell — **after the Reflex gate
+from its argv template and run with `execFile` (never through a shell) **after the Reflex gate
 judges the exact command**, shell-quoted (`decideSafe`, agent `reflex-router`, with the intent as
 the stated task). `deny` returns `denied`; `ask` returns `needs_approval` and nothing runs (an MCP
 tool cannot prompt), so the agent asks you and runs it through its own, also gated, shell tool.
@@ -1326,7 +1325,7 @@ Adding a command tool is a JSON entry:
 `"{x}"` is replaced by argument `x`; `"{x...}"` splits an enum value on spaces (`"ec2 describe-vpcs"`);
 a nested array is a group kept only when all its placeholders have a value, and a boolean
 placeholder keeps its group when true. Write each argument's `description` as the idea, not the
-parameter name — it is what Jev matches the intent against. Add only commands you would let the
+parameter name: it is what Jev matches the intent against. Add only commands you would let the
 agent run unasked; the gate still judges each call.
 
 **Logs.** Every `find_tools` and `run` appends to `router.jsonl` in the data directory: the intent
@@ -1394,7 +1393,7 @@ Per request:
 3. **Jev**, one call, cached for an hour by a hash of the question state. The state is the last
    thing the user typed (tool results and `<system-reminder>` blocks removed), the first 400
    characters of the system prompt, the tool names, the file paths mentioned anywhere in the
-   conversation, and the turn number — all redacted. `paths_to_jev` decides how much of a path
+   conversation, and the turn number, all redacted. `paths_to_jev` decides how much of a path
    Jev sees: `shape_outside_repo` (default) sends paths inside the agent's working directory
    (read from Claude Code's "Primary working directory" or Codex's `<cwd>`) repo-relative, and any
    other path only as its file name with flags, e.g. `.../rds.tf [outside repo, sensitive]`;
@@ -1404,7 +1403,7 @@ Per request:
    | Question | Type | Meaning |
    |---|---|---|
    | `sensitivity` | choice | public / application / restricted / proprietary |
-   | `difficulty` | score 0–2 | small / medium / large model tier |
+   | `difficulty` | score 0 to 2 | small / medium / large model tier |
    | `needs_tools` | noul | does the answer need the offered tools |
 
    `restricted` is also taken when P(restricted) + P(proprietary) ≥ `restricted_at` (0.25), so a
@@ -1712,8 +1711,8 @@ with itself on 99 to 100 % of the individual answers. Laya is raw (no calibratio
 | model routing (27): sensitivity · **leaks** · tier | 27 · **0** · 26 | 7 · **0** · 10 | 8 · **0** · 10 | 12 · **4** · 10 | 8 · **0** · 10 | 8 · **0** · 10 |
 | tool router (15): ok · held · **unsafe** | 14 · 1 · **0** | 1 · 14 · **0** | 1 · 14 · **0** | 1 · 13 · **1** | 1 · 14 · **0** | 1 · 14 · **0** |
 | context (16): must-keep kept of 17 · hidden | 17 · 74 % | 17 · 8 % | 17 · 41 % | **15** · 58 % | (no context calibration) | |
-| answers agreeing with Jev: yes/no · choice · score (rounded) | 99–100 % | 35 % · 13 % · 10 % | 39 % · 46 % · 18 % | 36 % · 38 % · 17 % | 78 % · 13 % · 13 % | 78 % · 46 % · 17 % |
-| blast score, mean absolute difference from Jev (0–3) | 0.02 | 1.24 | 1.08 | 1.20 | 1.11 | 1.10 |
+| answers agreeing with Jev: yes/no · choice · score (rounded) | 99 to 100 % | 35 % · 13 % · 10 % | 39 % · 46 % · 18 % | 36 % · 38 % · 17 % | 78 % · 13 % · 13 % | 78 % · 46 % · 17 % |
+| blast score, mean absolute difference from Jev (0 to 3) | 0.02 | 1.24 | 1.08 | 1.20 | 1.11 | 1.10 |
 
 `multilingual` calibrated matched `english` calibrated within a case or two on every set except
 instructions (8 exact, precision and recall 0: calibration drove every fragment below the
@@ -1736,7 +1735,7 @@ everything:
   has no MISS.
 - **Guard.** `english` misses 5 high-severity injections raw (7 calibrated); `typed-decisions` and
   `multilingual` catch every injection raw but flag 25 to 28 of the 29 benign pages.
-- **Instructions, routing, tool router.** Far below Jev (2–9 of 20 against 20 of 20; 7–12 of 27
+- **Instructions, routing, tool router.** Far below Jev (2 to 9 of 20 against 20 of 20; 7 to 12 of 27
   sensitivity against 27; 1 of 15 tools against 14). `multilingual` leaks restricted prompts to a
   model not cleared for them (4) and would run a wrong tool call (1).
 
