@@ -570,18 +570,24 @@ const CD_WATCH = /(^|\/)(\.claude(\/(settings|hooks)\b.*)?|\.codex(\/(hooks|rule
 const cdWatched = d => CD_WATCH.test(d) || [HERE, CONFIG.data, dirname(USER_CONFIG_FILE)].some(p => (d + "/").startsWith(p + "/") || p.startsWith(d.replace(/\/$/, "") + "/"));
 // A cd, pushd or popd the directory tracking below reads writes nothing itself: its effect is the
 // resolved paths, each set on a line of its own so a rule cannot match across it and the command
-// text. One it cannot read is kept whole. `resolvedOnly`: only those lines.
-const writesView = (ps, resolvedOnly = false) => {
+// text. One it cannot read is kept whole, and then every cd in the command is (the tracking is not
+// trusted). A relative directory that is not watched as written is also tried against `cwd`
+// (`cd setup/tool-gate` in the checkout). `resolvedOnly`: only those lines.
+const writesView = (ps, resolvedOnly = false, cwd = null) => {
   const dirs = cdDirs(ps);
   return ps.map((p, i) => {
     const whole = !p.inert || /^[\s({!]*(cd|pushd|popd|for|select|case|while|until|if|export|local|declare|typeset|readonly|read|touch|mkdir)\b|^[\s({!]*\w+=/.test(p.core);
-    const view = resolvedOnly ? "" : dirs[i] === CD_STEP || !whole ? p.targets.map(t => `> ${t}`).join(" ") : p.text;
-    const at = typeof dirs[i] === "string" && cdWatched(dirs[i]) ? dirs[i] : null;
+    const view = resolvedOnly ? "" : (dirs[i] === CD_STEP && !dirs.unread) || !whole ? p.targets.map(t => `> ${t}`).join(" ") : p.text;
+    const d = typeof dirs[i] === "string" ? dirs[i] : null, abs = d && cwd && !/^[/~$]/.test(d) ? posix.join(cwd, d) : null;
+    // Inside the checkout its relative paths are judged as written (setup/…, gate.mjs), as without a cd.
+    const inside = cwd && (cwd + "/").startsWith(HERE + "/");
+    const at = d && cdWatched(d) ? d : abs && cdWatched(abs) ? (inside ? d : abs) : null;
     if (!at) return view;
     // the arguments of each command in the pipeline (not its name, not a URL) and the redirect targets
     const words = whole ? [...p.text.split("|").flatMap(s => s.replace(/[<>&;(){}]/g, " ").trim().split(/\s+/).slice(1)), ...p.targets]
       .flatMap(w => [w, w.replace(/^[^=]*=/, "")]).filter(w => !w.includes("://")) : p.targets;
-    return `${view}\n${words.map(w => w.replace(/["'\\]/g, "")).filter(w => w && !/^[-/~$]/.test(w)).map(w => `> ${posix.join(at, w)}`).join(" ")}\n`;
+    // a command run there that names no file (make, ./install.sh, vim) is marked by the directory itself
+    return `${view}\n${whole ? `> ${at}/ ` : ""}${words.map(w => w.replace(/["'\\]/g, "")).filter(w => w && !/^[-/~$]/.test(w)).map(w => `> ${posix.join(at, w)}`).join(" ")}\n`;
   }).filter(Boolean).join(" ; ");
 };
 // The directory each pipeline runs in, as far as the command line itself changes it: after
@@ -598,7 +604,9 @@ function cdDirs(ps) {
   const sub = s => s.replace(/\$\{?(\w+)\}?/g, (v, n) => n in vars && !new RegExp(String.raw`\b(for|select)\s+${n}\b|(^|[;&|(\s])read\s[^;&|\n]*\b${n}\b`).test(all) ? vars[n] : v);
   const stack = [], scopes = [], home = s => sub(s).replace(/^(\$HOME|\$\{HOME\})(?=\/|$)/, "~");
   const go = to => { [old, dir] = [dir, /^[/~$]/.test(to) ? to : posix.join(dir ?? ".", to)]; };
-  return ps.map(p => {
+  // CDPATH changes where a relative cd goes
+  let unread = /\bCDPATH=/.test(all);
+  const out = ps.map(p => {
     if (/^\s*(export\s+)?\w+=/.test(p.core))
       for (const [, n, v] of p.core.matchAll(/(?:^|\s)(\w+)=(\S*)/g)) if (/^[\w./~@%+:,-]*$/.test(v) && n !== "HOME") vars[n] = v; else delete vars[n];
     const m = maskQuotes(p.text, "_"), count = re => (m.match(re) ?? []).length;
@@ -609,15 +617,19 @@ function cdDirs(ps) {
     if (cmd) {
       const arg = cmd[3] === undefined ? undefined : home(cmd[3].replace(/["'\\]/g, ""));
       here = CD_STEP;
-      if (cmd[1] === "popd") [old, dir] = [dir, stack.pop() ?? null];
+      // pushd with no directory swaps the top two, pushd/popd ±N rotate the stack: not followed
+      if ((cmd[1] === "pushd" && arg === undefined) || (cmd[1] !== "cd" && /^[+-]\d+$/.test(arg ?? "")) || (cmd[1] === "popd" && arg !== undefined)) unread = true;
+      else if (cmd[1] === "popd") [old, dir] = [dir, stack.pop() ?? null];
       else if (cmd[1] === "pushd") { stack.push(dir); if (arg !== undefined) go(arg); }
       else if (arg === "-") [dir, old] = [old, dir];
       else go(arg ?? "~");
-    } else if (/^[\s({!]*(builtin\s+|command\s+)?(cd|pushd|popd)\b/.test(p.core)) here = dir;   // unread: kept whole
+    } else if (/^[\s({!]*(builtin\s+|command\s+)?(cd|pushd|popd)\b/.test(p.core)) unread = true;   // unread: kept whole
     const closes = count(/\)/g) - count(/\(/g);
     for (let k = 0; k < closes && scopes.length; k++) { const s = scopes.pop(); [dir, old] = s; stack.length = Math.min(stack.length, s[2]); }
     return here;
   });
+  out.unread = unread;
+  return out;
 }
 // Only inert pipelines writing notes (Markdown, text, logs, CSV) or nothing: there is no shell
 // command in it for a "shell" rule to find, whatever its quoted text says (echo '… rm -rf / …' >> MEMORY.md).
@@ -920,8 +932,24 @@ function nestedCheckout(cwd) {
 // when there are none or dropping them leaves the quotes unbalanced (then it is not what the shell reads).
 const QUOTED_PART = /(?<=[^\s;&|<>()'"\\])(['"])([^'"\s;&|<>()$`\\]*)\1|(?<![\\'"])(['"])([^'"\s;&|<>()$`\\]*)\3(?=[^\s;&|<>()'"])/g;
 const joinQuotes = s => { const j = s.replace(QUOTED_PART, "$2$4"); return j !== s && (maskQuotes(j, "_") !== j || !/['"]/.test(j)) ? j : null; };
-/** Everything decided without Jev, or null when Jev has to judge. */
+// The command as the rules know it: quoted word parts joined, /bin/cat and /usr/bin/cat as cat,
+// `timeout -k1 5 cat` as `timeout 5 cat` (readOnly accepts those spellings, so the rules must see
+// through them too). null when nothing changes.
+const TIMEOUT_OPTS = new RegExp(String.raw`\btimeout((\s+(-[fpv]+|-[ks]\s*[^\s-]\S*|--(foreground|preserve-status|verbose)|--(kill-after|signal)(=|\s+)[^\s-]\S*))+)(?=\s+[^\s-])`, "g");
+const ruleSpelling = s => {
+  const v = (joinQuotes(s) ?? s).replace(/(^|[\s;&|(`]|\$\()\/(usr\/)?bin\/(?=[\w.-]+(\s|$))/g, "$1").replace(TIMEOUT_OPTS, "timeout");
+  return v !== s ? v : null;
+};
+const SEVERITY = {deny: 2, ask: 1};
+/** Everything decided without Jev, or null when Jev has to judge. A rule that fires on the command
+ * as the rules know it (ruleSpelling) counts too; the more severe of the two rule outcomes wins. */
 export function precheck(command, cwd, env) {
+  const own = precheckAs(command, cwd, env), alt = ruleSpelling(command.replace(/\\\n/g, ""));
+  const other = alt ? precheck(alt, cwd, env) : null;
+  if (other?.source !== "rule") return own;
+  return own?.source === "rule" && (SEVERITY[own.outcome] ?? 0) >= (SEVERITY[other.outcome] ?? 0) ? own : other;
+}
+function precheckAs(command, cwd, env) {
   const rules = load("rules.json");
   // The shell deletes a backslash-newline: `git push --force \⏎ origin main` is one line.
   command = command.replace(/\\\n/g, "");
@@ -929,10 +957,6 @@ export function precheck(command, cwd, env) {
   // --secret-id=prod-db), minus heredoc bodies that are only data.
   const haystack = [stripDataHeredocs(command),`cwd=${cwd ?? ""}`, ...Object.entries(env).map(([k, v]) => `${k}=${v}`)].join(" ");
   const ruled = r => ({outcome: r.outcome, rule: r.rule, id: r.id, source: "rule", policy_version: rules.version});
-  // The shell joins quoted parts of a word (m''ain, 'ma'in, ma"st"er are main and master): a rule
-  // also reads the command with those quotes dropped.
-  const joined = joinQuotes(command);
-  if (joined) { const r = precheck(joined, cwd, env); if (r?.source === "rule") return r; }
   // Some rules must see reads too (printing an API key is a read).
   const bare = stripDataHeredocs(command), ctx = haystack.slice(bare.length);
   const early = checkRules(haystack, {rules: rules.rules.filter(r => r.before_read_only)}, bare);
@@ -943,7 +967,7 @@ export function precheck(command, cwd, env) {
   // Quotes and backslashes are dropped, as the shell drops them: ~/.claude/'settings.json' is the file.
   // When the text hides what runs (a $, a heredoc), the whole command counts, plus the paths a cd
   // in it points relative ones at (cd "$HOME/.claude" && tee settings.json).
-  const ps = pipelines(command), writes = (ps ? writesView(ps) : `${bare} ; ${writesView(roughPipelines(bare), true)}`).replace(/["'\\]/g, "");
+  const ps = pipelines(command), writes = (ps ? writesView(ps, false, cwd) : `${bare} ; ${writesView(roughPipelines(bare), true, cwd)}`).replace(/["'\\]/g, "");
   // The checkout itself is protected wherever it was cloned, not only under a directory named reflex.
   // A git worktree or clone nested inside it is another checkout, unless the command climbs out (..).
   const inRepo = cwd && (cwd + "/").startsWith(HERE + "/") && !(nestedCheckout(cwd) && !/(^|[\s/'"=:])\.\.([\s/'";&|)]|$)/.test(command));
@@ -1805,8 +1829,22 @@ async function selfcheck() {
     ok(pw(c) === "force-push-unknown-branch", `force push, branch unknown: ${c}`);
   ok(checkRules("git push -f origin HEAD cwd=/w git_branch=feat/x", rules)?.id !== "force-push-unknown-branch" && pw("git push origin HEAD") !== "force-push-unknown-branch" &&
      pw("git push -f origin HEAD:feat/x") === null, "force push: a known branch or an explicit ref is not unknown");
+  // review: the spellings readOnly accepts (/bin/cat, timeout -k1) are the ones the rules read too
+  for (const c of ["/bin/cat .env", "/usr/bin/xxd ~/.ssh/id_rsa", "rtk proxy /bin/cat .env", "ssh h /bin/cat .env", "docker exec c /bin/cat .env", "docker exec c cat .env",
+    "docker exec -u root -w /app c cat .env", "timeout -k1 5 cat .env", "timeout --signal=KILL 5 cat ~/.ssh/id_rsa", "timeout -k1 5 kubectl get secret x -o yaml",
+    ". -- .env", "ssh h find . -name .env -exec cat {} +", "security find-generic-password -s x -w >/dev/null >&2", "security find-generic-password -s x -w >/dev/null 1>&2",
+    "security find-generic-password -s x -w -g >/dev/null", "security find-generic-password -s x -w >/dev/null 2>&1 >k.txt; cat k.txt"])
+    ok(/^secret-(file-)?read$/.test(pw(c)), `secret read: ${c}`);
+  ok(pw("cat .'env'; rm -rf /") === "rm-root" && pw("docker exec c cat /etc/hostname") === null, "the more severe rule wins; a container read of a plain file");
+  // review: a cd the tamper rule must still see (relative in the checkout, a command naming no file, pushd rotations)
+  for (const c of ["cd setup/tool-gate && sed -i s/deny/ask/ rules.json", "(cd setup/tool-gate && cp /tmp/r rules.json)", "cd router/ && rm x.mjs", "cd .git/hooks && echo x > pre-commit"])
+    ok(pw(c, HERE) === "tamper", `tamper, a relative cd in the checkout: ${c}`);
+  for (const c of ["cd ~/.claude/hooks && make", "cd ~/.claude/hooks || exit; make", "cd ~/.config/reflex && vim", "cd ~/.claude/hooks && rm -- -x",
+    "pushd ~/.claude/hooks; pushd /tmp; pushd; tee gate.sh < /tmp/x", "pushd ~/.claude/hooks; pushd /tmp; pushd +1; tee gate.sh < /tmp/x",
+    "pushd /tmp; pushd ~/.claude/hooks; popd +1; tee gate.sh < /tmp/x"]) ok(pw(c) === "tamper", `tamper after cd: ${c}`);
   // node --check is the fast lane only without a preload or an env file
-  for (const c of ["node --check -r ./p.js x.js", "node --check --import ./p.mjs x.js", "node --check x.js --require=./p.js", "node --check --env-file=.env.test x.js"])
+  for (const c of ["node --check -r ./p.js x.js", "node --check --import ./p.mjs x.js", "node --check x.js --require=./p.js", "node --check --env-file=.env.test x.js",
+    "node --check --run build", "node --check --build-snapshot e.js"])
     ok(!fastPass(c, rules), `not fast lane: ${c}`);
   ok(fastPass("node --check x.js", rules), "node --check alone is the fast lane");
   // the checkout: committing its files is not changing them; a worktree nested in it is another checkout unless the command climbs out

@@ -20,8 +20,20 @@ All notable changes to Reflex are documented here. The format follows
   known asks, before the engine (new rule `force-push-unknown-branch`, rules-v14).
 - `git push --force origin m''ain` (and `'ma'in`, `ma""ster`): the shell joins quoted parts of a
   word, so the rules now also read the command with those quotes dropped. `force-push-main` denies.
-- `node --check` with `-r`, `--require`, `--import`, `--loader`, `--env-file` or a config file is no
-  longer the fast lane: those still load code before the syntax check.
+- `node --check` with `-r`, `--require`, `--import`, `--loader`, `--env-file`, a config file, `--run`
+  or `--build-snapshot` is no longer the fast lane: those still run code before or instead of the
+  syntax check.
+- Rules also read the command as readOnly reads it (`/bin/cat` as `cat`, `timeout -k1 5 cat` as
+  `timeout 5 cat`), and the more severe of the two rule outcomes wins, so a new read-only spelling
+  cannot skip `secret-file-read` and a joined spelling cannot turn a deny into an ask.
+- `docker exec c cat .env` (and `~/.aws/credentials`, a private key) was read-only: the
+  secret-file rule now reads the command a container runs. `find … -name .env … -exec` asks.
+- `secret-read` keeps firing when the key goes to `/dev/null` and then somewhere else
+  (`>/dev/null >&2`, `>/dev/null 1>&2`, a later `>file`), or with `-g`.
+- A relative cd in the checkout (`cd setup/tool-gate && sed -i … rules.json`), a command that names
+  no file after a cd into a watched directory (`cd ~/.claude/hooks && make`), and `pushd`/`popd`
+  rotations the tracker does not follow (bare `pushd`, `pushd +1`, `popd +1`, `CDPATH`) keep every
+  cd in the command visible to `tamper`.
 
 ### Fixed
 
@@ -32,7 +44,8 @@ All notable changes to Reflex are documented here. The format follows
     `ip ne s`, `ip l l`, `ip r g`, `ip n g`, `ip addre l`. `ip l s` (link set) and `ip r sa` still ask.
   - `timeout -k1 5 ssh h uptime` and `timeout --signal=KILL 5 …`: timeout's options are read.
   - `ssh h find . -name .env` lists files; `.` there is a path, not the source builtin.
-  - `/usr/bin/grep`, `/bin/cat`, `/usr/bin/git log`: a program from `/bin` or `/usr/bin` is that program.
+  - `/usr/bin/grep`, `/bin/cat`, `/usr/bin/git log`: a program from `/bin` or `/usr/bin` is that program
+    (and the rules read it as that program).
 - False positives from a replay of a real week:
   - `jq -r '.env // {} | keys' ~/.claude/settings.json` read the jq field as a `.env` file. Inside
     a quoted word a file name now ends at the quote.

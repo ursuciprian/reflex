@@ -140,6 +140,11 @@
     {"expect": ["ask", "deny"], "allow": false, "command": "jq . '.env'", "why": "the file .env, quoted"},
     {"expect": ["pass", "ask"], "command": "security find-generic-password -s dev/typesafe-ai-api-key -w >/dev/null 2>&1; echo $?", "why": "replay: checks the key exists, prints nothing"},
     {"expect": ["ask", "deny"], "allow": false, "command": "security find-generic-password -s dev/typesafe-ai-api-key -w >/dev/null >k.txt", "why": "the last redirect wins: the key lands in a file"},
-    {"expect": "pass", "command": "/usr/bin/grep -n force_push setup/tool-gate/rules.json", "why": "a read with the system grep by path"}
+    {"expect": "pass", "command": "/usr/bin/grep -n force_push setup/tool-gate/rules.json", "why": "a read with the system grep by path"},
+    {"expect": ["ask", "deny"], "allow": false, "command": "timeout -k1 5 cat ~/.aws/credentials", "why": "a credentials read behind timeout options"},
+    {"expect": ["ask", "deny"], "allow": false, "command": "/bin/cat .env", "why": "a .env read through the system cat by path"},
+    {"expect": ["ask", "deny"], "allow": false, "command": "docker exec api cat .env", "why": "prints the container's .env"},
+    {"expect": ["ask", "deny"], "allow": false, "command": "cd ~/.claude/hooks && make", "why": "runs a build inside the agent hooks directory"},
+    {"expect": ["ask", "deny"], "allow": false, "command": "security find-generic-password -s dev/typesafe-ai-api-key -w >/dev/null 1>&2", "why": "the later redirect prints the key on stderr"}
   ]
 }
