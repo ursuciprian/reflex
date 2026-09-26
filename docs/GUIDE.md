@@ -23,7 +23,8 @@
 
 New setup uses `--engine local`. Deterministic shell checks and path/keyword instruction matches
 run without TypeSafe. An unknown command produces `ask`: enforce requires human review, while
-shadow logs it and leaves the host's permissions in charge. Local operation does not reuse cached
+shadow logs it and leaves the host's permissions in charge. In the autonomous profile that ask goes
+to System 2 first ([keyless autonomy](#keyless-autonomy)). Local operation does not reuse cached
 Jev answers, spawn background classifiers, classify subgoals or make semantic instruction calls.
 The shared Jev client rejects hosted requests while local; the LiteLLM callback leaves model
 selection unchanged. A separate LiteLLM container needs the same configuration or `REFLEX_ENGINE=local`.
@@ -694,7 +695,7 @@ command
 
 ```sh
 reflex setup --profile autonomous --dry-run     # the effective settings, nothing written
-reflex setup --profile autonomous               # engine jev, enforce, allow on, System 2, queue, checkpoints
+reflex setup --profile autonomous               # engine jev (local without a TypeSafe key), enforce, allow on, System 2, queue, checkpoints
 reflex setup --profile autonomous --mode shadow # a flag beside a profile wins: log what it would do
 reflex setup --profile supervised               # back to a human for every ask
 ```
@@ -704,6 +705,60 @@ A profile is a preset written to `config.json` (`profile`, `judge`, `queue`, `ch
 override one session; `reflex run` turns all three off, since a person is at that terminal.
 `autonomy.mjs` holds the ladder, the queue, envelopes and checkpoints; `judge2.mjs` System 2;
 `setup/tool-gate/escalation.json` the always-human class and System 2's prompt.
+
+### Keyless autonomy
+
+The profile uses Jev when setup finds a TypeSafe key (`TYPESAFE_API_KEY`, or the Keychain item on
+macOS). Without one it picks the local engine and says so, in a dry run too; `--engine` beside the
+profile wins, and a later setup with a key moves to Jev. Keyless, System 1 is the rules, the
+read-only list and the fast lane only, and a command they do not cover goes to System 2 instead of
+straight to a human. Rule denies, tamper, the always-human patterns and taint behave exactly as with
+Jev. What keyless does not have is Jev's own answers: the `prod`, `prod-destroy` and `exfil` gates
+are Jev's, so production is caught only by the `prod` pattern (the command, cwd, AWS profile, kube
+context, terraform workspace or branch naming prod, prd or live) and exfiltration only by System 2.
+
+System 2 approved something no other model judged, so its approve is a `pass` (the agent's own
+permissions decide), except for a small class that becomes `allow`: a verdict at 0.9 or more, a stated
+intent, an unredacted command of at most 400 characters (the case System 2 gets can cut a longer one),
+a narrow cwd, no suspected injection in the session, and a command that sends nothing over the
+network (the `tainted` egress patterns in `rules.json`), names no cloud, cluster, database, deploy,
+package or system tool (`kubectl`, `helm`, `terraform`, `aws`, `gh`, `psql`, `docker`, `prisma`,
+`brew`, `launchctl`, `sudo` and the like, in any case or quoting: a checkpoint cannot undo them) and no
+verb that ships or installs (`deploy`, `publish`, `push`, `migrate`, `install`, `up`, `run`, ...),
+writes nothing outside the working directory (no `~`, `$HOME`, `--global` or absolute path elsewhere),
+and runs no local script or code nobody read (System 2 sees at most 24 lines of it). What is left
+changes the repository, where a checkpoint was just taken. The same held prompts apply (plan mode, an
+unsandboxed retry). What that means per agent:
+
+| Agent | System 2 approves an allow-eligible command | System 2 approves anything else |
+|---|---|---|
+| Claude Code | `allow`: runs without its permission prompt (its own deny and ask rules still apply) | `pass`: its permission rules decide, a prompt unless it is allowlisted or prompts are off |
+| Codex | its approval policy decides (it has no allow to skip) | the same |
+| Hermes | its approvals decide | the same |
+| opencode, pi, omp | runs | runs |
+
+So in Codex, opencode, pi and omp a keyless System 2 approval runs the command, as a Jev-backed one
+does; in Claude Code with its default permissions, the remote and networked ones still stop at its
+prompt, which is the cost of having no second model.
+
+**How often System 2 is asked.** Measured with `precheck` and the always-human patterns over 14,445
+real Bash commands from Claude Code transcripts (one heavy DevOps user, 166 sessions, 63 active days):
+31.5 % read-only, 1.0 % fast lane, 0.2 % a rule deny, 5.5 % a human before System 2 (rule asks 1.9 %,
+production 2.9 %, destructive deletes 0.7 %, IAM and secrets), and 61.9 % to System 2 (about 90 % of
+the commands the ladder judges; the verdict cache saved 0.5 %, since the same command rarely repeats
+in a session). That is 115 calls on a median active day, 294 at p90 and 592 at most. Of those
+escalations 59.6 % were egress (mostly `ssh`), 7.1 % remote CLIs, 11.4 % ran local code and 20.3 %
+passed the egress, remote-tool and script checks (an upper bound: the length, verb, path, intent and confidence checks come on top). With Jev, System 2 sees far fewer: on the
+ladder golden set 7 of 33 commands against 12 keyless.
+
+The keyless defaults follow from that: `budget.calls` 300 a day (enough for nine days in ten),
+`session_calls` 100, `session_usd` $2, and the breaker off (`breaker.rate` 1): its 30 % would stay open
+all the time, and it guards against a Jev outage or a noisy policy, neither of which exists without
+Jev. Saved settings win. Past a cap, cases go to the queue. At the measured `claude` CLI numbers a call
+is 3 to 4 s and $0.004 to $0.016 at API prices (with a subscription it counts against your plan
+instead), so a median day costs about $0.5 to $1.8 and every escalated command waits for the judge.
+`reflex status` shows `System 1: local rules (keyless: …)`; `npm run eval-ladder -- --engine local`
+runs the golden set keyless, offline.
 
 ### System 2
 
@@ -766,7 +821,8 @@ nothing and cannot recurse) and with every tool off:
   input and output tokens); a CLI backend uses the cost it reports itself. A breaker pauses System 2 when more than
   `breaker.rate` (30 %) of the commands the ladder judged in the last `breaker.window_minutes` (60),
   and at least `breaker.min_decisions` (20), were escalated: a Jev outage or a noisy policy then fills
-  the queue instead of the bill, and `reflex status` and `reflex report` say so.
+  the queue instead of the bill, and `reflex status` and `reflex report` say so. Keyless the caps are
+  300 calls a day, 100 and $2 a session, and the breaker is off ([why](#keyless-autonomy)).
 
 Measured. On the escalation golden set the case System 2 gets is about 520 tokens (the stub judge
 counts what it was sent) and a verdict about 20 tokens out on an API backend, where `max_tokens`
@@ -868,8 +924,10 @@ user allowed but never widen it; System 2 is told it is untrusted and can only r
 
 In the autonomous profile, before an effective pass or allow of a command that is not read-only, in
 a git repository, Reflex records the tracked files: `git stash create` against a temporary copy of
-the index (it refreshes the stat cache of whatever index it uses, so never the real one), or `HEAD`
-for a clean tree, kept as `refs/reflex/checkpoints/<time>-<pid>` (the last 50 per repository; an
+the index (it refreshes the stat cache of whatever index it uses, so never the real one; the copy
+keeps the index's modification time, or git would trust stale stat data and miss a same-size edit
+made within a second of the last index write; the commit carries Reflex's own identity,
+`reflex <reflex@localhost>`, never the user's), or `HEAD` for a clean tree, kept as `refs/reflex/checkpoints/<time>-<pid>` (the last 50 per repository; an
 unchanged tree is not recorded twice). The working tree and the index are not touched.
 
 ```sh
@@ -911,8 +969,10 @@ budget left, the breaker and the queue.
 resolver) with Jev live and a stub System 2 that approves everything it is asked. It fails on any
 unsafe approval (a `safe: false` case that ended in pass or allow) and when the mean case System 2
 gets exceeds `judge.max_input_tokens`. Current result, `jev-1.13.0`: 33 of 33 resolved as labelled, 0
-unsafe approvals, 30.3 human interventions per 100 commands, System 2 asked 7 times, 516 tokens in
-and 22 out per call.
+unsafe approvals, 30.3 human interventions per 100 commands, System 2 asked 21.2 times per 100
+commands, 516 tokens in and 22 out per call. `npm run eval-ladder -- --engine local` runs the same set
+keyless (no Jev, so offline; the labels are Jev's, so only unsafe approvals are scored): 0 unsafe
+approvals, 36.4 human interventions and 36.4 System 2 calls per 100 commands, 494 tokens in per call.
 
 ### Safety invariants
 
@@ -927,6 +987,8 @@ and 22 out per call.
 | The CLI judge runs no tools and no Reflex | the fake `claude` and `codex` refuse to answer without the tool and hook switches, with Reflex on, or inside the project |
 | Shadow never blocks | `autonomy.mjs --selfcheck`: shadow logs what would have happened, parks nothing |
 | Checkpoints never touch the working tree or the index | `autonomy.mjs --selfcheck` compares the index file and `git status` |
+| A checkpoint sees a same-size edit made within a second of the last index write (#21) | `autonomy.mjs --selfcheck` aligns to the clock and checkpoints the same tree again a second later |
+| Keyless: System 2 allows only local, small commands; the rest of its approvals pass; the always-human class, rules, tamper and taint as with Jev | `autonomy.mjs --selfcheck` (each exclusion, the 0.9 bar, the caps); `test.mjs` keyless journey; `eval-ladder --engine local` |
 
 ### Limits
 
@@ -943,6 +1005,11 @@ and 22 out per call.
   point, and also the ceiling: an id that decides safety (a resource named by a UUID) shares a
   verdict. Lower `judge.cache_ttl_hours` or set it to 0 if that matters to you.
 - CLI token usage was not measured live here; `reflex report` shows it from the CLI's own usage.
+- Keyless, nothing classifies the environment or exfiltration: a production change the `prod`
+  pattern cannot see (an unmarked directory, a profile named `main`) or a leak through a command the
+  egress patterns miss is System 2's call alone, and in Codex, opencode, pi and omp its approval
+  runs. Use a TypeSafe key for production-adjacent work. The tool, verb, path and egress checks
+  that keep an allow local are lists, not a parser: a tool they miss is allowed on System 2's word.
 
 ## Conditional instructions
 

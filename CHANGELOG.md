@@ -6,8 +6,39 @@ All notable changes to Reflex are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Keyless autonomy: `reflex setup --profile autonomous` without a TypeSafe key picks the local engine
+  and says so (dry run too); with a key it stays on Jev, and `--engine` beside the profile wins.
+  Commands the local rules do not cover go to System 2 instead of straight to a human; rule denies,
+  tamper, the always-human class and taint behave as with Jev. A keyless System 2 approve is a pass,
+  except that it allows (skipping Claude Code's prompt) at confidence 0.9 or more for a short command
+  with a stated intent whose effects stay in the working directory: no network egress, no cloud,
+  cluster, database, deploy, package or system tool, no shipping or installing verb, no write outside
+  the working directory, no local script. Keyless defaults: 300 System 2 calls a day, 100 and $2
+  a session, breaker off, from a measurement of 14,445 real Bash commands (62 % would reach System 2,
+  115 calls on a median day, 294 at p90). `reflex status` / `doctor` show `system1`.
+- `npm run eval-ladder -- --engine local`: the ladder golden set keyless and offline; 0 unsafe
+  approvals, 36.4 human interventions and 36.4 System 2 calls per 100 commands.
+- Injection guard: the phrase detectors also read text spaced out letter by letter
+  (`I g n o r e   p r e v i o u s`, with spaces, no-break, thin or ideographic spaces); a phrase
+  there counts like a plain one, so a spaced override next to a command blocks and a quotation Jev
+  judges informative passes.
+- Injection golden set (`injection-golden-v3`, 62 cases): paraphrases split across two chunks, on
+  one long line, at the top, middle and end of long pages, a letter-spaced override, and benign
+  letter-spaced headings, a long field guide on prompt injection and a long coding-agent README.
+
 ### Fixed
 
+- Checkpoints could miss a same-size edit made within a second of the last index write and fall back
+  to `HEAD` (the flaky macOS selfcheck, #21): the temporary index copy got a fresh modification time,
+  so git trusted stale stat data. The copy now keeps the index's time; checkpoint ref names are
+  unique within a process; the selfcheck exercises the race on every run.
+- Checkpoint commits carry Reflex's own identity (`reflex <reflex@localhost>`), so they never depend
+  on a git `user.name` / `user.email` the machine may not have; `npm test` passes with none set.
+- `reflex setup` also adds a new version's gates, params and flags to a user copy of the injection
+  policy (`~/.config/reflex/injection/policy.json`), as it does for the tool-gate policy; it never
+  creates one, and never changes or reorders the user's entries.
 - Injection guard: a long paraphrased injection whose short last section was judged on its own
   (golden case `paraphrase-past-eight-chunks`) passed about one run in three (#19). A piece under
   1,000 characters now goes to Jev with a neighbour when both fit in a chunk, else with the lines
@@ -18,15 +49,6 @@ All notable changes to Reflex are documented here. The format follows
   Five live runs: 0 missed, precision 97 %, recall 100 %, no new false positive; input tokens on
   the previous 53 cases 72,350 before, 71,807 after.
 
-### Added
-
-- Injection guard: the phrase detectors also read text spaced out letter by letter
-  (`I g n o r e   p r e v i o u s`, with spaces, no-break, thin or ideographic spaces); a phrase
-  there counts like a plain one, so a spaced override next to a command blocks and a quotation Jev
-  judges informative passes.
-- Injection golden set (`injection-golden-v3`, 62 cases): paraphrases split across two chunks, on
-  one long line, at the top, middle and end of long pages, a letter-spaced override, and benign
-  letter-spaced headings, a long field guide on prompt injection and a long coding-agent README.
 
 ## [0.5.0] - 2026-09-25
 

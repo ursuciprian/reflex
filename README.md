@@ -134,8 +134,8 @@ command
 ```
 
 ```sh
-reflex setup --profile autonomous          # Jev, enforce, calibrated allow, System 2, queue, checkpoints
-reflex setup --profile autonomous --dry-run
+reflex setup --profile autonomous          # Jev (local without a key), enforce, calibrated allow, System 2, queue, checkpoints
+reflex setup --profile autonomous --dry-run  # no TypeSafe key? it says so and goes keyless
 reflex envelope set "may modify this repo and the dev AWS account (profile dev); nothing in prod"
 reflex queue                               # list what waits; reflex queue approve <id> | deny <id>
 reflex checkpoints                         # recovery points taken before mutations
@@ -154,6 +154,13 @@ reflex checkpoints                         # recovery points taken before mutati
   cache so a retry or the same command with another id never asks twice, optional cheaper tiers
   before the frontier model, daily and per-session caps, and a breaker that pauses System 2 when
   more than 30 % of the last hour's commands escalated.
+- **Keyless**: without a TypeSafe key the profile uses the local engine, and what the local rules do
+  not cover goes to System 2 instead of a human. With no second model behind it, System 2 alone
+  allows only short commands whose effects stay in the working directory (no network, no cloud,
+  cluster, database, deploy or install tool, no script it could not read in full, nothing under
+  `~`); its other approvals leave the decision to the agent's own permissions. Measured on real
+  history, System 2 then sees most non-read-only commands, so the daily cap is 300 calls
+  ([GUIDE](docs/GUIDE.md#keyless-autonomy)).
 - **Always human**: production changes, IAM and permission changes, writing secrets, destructive
   deletes, money and billing APIs, network egress after a suspected prompt injection, and anything a
   deterministic rule decided. Neither System 1 nor System 2 can approve these.

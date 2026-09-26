@@ -95,10 +95,15 @@ function ask(question, secret) {
 // Profiles are presets written to config.json; a flag given next to one still wins. supervised is
 // the behaviour Reflex always had: a human answers every ask in the agent. autonomous puts System 2
 // and an async human queue in front of the human (autonomy.mjs, docs/GUIDE.md#autonomous-agents).
+// Its engine is Jev when a TypeSafe key is there, else local (keyless): the rules, the read-only list
+// and the fast lane decide what they cover and System 2 judges the rest.
 const PROFILES = {
   supervised: {judge: "none", queue: false, checkpoints: false},
-  autonomous: {engine: "jev", mode: "enforce", allow: "on", judge: "auto", queue: true, checkpoints: true},
+  autonomous: {engine: "auto", mode: "enforce", allow: "on", judge: "auto", queue: true, checkpoints: true},
 };
+// A TypeSafe key where the hooks will look: the environment, or the Keychain item on macOS.
+const hasKey = keychain => !!ENV.TYPESAFE_API_KEY?.trim() ||
+  (platform() === "darwin" && spawnSync("security", ["find-generic-password", "-s", keychain], {stdio: "ignore", timeout: 2000}).status === 0);
 const SETUP_OPTIONS = ["--mode", "--allow", "--agents", "--keychain", "--node", "--engine", "--profile", "--judge", "--judge-cli", "--judge-url",
   "--judge-model", "--judge-key-env", "--judge-keychain", "--judge-timeout", "--judge-budget-calls", "--judge-budget-usd", "--queue", "--queue-ttl",
   "--notify", "--checkpoints"];
@@ -158,14 +163,17 @@ function ladderSettings(preset) {
   return {judge, queue, checkpoints: onOff("--checkpoints", preset.checkpoints ?? saved.checkpoints ?? false), detected};
 }
 function describe(s) {
-  const j = judgeSettings(s.judge), q = {...QUEUE_DEFAULTS, ...s.queue};
+  const j = judgeSettings(s.judge, undefined, s.engine), q = {...QUEUE_DEFAULTS, ...s.queue};
   const key = j.key_env && ENV[j.key_env]?.trim() ? `$${j.key_env} (set)` : j.keychain ? `Keychain item ${j.keychain}`
     : j.key_env ? `$${j.key_env} (not set)` : "none (a keyless endpoint)";
   const where = j.backend === "cli" ? `cli ${j.cli} (${j.command ?? "not found"}), model ${j.model ?? "the CLI's default (pin one with --judge-model)"}, no API key`
     : `${j.backend} ${j.url}, model ${j.model}, key ${key}`;
   const picked = !s.detected ? "" : j.backend === "cli" ? " [picked because claude is installed; --judge anthropic|openai-compatible|none to change]"
     : j.backend === "anthropic" ? " [picked because ANTHROPIC_API_KEY is set; --judge to change]" : " [no claude CLI and no ANTHROPIC_API_KEY; --judge to pick one]";
-  return [`profile ${s.profile} · engine ${s.engine} · mode ${s.mode} · allow ${s.allow}`,
+  const keyless = !s.keyless ? [] : [`engine local: no TypeSafe key found ($TYPESAFE_API_KEY or Keychain item ${s.keychain}), so this is keyless autonomy: ` +
+    (j.enabled ? "commands the local rules do not cover go to System 2 instead of Jev; System 2 alone allows only small commands (docs/GUIDE.md#keyless-autonomy)"
+      : "with no System 2 either, every command the local rules do not cover waits in the approval queue") + "; add a key and rerun for Jev"];
+  return [`profile ${s.profile} · engine ${s.engine} · mode ${s.mode} · allow ${s.allow}`, ...keyless,
     `System 2: ${j.enabled ? `${where}; timeout ${j.timeout_ms / 1000} s; case capped at ${j.max_input_tokens} tokens; budget ${j.budget.calls} calls${j.backend === "cli" ? "" : ` / $${j.budget.usd}`} a day` : "none (uncertain decisions go to a human)"}${picked}`,
     `queue: ${q.enabled ? `on (approvals valid ${q.ttl_hours} h, notify ${q.notify ? "on" : "off"})` : "off (a human answers in the agent)"} · checkpoints: ${s.checkpoints ? "on" : "off"}`];
 }
@@ -187,14 +195,15 @@ function setup() {
   // A fresh install starts local (no key needed). "Fresh" is judged from saved settings, not from
   // the package directory: the curl installer puts the package in place before running setup.
   // Settings from before `engine` existed (a Keychain item or an agent record) mean Jev was in use.
-  const engine = opt(args, "--engine", preset.engine ?? ENV.REFLEX_ENGINE ?? USER_CONFIG.engine ??
+  const keychain = opt(args, "--keychain", ENV.REFLEX_KEYCHAIN_SERVICE ?? USER_CONFIG.keychain ?? "typesafe-api-key");
+  const auto = preset.engine === "auto" && opt(args, "--engine") === undefined;
+  const engine = opt(args, "--engine", (auto ? (hasKey(keychain) ? "jev" : "local") : preset.engine) ?? ENV.REFLEX_ENGINE ?? USER_CONFIG.engine ??
     (USER_CONFIG.keychain || Object.keys(USER_CONFIG.agents ?? {}).length ? "jev" : "local"));
   const ladder = ladderSettings(preset);
-  const settings = {profile: profile ?? USER_CONFIG.profile ?? "supervised", engine, mode, allow, ...ladder};
+  const settings = {profile: profile ?? USER_CONFIG.profile ?? "supervised", engine, mode, allow, keychain, keyless: auto && engine === "local", ...ladder};
   const judgeOn = judgeSettings(settings.judge).enabled;
   if (judgeOn && mode !== "enforce") say(`note: System 2 only acts in enforce mode; in ${mode} mode it is logged as what would have happened`);
   const agents = opt(args, "--agents", ENV.REFLEX_AGENTS ?? "all");
-  const keychain = opt(args, "--keychain", ENV.REFLEX_KEYCHAIN_SERVICE ?? USER_CONFIG.keychain ?? "typesafe-api-key");
   const nodeBin = opt(args, "--node", node());
   const nodeVersion = spawnSync(nodeBin, ["--version"], {encoding: "utf8"});
   if (nodeVersion.status !== 0 || Number(nodeVersion.stdout?.match(/^v(\d+)/)?.[1] ?? 0) < 18) die(`--node must point to Node.js 18+: ${nodeBin}`);
@@ -212,17 +221,21 @@ function setup() {
     const previous = join(TARGET, "setup/tool-gate/policy.json");
     copyFileSync(existsSync(previous) ? previous : join(ROOT, "setup/tool-gate/policy.json"), join(policyDirectory, "policy.json"));
   }
-  // A policy seeded by an earlier setup lacks what later versions added (the tainted-* gates).
-  const userPolicy = join(policyDirectory, "policy.json");
-  try {
-    const mine = JSON.parse(readFileSync(userPolicy, "utf8"));
-    const added = mergePolicy(mine, JSON.parse(readFileSync(join(ROOT, "setup/tool-gate/policy.json"), "utf8")));
-    if (added.length) {
-      copyFileSync(userPolicy, `${userPolicy}.bak-${Date.now()}`);
-      writeFileSync(userPolicy, JSON.stringify(mine, null, 2) + "\n");
-      say(`policy: added ${added.join(", ")} from this version (your gates and values are unchanged; disable a gate with its flag, since a deleted one is added back)`);
-    }
-  } catch (e) { say(`policy: could not add new gates to ${userPolicy}: ${e.message}`); }
+  // A policy seeded by an earlier setup lacks what later versions added (the tainted-* gates); so does
+  // an injection policy the user copied (the guard reads ~/.config/reflex/injection/ first). Never seeded.
+  for (const [label, userPolicy, bundled] of [["policy", join(policyDirectory, "policy.json"), "setup/tool-gate/policy.json"],
+    ["injection policy", join(dirname(USER_CONFIG_FILE), "injection/policy.json"), "setup/injection/policy.json"]]) {
+    if (!existsSync(userPolicy)) continue;
+    try {
+      const mine = JSON.parse(readFileSync(userPolicy, "utf8"));
+      const added = mergePolicy(mine, JSON.parse(readFileSync(join(ROOT, bundled), "utf8")));
+      if (added.length) {
+        copyFileSync(userPolicy, `${userPolicy}.bak-${Date.now()}`);
+        writeFileSync(userPolicy, JSON.stringify(mine, null, 2) + "\n");
+        say(`${label}: added ${added.join(", ")} from this version (your gates and values are unchanged; disable a gate with its flag, since a deleted one is added back)`);
+      }
+    } catch (e) { say(`${label}: could not add new gates to ${userPolicy}: ${e.message}`); }
+  }
 
   // 1. Copy the package to its stable home (replaced whole, so an upgrade leaves no stale files).
   if (realpathSync(ROOT) !== (existsSync(TARGET) ? realpathSync(TARGET) : "")) {
@@ -269,7 +282,7 @@ function setup() {
   say(`installed (${engine} engine, ${mode} mode, allow ${allow})`);
   say(engine === "local" ? "local rules and instruction matches; no hosted classification or API key needed" : "Jev classification sends redacted context to TypeSafe");
   say(mode === "shadow" ? "shadow: deterministic rules still block; other decisions are logged only" : mode === "off" ? "off: protection is disabled"
-    : judgeOn ? `enforce: uncertain commands go to System 2, then ${settings.queue.enabled ? "the approval queue (reflex queue)" : "a human in the agent"}`
+    : judgeOn ? `enforce: ${engine === "local" ? "commands the local rules do not cover" : "uncertain commands"} go to System 2, then ${settings.queue.enabled ? "the approval queue (reflex queue)" : "a human in the agent"}`
     : settings.queue.enabled ? "enforce: uncertain commands are parked in the approval queue (reflex queue)" : "enforce: uncertain commands require human review");
   say(`editable policy: ${join(policyDirectory, "policy.json")} (preserved by upgrades)`);
   if (!(ENV.PATH ?? "").split(":").includes(dirname(BIN_LINK))) say(`add ${dirname(BIN_LINK)} to PATH to use the 'reflex' command`);

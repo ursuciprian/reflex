@@ -25,6 +25,7 @@ npm run eval-context      # setup/context/golden.json: what the visibility ladde
 npm run eval-instructions # examples/instructions/golden.json: which fragments load
 npm run eval-injection    # setup/injection/golden.json: 43 tool results, injection or not
 npm run eval-ladder       # setup/tool-gate/ladder.json: the escalation ladder, Jev live, stub System 2
+npm run eval-ladder -- --engine local   # the same keyless: no Jev, offline, only unsafe approvals scored
 ```
 
 They need `TYPESAFE_API_KEY`, they are non-deterministic (Jev's answers vary run to run), and they
@@ -93,7 +94,7 @@ When you change rules, questions, policy or redaction:
 | `gate.mjs` | The decision core and CLI: read-only detection, rules, redaction, Jev client, cache, logs, and the Claude Code / Codex / Hermes hook adapters |
 | `autonomy.mjs` | The escalation ladder (autonomous profile): the always-human class, System 2 escalation, the verdict cache key and the breaker, the approval queue, task envelopes, checkpoints, and `reflex queue` / `envelope` / `checkpoints` |
 | `judge2.mjs` | System 2: the `cli`, `anthropic` and `openai-compatible` backends, the lean case under a token cap, strict verdict parsing, the verdict cache, tiers, budgets; the stub judge and fake CLIs for the tests |
-| `eval-ladder.mjs` | Runs `setup/tool-gate/ladder.json` through the autonomous profile with Jev live and an approve-everything stub System 2 |
+| `eval-ladder.mjs` | Runs `setup/tool-gate/ladder.json` through the autonomous profile with Jev live (or keyless, `--engine local`) and an approve-everything stub System 2 |
 | `guard.mjs` | Injection guard: detectors, one Jev request per tool result, the policy, rewriting, taint, credential checks on prompts, the Claude Code / Codex / Hermes hook adapters, `--scan` / `--prompt` for the plugins, `--check` (`reflex scan`) and `--eval` |
 | `setup/injection/` | `detectors.json`, `questions.json`, `policy.json` (including `sources`: which tool results are inspected), `golden.json` |
 | `instructions.mjs` | Conditional instructions: fragment discovery, path / keyword matching, one Jev request per prompt, and the Claude Code / Codex / Hermes prompt hooks |
