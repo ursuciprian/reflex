@@ -6,6 +6,40 @@ All notable changes to Reflex are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- `tamper` missed writes to agent or Reflex settings reached through a directory change in the
+  same command: `cd ~/.claude && jq … settings.json > s.tmp && mv s.tmp settings.json`,
+  `pushd ~/.config/reflex; echo x > config.json`, `(cd ~/.codex && tee hooks.json)`. The gate now
+  follows `cd`, `pushd`, `popd`, `cd -`, subshell parentheses and a literal `D=…; cd $D`, and
+  resolves the relative arguments and redirect targets after it against that directory when it is
+  one the rule watches (an agent's settings or hooks directory or a parent, a directory named
+  reflex, the checkout, the Reflex data or config directory). A cd itself writes nothing, so a
+  pure read after it (`cd ~/.claude && jq . settings.json > /tmp/x`) is not tamper.
+- `git push --force` of the current branch (`HEAD`, `+HEAD` or no ref) where the branch is not
+  known asks, before the engine (new rule `force-push-unknown-branch`, rules-v14).
+- `git push --force origin m''ain` (and `'ma'in`, `ma""ster`): the shell joins quoted parts of a
+  word, so the rules now also read the command with those quotes dropped. `force-push-main` denies.
+- `node --check` with `-r`, `--require`, `--import`, `--loader`, `--env-file` or a config file is no
+  longer the fast lane: those still load code before the syntax check.
+
+### Fixed
+
+- Read-only spellings that asked for no reason (latency only):
+  - `ssh -J a h -J b uptime` and `ssh h -J b 'uptime'`: options after the host go through the same
+    allowlist (ssh reads them); `--` or an option that runs a local command there still refuses.
+  - `ip` object and verb prefixes that iproute2's first match makes show, list or get:
+    `ip ne s`, `ip l l`, `ip r g`, `ip n g`, `ip addre l`. `ip l s` (link set) and `ip r sa` still ask.
+  - `timeout -k1 5 ssh h uptime` and `timeout --signal=KILL 5 …`: timeout's options are read.
+  - `ssh h find . -name .env` lists files; `.` there is a path, not the source builtin.
+  - `/usr/bin/grep`, `/bin/cat`, `/usr/bin/git log`: a program from `/bin` or `/usr/bin` is that program.
+- False positives from a replay of a real week:
+  - `jq -r '.env // {} | keys' ~/.claude/settings.json` read the jq field as a `.env` file. Inside
+    a quoted word a file name now ends at the quote.
+  - `security find-generic-password … -w >/dev/null 2>&1; echo $?` counted as printing the key.
+    A lookup whose output goes to `/dev/null` (and nowhere else) is not `secret-read`.
+- README: the replay section has numbers for v0.9.0 on a new week, and what the fixes above change.
+
 ## [0.9.0] - 2026-09-26
 
 ### Added
