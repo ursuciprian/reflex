@@ -232,12 +232,18 @@ See [Calibrated allow](GUIDE.md#calibrated-allow). `REFLEX_ALLOW` overrides the 
 ## 7. Optional: the autonomous profile
 
 For agents that should not wait for you on every uncertain command. Read
-[GUIDE: autonomous agents](GUIDE.md#autonomous-agents) first; it assumes the Jev engine.
+[GUIDE: autonomous agents](GUIDE.md#autonomous-agents) first.
 
 ```sh
 reflex setup --profile autonomous --dry-run   # the effective settings; nothing is written
-reflex setup --profile autonomous             # engine jev, enforce, allow on, System 2, queue, checkpoints
+reflex setup --profile autonomous             # engine jev (local without a key), enforce, allow on, System 2, queue, checkpoints
 ```
+
+**Without a TypeSafe key** setup picks the local engine and says so (keyless autonomy): commands the
+local rules do not cover go to System 2 instead of Jev, System 2 alone may allow only short commands
+whose effects stay in the working directory, and its budget defaults to 300 calls a day with no breaker, since it is asked far more
+often. See [GUIDE: keyless autonomy](GUIDE.md#keyless-autonomy). `--engine jev` or `--engine local`
+beside the profile picks one yourself; rerun setup after adding a key to move to Jev.
 
 **System 2.** Setup picks a backend and prints which:
 
@@ -263,7 +269,7 @@ reflex setup --judge none
 
 Keys are read from the environment variable named by `--judge-key-env` (its name is saved, never the
 key) or the macOS Keychain item named by `--judge-keychain`. `--judge-timeout SECONDS` (20),
-`--judge-budget-calls N` (200 a day) and `--judge-budget-usd X` ($5 a day) set limits; with System 2
+`--judge-budget-calls N` (200 a day; 300 keyless) and `--judge-budget-usd X` ($5 a day) set limits; with System 2
 on, setup gives the Claude Code, Codex and Hermes gate hooks the judge's timeout plus 30 s, so a slow
 answer never makes a hook time out (which would let the command through). Further settings live in
 `judge` in `config.json`:
@@ -345,7 +351,7 @@ Runtime precedence is environment, explicit hook flags, saved settings, then def
 `REFLEX_SETUP_DIR` takes precedence over both. Setup seeds only `policy.json`; you can also place
 `rules.json`, `questions.json` and `subgoals.json` there. The injection guard reads
 `$XDG_CONFIG_HOME/reflex/injection/` the same way (`detectors.json`, `questions.json`, `policy.json`,
-whose `sources` pick which tool results are inspected); `REFLEX_INJECTION_DIR` wins over both. Invalid configuration asks instead of silently
+whose `sources` pick which tool results are inspected); `REFLEX_INJECTION_DIR` wins over both. Each setup adds to your `policy.json` copies (tool gate and, if you made one, injection guard) the gates, params and flags a new version bundles, without changing or reordering yours. Invalid configuration asks instead of silently
 enabling hosted calls. Inspect active paths with `reflex status`.
 
 A standalone LiteLLM process reads the same engine setting at startup. If its container cannot read

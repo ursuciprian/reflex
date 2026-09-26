@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // The escalation ladder: humans as the last rung instead of the default (the autonomous profile).
 //
-//   System 1  Jev + the policy resolve the confident majority (gate.mjs).
+//   System 1  Jev + the policy resolve the confident majority (gate.mjs). Keyless (engine local): only
+//             the rules, the read-only list and the fast lane; what they do not cover escalates.
 //   System 2  a decision that would be `ask` goes to a stronger model with everything Reflex knows
 //             (judge2.mjs): approve, deny or human.
 //   Human     the always-human class (setup/tool-gate/escalation.json: production mutations, IAM,
@@ -24,20 +25,21 @@
 //   node autonomy.mjs envelope set "<text>" [--session id | --cwd dir] [--ttl 8h] | show | list | clear
 //   node autonomy.mjs checkpoints [list|restore <name>] [--cwd dir]
 //   node autonomy.mjs --selfcheck
-import {copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync} from "node:fs";
+import {copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, utimesSync, writeFileSync} from "node:fs";
 import {createHash} from "node:crypto";
 import {spawn, spawnSync} from "node:child_process";
-import {tmpdir} from "node:os";
+import {homedir, tmpdir} from "node:os";
 import {dirname, join, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
-import {CONFIG, allowSetting, callSession, checkRules, decide, decideSafe, envContext, holdAllow, jsonLines, load, localScripts, readTail, redact, sha,
-        stripDataHeredocs, taint, tainted} from "./gate.mjs";
+import {CONFIG, allowSetting, broadCwd, maskQuotes, callSession, checkRules, decide, decideSafe, envContext, holdAllow, jsonLines, judgeSettings, load, localScripts, readTail, redact, sha,
+        stripDataHeredocs, taint, tainted, taintedRule} from "./gate.mjs";
 import {judge2, stubServer, template} from "./judge2.mjs";
 import {hitsOf, terms} from "./context.mjs";
 
 const iso = (t = Date.now()) => new Date(t).toISOString();
 const numbers = answers => Object.fromEntries(Object.entries(answers ?? {}).map(([k, a]) => [k, a?.noul ?? a?.choice ?? a?.score ?? null]));
 
+const inside = (dir, key) => key === "/" || dir === key || dir.startsWith(`${key}/`);
 // ---------------------------------------------------------------------------------------------
 // The always-human class. A rule outcome is always a human's; a policy gate or a pattern in
 // escalation.json makes a Jev or local ask one too. `system1`: also check a System 1 pass or allow
@@ -98,7 +100,9 @@ export async function ladder(j, call, effective, {env = envContext(call.cwd), ju
         // unsandboxed-retry and plan-mode prompts and REFLEX_ALLOW exactly as calibrated allow does.
         // allow_guard: what keeps System 1 from allowing (no fresh Jev answer, no stated intent, a redacted
         // command, code not seen in full, a broad cwd). System 2 saw less than Jev did, so the same holds.
-        const guard = tainted(call.session_id) ? "session read a suspected prompt injection" : j.source !== "jev" ? "no fresh Jev answer" : j.allow_guard;
+        // Keyless (engine local) there is no Jev answer at all: keylessGuard decides instead.
+        const guard = tainted(call.session_id) ? "session read a suspected prompt injection"
+          : j.source === "local" ? keylessGuard(call, context, v) : j.source !== "jev" ? "no fresh Jev answer" : j.allow_guard;
         const a = guard ? {...j, outcome: "pass", source: "judge", rule: `System 2 approved it (no allow: ${guard}): ${v.reason}`}
           : allowSetting(holdAllow({...j, outcome: "allow", source: "judge", rule: `System 2 approved it: ${v.reason}`}, call));
         r = {j: a, effective: a.outcome === "allow" ? "allow" : "pass"};
@@ -144,6 +148,36 @@ export function judgeContext(j, call, env) {
   return {command, cwd: call.cwd ?? null, env: env ?? {}, ...(intent && {intent}), ...(session.envelope && {envelope: session.envelope}),
     ...(script && {script}), system1: {decision: j.outcome, rule: redact(j.rule ?? "").slice(0, 160), ...(j.gate && {gate: j.gate}), answers: numbers(j.answers)},
     ...(t && {session_tainted: true})};
+}
+// Keyless (engine local): System 2 is the only model that judged the command, so its approval is a
+// pass (the agent's own permissions decide) unless a deterministic check keeps the command local. It
+// allows only at KEYLESS_ALLOW_AT or above, and never: network egress (the rules.json `tainted`
+// patterns; Jev's exfil gate, which is always-human, is not there to catch a leak), a cloud, cluster,
+// database or hosted-service CLI (REMOTE: Jev's environment answers, which feed the always-human prod
+// gate, are not there either, and a checkpoint cannot undo a remote change), a command that runs local
+// code (System 2 sees at most 24 lines of it) or code nobody read, and what System 1's guard excludes
+// too: no stated intent, a redacted command, a broad cwd. Nor a command longer than KEYLESS_MAX (the case
+// System 2 gets can cut it), one that writes outside the working directory (a path under ~ or $HOME, an
+// absolute path elsewhere, --global) or touches the system (launchctl, defaults, crontab, ...). What is
+// left changes the repository, where a checkpoint was just taken. Only Claude Code tells allow from
+// pass (allow skips its permission prompt); Codex, Hermes, opencode, pi and omp run both alike.
+// ponytail: egress, REMOTE and SHIPS are lists, not a parser; a remote tool they miss gets allow on
+// System 2's word. Add it to REMOTE.
+export const KEYLESS_ALLOW_AT = 0.9, KEYLESS_MAX = 400;
+const REMOTE = new RegExp(String.raw`\b(kubectl|kubectx|oc|eksctl|helm|helmfile|terraform|tofu|terragrunt|pulumi|cdk|serverless|sls|sam|ansible(-playbook)?|aws|gcloud|gsutil|bq|az|doctl|fly|flyctl|heroku|vercel|netlify|wrangler|firebase|supabase|railway|render|argocd|skaffold|tilt|nomad|consul|gh|glab|psql|mysql|mongosh|redis-cli|rclone|s3cmd|mc|twine|gem|docker|podman|prisma|alembic|flyway|liquibase|dbt|rails|brew|launchctl|defaults|osascript|crontab|systemctl|sudo)\b`, "i");
+// Verbs that ship, fetch or install whatever the tool: cargo publish, go install, compose up.
+const SHIPS = /\b(deploy|publish|upload|push|release|migrate|sync|login|install|up|run|apply)\b/i;
+const OUTSIDE = /(^|[\s=:'"])(~|\$\{?HOME\b)|--global\b|--system\b/;
+function keylessGuard(call, context, v) {
+  const command = String(call.command ?? ""), bare = maskQuotes(stripDataHeredocs(command)), flat = stripDataHeredocs(command).replace(/["'\\]/g, "");
+  const cwd = resolve("/", call.cwd || "/"), abs = [...command.matchAll(/(?:^|[\s=:'"<>])(\/[^\s'"<>;|&)]*)/g)].map(m => m[1]);
+  return !(v.confidence >= KEYLESS_ALLOW_AT) ? `keyless, System 2 at ${v.confidence} below ${KEYLESS_ALLOW_AT}`
+    : command.length > KEYLESS_MAX ? "keyless, too long for System 2 to see whole"
+    : taintedRule(command) ? "keyless, network egress"
+    : REMOTE.test(flat) || SHIPS.test(bare) ? "keyless, changes something outside this machine"
+    : OUTSIDE.test(command) || abs.some(p => p !== "/dev/null" && !inside(resolve(p), cwd)) ? "keyless, writes outside the working directory"
+    : localScripts(command, call.cwd).length ? "keyless, runs code System 2 saw only in part"
+    : !context.intent ? "no stated intent" : redact(command) !== command ? "redacted command" : broadCwd(call.cwd) ? "broad cwd" : null;
 }
 // The verdict cache key: everything a verdict depends on, except the ids a template turns into slots.
 // Taint and egress are in it, so a verdict is never reused across them; so are the script contents
@@ -251,7 +285,6 @@ const writeEnvelopes = e => {
   writeFileSync(`${ENVELOPES()}.${process.pid}`, JSON.stringify(e, null, 1), {mode: 0o600});
   renameSync(`${ENVELOPES()}.${process.pid}`, ENVELOPES());
 };
-const inside = (dir, key) => key === "/" || dir === key || dir.startsWith(`${key}/`);
 export function setEnvelope({text, session, cwd = process.cwd(), ttlHours = 24}) {
   if (!text?.trim()) throw new Error("an envelope needs text");
   const e = readEnvelopes(), scope = session ? "session" : "cwd", key = session ? String(session) : resolve(cwd);
@@ -298,8 +331,17 @@ export function envelopeFor(call) {
 // Checkpoints. `git stash create` records the tracked files (index and working tree) as a commit
 // without changing either; it refreshes the index's stat cache as it goes, so it runs against a
 // temporary copy of the index. A clean tree is checkpointed as HEAD. Kept: the last 50 per repo.
+// The copy keeps the index's mtime (rounded down to the second): git trusts an entry's stat data only
+// when the entry is older than the index file itself (racy git), so a copy stamped "now" made a
+// same-size edit within the second of the last index write look clean once the clock had passed that
+// second, and the checkpoint silently fell back to HEAD (#21). Older is only more careful.
 const REFS = "refs/reflex/checkpoints/", KEEP = 50;
-const git = (cwd, args, env = {}) => spawnSync("git", ["-C", cwd, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...args], {encoding: "utf8", timeout: 5000, env: {...process.env, GIT_OPTIONAL_LOCKS: "0", ...env}});
+let lastRef = 0;   // ref names strictly increase within a process, so two in one millisecond never collide
+// A checkpoint commit is Reflex's, not the user's: its own identity, so it never depends on (or
+// guesses) a user.name / user.email the machine may not have (a bare CI runner, a fresh HOME).
+const IDENTITY = {GIT_AUTHOR_NAME: "reflex", GIT_AUTHOR_EMAIL: "reflex@localhost", GIT_COMMITTER_NAME: "reflex", GIT_COMMITTER_EMAIL: "reflex@localhost"};
+const git = (cwd, args, env = {}) => spawnSync("git", ["-C", cwd, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...args], {encoding: "utf8", timeout: 5000,
+  env: {...process.env, GIT_OPTIONAL_LOCKS: "0", ...IDENTITY, ...env}});
 export function checkpoint(cwd) {
   if (!cwd) return null;
   const t0 = Date.now();
@@ -310,7 +352,11 @@ export function checkpoint(cwd) {
   let sha = "";
   try {
     const index = resolve(cwd, indexPath ?? "");
-    if (existsSync(index)) copyFileSync(index, tmp);
+    if (existsSync(index)) {
+      const st = statSync(index);   // before the copy: an index rewritten in between only makes the copy look older
+      copyFileSync(index, tmp);
+      utimesSync(tmp, st.atime, Math.floor(st.mtimeMs / 1000));
+    }
     sha = git(cwd, ["stash", "create", "reflex checkpoint"], {GIT_INDEX_FILE: tmp}).stdout?.trim() ?? "";
   } finally { rmSync(tmpDir, {recursive: true, force: true}); }
   if (!sha) sha = git(cwd, ["rev-parse", "-q", "--verify", "HEAD"]).stdout?.trim() ?? "";
@@ -319,7 +365,7 @@ export function checkpoint(cwd) {
   const refs = git(cwd, ["for-each-ref", "--sort=-refname", "--format=%(refname) %(tree) %(parent)", REFS]).stdout.trim().split("\n").filter(Boolean);
   const sig = git(cwd, ["log", "-1", "--format=%T %P", sha]).stdout.trim().split(" ").slice(0, 2).join(" ");
   if (refs[0] && refs[0].split(" ").slice(1, 3).join(" ") === sig) return {sha, ref: refs[0].split(" ")[0], same: true, ms: Date.now() - t0};
-  const ref = `${REFS}${Date.now()}-${process.pid}`;
+  const ref = `${REFS}${lastRef = Math.max(Date.now(), lastRef + 1)}-${process.pid}`;
   if (git(cwd, ["update-ref", ref, sha]).status !== 0) return null;
   const old = refs.slice(KEEP - 1).map(l => l.split(" ")[0]);
   if (old.length) spawnSync("git", ["-C", cwd, "update-ref", "--stdin"], {input: old.map(r => `delete ${r}\n`).join(""), timeout: 5000});
@@ -409,6 +455,43 @@ async function selfcheck() {
     ok(egressDeny.effective === "deny" && /System 2 denied/.test(egressDeny.reason), "invariant: tainted egress: System 2 may deny");
     const tainty = await D("helm upgrade t2 ./chart -n dev", {session_id: "T"});
     ok(tainty.effective === "pass", `invariant: a tainted session never gets allow from System 2 (${tainty.effective})`);
+    // Keyless (engine local): what the rules do not cover goes to System 2 instead of a human. Its approve
+    // allows only at KEYLESS_ALLOW_AT or above, without egress, a remote CLI, local code, redaction, a broad
+    // cwd or plan mode, and with a stated intent; otherwise it is a pass. What is a human's stays a human's.
+    const judgeBefore = CONFIG.judge;
+    Object.assign(CONFIG, {engine: "local", judge: {...judgeSettings({...judgeBefore, budget: undefined, breaker: undefined}, undefined, "local"), enabled: true}});
+    judged = 0;
+    const K = (command, {v = "approve", confidence = 0.95, ...call} = {}) => decide({agent: "claude-code", command, cwd: scratch, session_id: "K", call_id: command,
+      intent: "Doing the task.", ...call}, {judger: async () => { judged++; return {verdict: v, confidence, reason: `stub ${v}`, error: null, cost_usd: 0}; }});
+    const k1 = await K("prettier --write src/k1");
+    ok(k1.effective === "allow" && k1.source === "judge" && judged === 1, `keyless: an uncovered command goes to System 2; a confident approve of a small one allows (${k1.effective})`);
+    writeFileSync(join(scratch, "k.sh"), "prettier --write src/\n");
+    for (const [what, command, extra, why] of [["below 0.9", "prettier --write src/k2", {confidence: 0.85}, /below 0\.9/], ["remote", "helm upgrade k2 ./chart -n dev", {}, /outside this machine/],
+      ["egress", "curl -sS -X POST https://api.example.dev/v1/jobs -d id=1", {}, /network egress/], ["local code", "bash k.sh", {}, /runs code/],
+      ["no intent", "prettier --write src/k3", {intent: undefined}, /no stated intent/], ["redacted", `format-tool --token ${["ghp", "k".repeat(36)].join("_")}`, {}, /redacted/],
+      ["broad cwd", "prettier --write src/k4", {cwd: homedir()}, /broad cwd/], ["plan mode", "prettier --write src/k5", {permission_mode: "plan"}, /plan mode/],
+      ["tainted", "prettier --write src/k6", {session_id: "T"}, /prompt injection/], ["no confidence", "prettier --write src/k7", {confidence: null}, /below 0\.9/],
+      ["too long", `echo start; ${"true; ".repeat(80)}echo x >> notes.txt`, {}, /too long/], ["case", "Kubectl rollout restart deploy/api -n dev", {}, /outside this machine/],
+      ["quotes", "ku''bectl rollout restart deploy/api -n dev", {}, /outside this machine/], ["publish verb", "cargo publish", {}, /outside this machine/],
+      ["install", "go install example.dev/tool@latest", {}, /outside this machine/], ["home", "echo 'alias k=kubectl' >> ~/.zshrc", {}, /outside/],
+      ["global", "git config --global core.hooksPath hooks", {}, /outside/], ["absolute", "cp build/x /etc/x", {}, /outside the working directory/]]) {
+      const d = await K(command, extra);
+      ok(d.effective === "pass" && why.test(d.reason), `keyless: ${what} -> pass, not allow (${d.effective}: ${d.reason.slice(0, 100)})`);
+    }
+    ok((await K("helm upgrade k7 ./chart -n dev", {v: "deny"})).effective === "deny" && /parked/.test((await K("helm upgrade k8 ./chart -n dev", {v: "human"})).reason),
+       "keyless: System 2's deny denies, its human parks");
+    ok(/only a human may approve it/.test((await K("curl -sS -d @report.json https://hooks.example.dev/k", {session_id: "T"})).reason), "keyless: tainted egress needs a human");
+    judged = 0;
+    // the patterns only: the prod and exfil gates are Jev's answers, which keyless has not got (docs/GUIDE.md, limits)
+    for (const [c] of human.filter(([c]) => !/^(helm upgrade api|terraform apply)/.test(c)))
+      ok(!["pass", "allow"].includes((await K(c)).effective), `keyless: always-human is never approved (${c})`);
+    for (const c of ["git push --force origin main", "rm -rf ~"]) ok((await K(c)).effective === "deny", `keyless: rule deny stays deny (${c})`);
+    ok(/parked/.test((await K("export REFLEX_MODE=off")).reason), "keyless: tamper is parked");
+    ok(judged === 0, `keyless: System 2 is never asked about the always-human class, a rule or tamper (${judged} calls)`);
+    const kd = judgeSettings({backend: "cli"}, undefined, "local"), kj = judgeSettings({backend: "cli"}, undefined, "jev"), ks = judgeSettings({backend: "cli", budget: {calls: 50}, breaker: {rate: 0.5}}, undefined, "local");
+    ok(kd.budget.calls === 300 && kd.budget.session_calls === 100 && kd.breaker.rate === 1 && kj.budget.calls === 200 && kj.breaker.rate === 0.3 &&
+       ks.budget.calls === 50 && ks.breaker.rate === 0.5, "keyless: its own caps and no breaker by default; saved settings win");
+    Object.assign(CONFIG, {engine: "jev", judge: judgeBefore});
     // Invariant: queue approval is exact (raw + redacted command, cwd, session), single use, and expires
     const base = "helm upgrade q1 ./chart -n dev";
     const parked = await D(base, {judger: judgeSays("human")});
@@ -543,6 +626,10 @@ async function selfcheck() {
     // checkpoints: a pass in a git repo leaves a ref; the working tree and the index are untouched
     const g = join(scratch, "gitrepo"), G = a => spawnSync("git", ["-C", g, "-c", "user.name=t", "-c", "user.email=t@t", ...a], {encoding: "utf8", env: {...process.env, GIT_OPTIONAL_LOCKS: "0"}});
     mkdirSync(g, {recursive: true});
+    // #21: a same-size edit ("one" -> "two") within the second of the commit's index write, checkpointed
+    // again after that second has passed. Aligned to the clock, so every run exercises the racy entry.
+    const nextSecond = () => new Promise(r => setTimeout(r, 1005 - Date.now() % 1000));
+    await nextSecond();
     G(["init", "-q"]); writeFileSync(join(g, "a.txt"), "one\n"); G(["add", "a.txt"]); G(["commit", "-q", "-m", "init"]);
     writeFileSync(join(g, "a.txt"), "two\n");
     const idx = () => createHash("sha1").update(readFileSync(join(g, ".git/index"))).digest("hex");
@@ -550,10 +637,12 @@ async function selfcheck() {
     CONFIG.checkpoints = true;
     const cp = await decide({agent: "x", command: "go test ./...", cwd: g, session_id: "C"}, {asker: jev(SAFE)});
     const list = checkpoints(g);
+    ok(G(["log", "-1", "--format=%an %ce", list[0].sha]).stdout.trim() === "reflex reflex@localhost", "checkpoint: Reflex's own identity, never the user's");
     ok(cp.effective === "pass" && list.length === 1 && list[0].stash && idx() === i0 && G(["status", "--porcelain"]).stdout === s0,
        "checkpoint: created before a pass; working tree and index untouched");
+    await nextSecond();
     await decide({agent: "x", command: "go vet ./...", cwd: g, session_id: "C"}, {asker: jev(SAFE)});
-    ok(checkpoints(g).length === 1, "checkpoint: an unchanged tree is not checkpointed twice");
+    ok(checkpoints(g).length === 1, "checkpoint: an unchanged tree is not checkpointed twice, a second later too (#21)");
     await decide({agent: "x", command: "git status", cwd: g, session_id: "C"}, {asker: jev(SAFE)});
     ok(checkpoints(g).length === 1, "checkpoint: read-only commands take none");
     writeFileSync(join(g, "a.txt"), "three\n");

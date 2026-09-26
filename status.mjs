@@ -21,7 +21,9 @@ const configuration = configurationError();
 if (configuration) errors.push(configuration);
 if (platform() === "win32") errors.push("Native Windows is not supported; run Reflex and the agent inside WSL.");
 if (CONFIG.mode === "off") warnings.push("Protection is off.");
-if (CONFIG.engine === "local") warnings.push("Local coverage: shell rules and deterministic instructions; uncertain commands ask in enforce mode. Hosted features are disabled.");
+// Keyless autonomy: the local engine with System 2 on, so what the rules do not cover goes to System 2, not to a human.
+const keyless = CONFIG.engine === "local" && CONFIG.judge.enabled;
+if (CONFIG.engine === "local") warnings.push(`Local coverage: shell rules and deterministic instructions; ${keyless ? "keyless autonomy: commands they do not cover go to System 2, which allows only small ones" : "uncertain commands ask in enforce mode"}. Hosted features are disabled.`);
 if (CONFIG.mode === "shadow") warnings.push("Shadow mode enforces deterministic rules. Other decisions are logged without blocking.");
 const policy = setupFile("policy.json");
 try { compile(load("policy.json")); load("rules.json"); load("questions.json"); }
@@ -132,12 +134,12 @@ if (!configuration && CONFIG.judge.enabled) {
 const items = listItems(), pending = items.filter(i => i.status === "pending");
 const queue = {enabled: CONFIG.queue.enabled, pending: pending.length, total: items.length, oldest_pending: pending.at(-1)?.created ?? null};
 if (pending.length) warnings.push(`${pending.length} item${pending.length === 1 ? "" : "s"} waiting in the approval queue: reflex queue list.`);
-const result = {profile: CONFIG.profile, engine: CONFIG.engine, mode: CONFIG.mode, guard: guardMode(), allow: CONFIG.allow, config: USER_CONFIG_FILE,
+const result = {profile: CONFIG.profile, engine: CONFIG.engine, system1: CONFIG.engine === "jev" ? "Jev + policy" : keyless ? "local rules (keyless: what they do not cover goes to System 2)" : "local rules", mode: CONFIG.mode, guard: guardMode(), allow: CONFIG.allow, config: USER_CONFIG_FILE,
   policy, api_key: key, judge, queue, checkpoints: CONFIG.checkpoints, agents, errors, warnings};
 if (json) console.log(JSON.stringify(result, null, 2));
 else {
   console.log(`Reflex: ${CONFIG.profile} profile · ${CONFIG.engine} engine · ${CONFIG.mode} mode · guard ${guardMode()} · allow ${CONFIG.allow}`);
-  console.log(`Settings: ${USER_CONFIG_FILE}\nPolicy: ${policy}\nAPI key: ${key}`);
+  console.log(`Settings: ${USER_CONFIG_FILE}\nPolicy: ${policy}\nAPI key: ${key}\nSystem 1: ${result.system1}`);
   console.log(`System 2: ${judge.enabled ? `${cliJudge ? `cli ${judge.cli} (${judge.command ?? "from PATH"})` : `${judge.backend} ${judge.url}; key ${judge.key}`}; model ${judge.model ?? "default"}; ` +
     `${judge.reachable ? (cliJudge ? "found" : `reachable (HTTP ${judge.status})`) : judge.reachable === false ? "NOT reachable" : "not checked"}` +
     (judge.budget ? `; budget left today ${judge.budget.calls_left} calls, $${judge.budget.usd_left}` : "") : "off"}`);

@@ -88,6 +88,21 @@ try {
   assert.equal(merged.params.askAt.default, 1.1);
   assert.equal(merged.flags.taintStrict.default, true);
   assert.doesNotMatch(success(cli(["setup", "--agents", picks])), /policy: added/, "a second setup adds nothing");
+  // The injection policy: merged the same way, but only into a copy the user made; never seeded.
+  const injection = join(env.XDG_CONFIG_HOME, "reflex/injection/policy.json");
+  assert.ok(!existsSync(injection), "setup never seeds an injection policy");
+  const bundledInjection = read(join(root, "setup/injection/policy.json")), lastGate = bundledInjection.gates.at(-1).id, lastParam = Object.keys(bundledInjection.params).at(-1);
+  const myInjection = {...bundledInjection, gates: [...bundledInjection.gates.slice(0, -1).reverse(), {id: "mine", test: "false", outcome: "warn", rule: "my own gate"}],
+    params: Object.fromEntries(Object.entries(bundledInjection.params).slice(0, -1).map(([k, v]) => [k, k === "blockAt" ? {...v, default: 0.99} : v]))};
+  mkdirSync(dirname(injection), {recursive: true});
+  writeFileSync(injection, JSON.stringify(myInjection));
+  assert.match(success(cli(["setup", "--agents", picks])), new RegExp(`injection policy: added param ${lastParam}, gate ${lastGate}`));
+  const mergedInjection = read(injection);
+  assert.deepEqual(mergedInjection.gates.filter(g => g.id !== lastGate).map(g => g.id), myInjection.gates.map(g => g.id), "the user's injection gates keep their order");
+  const prevGate = bundledInjection.gates.at(-2).id, ids = mergedInjection.gates.map(g => g.id);
+  assert.ok(ids.indexOf(lastGate) === ids.indexOf(prevGate) + 1 && mergedInjection.params.blockAt.default === 0.99, "a new gate goes where the bundled policy has it; the user's values stay");
+  assert.doesNotMatch(success(cli(["setup", "--agents", picks])), /injection policy: added/, "a second setup adds nothing to the injection policy");
+  rmSync(dirname(injection), {recursive: true, force: true});
   const moduleCheck = `import assert from 'node:assert/strict'; import * as g from ${JSON.stringify(join(packageRoot, "gate.mjs"))};
     assert.equal(g.load('policy.json').params.askAt.default, 1.1);
     let calls=0; globalThis.fetch=()=>{calls++; throw Error('network forbidden')};
@@ -335,5 +350,68 @@ try {
     assert.ok(!rep2.includes("ci-bot"), "the report names no command");
     assert.ok(!readFileSync(join(data2, "judge.jsonl"), "utf8").includes("unknown-action"), "the judge log holds no command");
     console.log("autonomous onboarding checks OK");
+
+    // Keyless autonomy, in a third throwaway HOME: no TypeSafe key anywhere (none in the environment, a
+    // Keychain item that does not exist), Jev at a closed port, a fake `claude` on PATH as System 2.
+    const home3 = join(scratch, "keyless"), fakes3 = join(home3, "fake-bin"), proj3 = join(home3, "proj");
+    mkdirSync(proj3, {recursive: true});
+    success(invoke("judge2.mjs", ["--fake-cli", fakes3]));
+    const env3 = {...env, HOME: home3, XDG_CONFIG_HOME: join(home3, "config"), XDG_STATE_HOME: join(home3, "state"), REFLEX_PREFIX: join(home3, "installed"),
+      PATH: `${fakes3}:/usr/bin:/bin`};
+    for (const k of ["TYPESAFE_API_KEY", "ANTHROPIC_API_KEY"]) delete env3[k];
+    const cli3 = (args, extra = {}) => invoke("bin/reflex", args, {...extra, env: {...env3, ...extra.env}});
+    const settings3 = join(home3, "config/reflex/config.json"), data3 = join(home3, "state/reflex");
+    const dry3 = success(cli3(["setup", "--profile", "autonomous", ...agents2, "--dry-run"]));
+    assert.match(dry3, /profile autonomous · engine local · mode enforce · allow on/, "no key: the autonomous profile picks the local engine");
+    assert.match(dry3, /no TypeSafe key found .* keyless autonomy: commands the local rules do not cover go to System 2 instead of Jev/);
+    assert.match(dry3, /System 2: cli claude .*budget 300 calls a day/, "keyless: its own daily cap");
+    assert.match(success(cli3(["setup", "--profile", "autonomous", ...agents2, "--dry-run"], {env: {PATH: "/usr/bin:/bin"}})),
+      /keyless autonomy: with no System 2 either, every command the local rules do not cover waits in the approval queue/);
+    assert.match(success(cli3(["setup", "--profile", "autonomous", ...agents2, "--engine", "jev", "--dry-run"])), /engine jev/, "--engine beside the profile wins");
+    assert.ok(!existsSync(settings3) && !existsSync(join(home3, "installed")), "a keyless preview writes nothing");
+    const setup3 = success(cli3(["setup", "--profile", "autonomous", ...agents2]));
+    assert.doesNotMatch(setup3, /paste it to store|set TYPESAFE_API_KEY/, "keyless setup never asks for a key");
+    assert.match(setup3, /enforce: commands the local rules do not cover go to System 2, then the approval queue/);
+    const saved3 = read(settings3);
+    assert.ok(saved3.engine === "local" && saved3.profile === "autonomous" && saved3.judge.backend === "cli" && saved3.queue.enabled && saved3.checkpoints, JSON.stringify(saved3));
+    let st3 = JSON.parse(success(cli3(["doctor", "--json"])));
+    assert.ok(st3.api_key === "not required" && /keyless/.test(st3.system1) && st3.judge.reachable && st3.judge.budget.calls_left === 300, JSON.stringify(st3));
+    const G3 = a => spawnSync("git", ["-C", proj3, "-c", "user.name=t", "-c", "user.email=t@t", ...a], {encoding: "utf8"});
+    G3(["init", "-q"]); writeFileSync(join(proj3, "a.txt"), "1\n"); G3(["add", "a.txt"]); G3(["commit", "-q", "-m", "i"]); writeFileSync(join(proj3, "a.txt"), "2\n");
+    // the agent's intent comes from its transcript, as in a real Claude Code session
+    const transcript = join(home3, "transcript.jsonl");
+    let n3 = 0;
+    const hook3 = (command, cwd = proj3) => {
+      const id = `toolu_k${++n3}`;
+      writeFileSync(transcript, JSON.stringify({type: "assistant", message: {content: [{type: "text", text: "Formatting the sources for the task."},
+        {type: "tool_use", id, name: "Bash", input: {command}}]}}) + "\n");
+      const hook = read(join(home3, ".claude/settings.json")).hooks.PreToolUse.flatMap(g => g.hooks).find(h => h.command.includes("gate.mjs")).command;
+      return JSON.parse(success(spawnSync("/bin/sh", ["-c", hook], {encoding: "utf8", env: env3,
+        input: JSON.stringify({tool_name: "Bash", tool_input: {command}, session_id: "keyless", cwd, tool_use_id: id, transcript_path: transcript})})) || "{}").hookSpecificOutput;
+    };
+    // judge calls only: doctor runs `claude --version` too
+    const calls3 = () => existsSync(join(fakes3, "calls.jsonl")) ? readFileSync(join(fakes3, "calls.jsonl"), "utf8").trim().split("\n").filter(l => JSON.parse(l).argv.includes("--system-prompt")).length : 0;
+    // not covered by the local rules: System 2 (the fake claude) approves; a local change is allowed, with a checkpoint first
+    assert.equal(hook3("prettier --write src/")?.permissionDecision, "allow");
+    assert.equal(calls3(), 1, "the uncovered command went to System 2");
+    assert.match(success(cli3(["checkpoints", "list", "--cwd", proj3])), /^\d+-\d+ {2}[0-9a-f]{7,} /m);
+    // approved but remote or egress: a pass, so Claude Code's own permissions decide
+    assert.equal(hook3("kubectl --context dev-cluster rollout restart deploy/api -n web"), undefined);
+    assert.equal(hook3("curl -sS https://example.dev/data.json -o data.json"), undefined);
+    assert.equal(calls3(), 3);
+    // the always-human class, a rule deny and tamper never reach System 2
+    const iam3 = hook3("aws iam create-user --user-name keyless-bot");
+    assert.ok(iam3.permissionDecision === "deny" && /parked in the approval queue/.test(iam3.permissionDecisionReason), JSON.stringify(iam3));
+    assert.match(hook3("git push --force origin main").permissionDecisionReason, /force push/);
+    assert.match(hook3("reflex queue approve q-0123456789").permissionDecisionReason, /parked in the approval queue/);
+    assert.equal(calls3(), 3, "System 2 is never asked about the always-human class, a rule or tamper");
+    // never a TypeSafe call: no Jev answer, no Jev fallback anywhere in the trace
+    const trace3 = readFileSync(join(data3, "trace.jsonl"), "utf8").trim().split("\n").map(l => JSON.parse(l));
+    assert.ok(trace3.length >= 6 && trace3.every(r => !["jev", "fallback", "cache"].includes(r.source) && !r.error), JSON.stringify(trace3.map(r => r.source)));
+    st3 = JSON.parse(success(cli3(["status", "--json"])));
+    assert.ok(st3.engine === "local" && st3.judge.budget.calls_used === 3 && st3.queue.pending >= 2 && !st3.judge.breaker.open, JSON.stringify(st3));
+    // a key later: the same profile moves to Jev
+    assert.match(success(cli3(["setup", "--profile", "autonomous", ...agents2, "--dry-run"], {env: Object.fromEntries([["TYPESAFE_API_KEY", ["test", "key", process.pid].join("-")]])})), /engine jev/);
+    console.log("keyless autonomous onboarding checks OK");
   } finally { stub.kill(); }
 } finally { rmSync(scratch, {recursive: true, force: true}); }

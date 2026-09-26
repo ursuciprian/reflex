@@ -56,16 +56,23 @@ export const JUDGE_DEFAULTS = {backend: "none", url: null, model: null, key_env:
   max_input_tokens: 1500, thinking: "disabled", effort: "low", min_confidence: 0.8, cache_ttl_hours: 12, tiers: null,
   budget: {calls: 200, usd: 5, session_calls: 40, session_usd: 1}, price: {input: 5, output: 25},
   breaker: {rate: 0.3, window_minutes: 60, min_decisions: 20}};
+// Keyless (engine local): no Jev, so every command the rules, the read-only list and the fast lane do
+// not cover goes to System 2. Measured on 14,445 real Bash commands: 62 % of all of them, about 90 %
+// of the ones the ladder judges, 115 calls on a median active day and 294 at p90. The breaker's 30 %
+// would stay open (it guards against a Jev outage or a noisy policy, neither of which exists here),
+// so it is off and the caps bound the spend: 300 calls a day covers nine days in ten.
+export const KEYLESS_JUDGE_DEFAULTS = {budget: {calls: 300, session_calls: 100, session_usd: 2}, breaker: {rate: 1}};
 export const BACKEND_DEFAULTS = {cli: {cli: "claude", model: "sonnet"}, anthropic: {url: "https://api.anthropic.com", model: "claude-sonnet-5", key_env: "ANTHROPIC_API_KEY"},
   "openai-compatible": {}, none: {}};
 export const QUEUE_DEFAULTS = {ttl_hours: 24, notify: null};
+const ENGINE = ENV.REFLEX_ENGINE ?? flagValue("--engine", USER_CONFIG.engine ?? "jev");
 export const CONFIG = {
   api: ENV.REFLEX_API_URL ?? "https://api.typesafe.ai/v1/systemone",
   model: ENV.REFLEX_MODEL ?? "jev-1.13.0",              // pinned so a decision can be reproduced
   // off | shadow | enforce. The environment wins, so one session can be switched for a test;
   // otherwise the --mode flag that install.mjs writes into each agent's hook command.
   mode: ENV.REFLEX_MODE ?? flagValue("--mode", USER_CONFIG.mode ?? "shadow"),
-  engine: ENV.REFLEX_ENGINE ?? flagValue("--engine", USER_CONFIG.engine ?? "jev"),
+  engine: ENGINE,
   // off | shadow | on: what a policy "allow" becomes. off: pass, the gate only tightens.
   // shadow: logged as would_allow, effective pass. on: effective allow, in enforce mode only.
   allow: ENV.REFLEX_ALLOW ?? flagValue("--allow", USER_CONFIG.allow ?? "off"),
@@ -77,15 +84,16 @@ export const CONFIG = {
   // checkpoints. Off unless config.json turns them on; REFLEX_JUDGE / REFLEX_QUEUE / REFLEX_CHECKPOINTS
   // (on | off) override for one session (`reflex run` turns them off: a human is at the terminal).
   profile: USER_CONFIG.profile ?? "supervised",
-  judge: judgeSettings(USER_CONFIG.judge, ENV.REFLEX_JUDGE),
+  judge: judgeSettings(USER_CONFIG.judge, ENV.REFLEX_JUDGE, ENGINE),
   queue: {...QUEUE_DEFAULTS, ...USER_CONFIG.queue, enabled: onOff(ENV.REFLEX_QUEUE, USER_CONFIG.queue?.enabled)},
   checkpoints: onOff(ENV.REFLEX_CHECKPOINTS, USER_CONFIG.checkpoints),
 };
-/** Saved judge settings with the backend's defaults filled in; `enabled` unless the backend is none or REFLEX_JUDGE=off. */
-export function judgeSettings(saved = {}, env) {
-  const backend = saved?.backend ?? JUDGE_DEFAULTS.backend, s = saved ?? {};
-  return {...JUDGE_DEFAULTS, ...BACKEND_DEFAULTS[backend], ...s, backend, budget: {...JUDGE_DEFAULTS.budget, ...s.budget},
-          price: {...JUDGE_DEFAULTS.price, ...s.price}, breaker: {...JUDGE_DEFAULTS.breaker, ...s.breaker}, enabled: env === undefined || env === "on" ? backend !== "none" : env === "off" ? false : env};
+/** Saved judge settings with the backend's (and, keyless, the engine's) defaults filled in; `enabled` unless the backend is none or REFLEX_JUDGE=off. */
+export function judgeSettings(saved = {}, env, engine = "jev") {
+  const backend = saved?.backend ?? JUDGE_DEFAULTS.backend, s = saved ?? {}, k = engine === "local" ? KEYLESS_JUDGE_DEFAULTS : {};
+  return {...JUDGE_DEFAULTS, ...BACKEND_DEFAULTS[backend], ...s, backend, budget: {...JUDGE_DEFAULTS.budget, ...k.budget, ...s.budget},
+          price: {...JUDGE_DEFAULTS.price, ...s.price}, breaker: {...JUDGE_DEFAULTS.breaker, ...k.breaker, ...s.breaker},
+          enabled: env === undefined || env === "on" ? backend !== "none" : env === "off" ? false : env};
 }
 function onOff(env, saved) { return env === undefined ? saved === true : env === "on" ? true : env === "off" ? false : env; }
 // Functions, not constants, so the self-check can point the whole gate at a scratch directory.
@@ -687,6 +695,9 @@ export function cachePut(key, answers) {
   } catch { /* a cache that cannot be written only costs a re-ask */ }
 }
 
+// A home or root cwd makes "inside the working directory" meaningless: never allowed from there.
+export const broadCwd = cwd => [homedir(), "/", dirname(homedir())].includes(resolve("/", cwd || "/"));
+
 /** Jev's judgment + the policy -> {outcome, rule, source, state, answers, ...}. */
 // `asker` stands in for the API in the self-check. `tainted`: the session read a suspected prompt
 // injection (guard.mjs), so the policy's taint gates apply and nothing is allowed.
@@ -731,10 +742,10 @@ export async function jevJudge({command, cwd, env, session = {}, useCache = true
     : d.path?.at(-1)?.outcome !== "yes" ? "not from an allow gate"
     : redact(command) !== command ? "redacted command"
     : scripts.some(s => s.partial) || script?.excerpt.length >= SCRIPT_BYTES ? "runs code Jev did not see in full"
-    : [homedir(), "/", dirname(homedir())].includes(resolve("/", cwd || "/")) ? "broad cwd" : null;
+    : broadCwd(cwd) ? "broad cwd" : null;
   const allowGuard = res.error ? "no answer" : cached ? "cached answer" : !session.intent ? "no stated intent" : redact(command) !== command ? "redacted command"
     : scripts.some(s => s.partial) || script?.excerpt.length >= SCRIPT_BYTES ? "runs code Jev did not see in full"
-    : [homedir(), "/", dirname(homedir())].includes(resolve("/", cwd || "/")) ? "broad cwd" : null;
+    : broadCwd(cwd) ? "broad cwd" : null;
   const policyOutcome = d.outcome;   // logged as is, so report.mjs replays policy against policy
   if (d.outcome === "allow" && noAllow) Object.assign(d, {outcome: "pass", rule: `low risk (not allowed: ${noAllow})`});
   return {outcome: d.outcome, policy_outcome: policyOutcome, rule: d.rule, source: res.error ? "fallback" : cached ? "cache" : "jev",
@@ -935,7 +946,7 @@ export function taint(session_id, event = null, fields = {}) {
   renameSync(`${f}.${process.pid}`, f);   // atomic; parallel writers can drop an event, never corrupt the file
 }
 // The command alone: a cwd like /tmp/http-client or a branch named ssh-keys is not egress.
-function taintedRule(command) {
+export function taintedRule(command) {
   const rules = load("rules.json"), bare = stripDataHeredocs(command);
   const hit = checkRules(bare, {rules: rules.tainted ?? []}, bare);
   return hit && {outcome: hit.outcome, rule: hit.rule, id: hit.id, source: "taint", policy_version: rules.version};
