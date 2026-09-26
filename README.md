@@ -79,6 +79,7 @@ See [docs/SETUP.md](docs/SETUP.md) for all options, per-agent notes and uninstal
 reflex check "terraform apply -auto-approve" --cwd ~/infra/envs/prod   # judge one command
 reflex scan page.html                                                  # check text for prompt injection
 reflex report                                                          # decisions so far
+reflex replay claude --since 7d                                        # what it would have done with past sessions
 reflex doctor                                                          # local checks; no API calls
 reflex status                                                          # configured vs observed hooks
 reflex run "command" --cwd /path/to/work                                 # human terminal handoff
