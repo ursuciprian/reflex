@@ -612,27 +612,27 @@ v0.9.0:
 
 | | Claude Code | Codex |
 |---|---|---|
-| Shell commands the agent ran | 13,556 | 700 |
-| Passed as read-only or fast lane, no API call | 7,025 (52 %) | 517 (74 %) |
-| Asked by a rule | 549 | 5 |
+| Shell commands the agent ran | 13,743 | 700 |
+| Passed as read-only or fast lane, no API call | 7,066 (51 %) | 517 (74 %) |
+| Asked by a rule | 597 | 5 |
 | Denied by a rule | 32 | 0 |
-| Left to the engine | 5,950 | 178 |
-| Would reach a human per 100 commands (keyless, supervised) | 47.9 | 26.1 |
+| Left to the engine | 6,048 | 178 |
+| Would reach a human per 100 commands (keyless, supervised) | 48.4 | 26.1 |
 | Estimated cost to send the rest to Jev | about $0.47 | about $0.01 |
 
 With the local engine every command a rule does not settle goes to a person, so the last rows
 are the upper bound for a human in the loop. With Jev or System 2 answering most of them,
 autonomous coding agents get fewer permission prompts.
 
-The rules that fired most on Claude Code were `tamper` (492), `secret-exfil` (19), `secret-read`
-(17), `force-push-main` (17), `secret-file-read` (16) and `rm-root` (11). 485 of the 492 `tamper`
+The rules that fired most on Claude Code were `tamper` (531), `secret-exfil` (27), `secret-read`
+(18), `force-push-main` (17), `secret-file-read` (16) and `rm-root` (11). 524 of the 531 `tamper`
 hits ran inside a Reflex checkout while Reflex itself was being developed (edits to the gate,
 `REFLEX_*` variables set for test runs), which is the rule doing its job; outside that checkout
 it fired 7 times. Not every hit was right. The replay found `secret-file-read` reading the jq
 filter `.env` as a `.env` file, `secret-read` counting a keychain lookup whose output goes to
 `/dev/null` as printing the key, and reads through `/usr/bin/grep` or `/usr/bin/git` missing the
 fast path. Those are fixed for the next release, which on the same week brings Claude Code to
-7,905 commands passed without an API call (58 %) and 41.5 per 100 reaching a human; Codex is
+7,973 commands passed without an API call (58 %) and 41.8 per 100 reaching a human; Codex is
 unchanged. What remains are rules matching test strings inside `python3 - <<EOF` programs and
 `node -e` scripts that carry a dangerous command as data (`rm-root`, `force-push-main`,
 `secret-exfil`). Those stay: the text could run, and an ask costs less than a miss. Replay is how
