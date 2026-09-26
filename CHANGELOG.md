@@ -6,6 +6,27 @@ All notable changes to Reflex are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- More remote reads are read-only: `ssh -o ProxyJump=…` (like `-J`), an unquoted remote command
+  (`ssh h uptime`, plain words only, ssh in command position), and a host that mixes literal text
+  with loop variables (`for i in 1 2 3; do ssh web-$i uptime; done`). `ip` show/list spellings per
+  object (`ip a s`, `ip r`, `ip l sh`, `ip rule show`, `ip r get …`) and `systemctl` with no verb
+  (`systemctl --failed`), `list-sockets`, `list-jobs` and `get-default`.
+
+### Fixed
+
+- `ssh -J a,-oProxyCommand=x` (and the same through `-o ProxyJump=`) was read-only: ssh pastes the
+  last hop into a shell command line as a host, so it ran a local command. Every hop is now a plain
+  `[ssh://][user@]host[:port]`, no `%`.
+- `systemctl -p status restart api` and `systemctl --property status restart api` were read-only:
+  the option took `status` as its value and the verb was `restart`. Before the verb only value-less
+  options or `--opt=value` count.
+- `journalctl --rot`, `--flu`, `--syn` and other unique prefixes of writing options were read-only
+  (getopt_long expands them). No long option may be a prefix of one that writes.
+- A loop word like `a@-F` made a host that is an option (`for h in a@-F; do ssh $h …`).
+- `ssh h cat .env` (unquoted) now hits the secret-file rule like `ssh h 'cat .env'`.
+
 ## [0.8.0] - 2026-09-26
 
 ### Added

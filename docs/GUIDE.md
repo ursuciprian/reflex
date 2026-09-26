@@ -58,22 +58,28 @@ hook (see the table in the README). Each adapter turns the agent's event into th
    the next step. → **pass**, not logged.
    An `ssh` call counts only as a read of its remote command, which must be read-only by the same
    rules (the fast lane is for local work): `ssh [options] host '<read-only>'`, with the quoted
-   command last (words after it are appended on the remote side). Options come from an allowlist
+   command last (words after it are appended on the remote side), or `ssh [options] host cmd args`
+   with no quotes at all (plain words only: no `$`, glob or `~`, the first not an option; ssh in
+   command position, not an argument like `grep ssh f`). Options come from an allowlist
    (`-4 -6 -C -T -a -k -n -q -t -v -x`, `-p -l -i -J -b -c -m`, and `-o` with `ConnectTimeout`,
    `BatchMode`, `StrictHostKeyChecking`, `UserKnownHostsFile=/dev/null`, `ServerAlive*`, `Port`,
-   `User`, `IdentityFile` and other connection settings), with values that are neither options
+   `User`, `IdentityFile`, `ProxyJump` and other connection settings), with values that are neither options
    (`-J -oProxyCommand=…`) nor globs: nothing that runs a local command or loads local code
    (`ProxyCommand`, `LocalCommand`, `KnownHostsCommand`, `-F` config, `-I`, `PKCS11Provider`),
    forwards (`-L -R -D -W -w`, `-A`, `-X -Y`), backgrounds (`-f -N`), writes a local file (`-E`, a
-   known-hosts file other than `/dev/null`) or sends the local environment (`SendEnv`). The host is a
-   literal name, or a plain variable set only by a `for h in <literal hosts>; do` loop the call is
-   inside (no `IFS`, `read`, `${h:=…}`, `unset` or other assignment of it). Nothing may feed ssh's
+   known-hosts file other than `/dev/null`) or sends the local environment (`SendEnv`). Each `-J` /
+   `ProxyJump` hop is a plain `[ssh://][user@]host[:port]` (ssh pastes hops into a shell command
+   line). The host is literal text, plain variables (`web-$i`, `ops@${h}.lan`) or both, each variable
+   set only by a `for h in <literal words>; do` loop the call is inside (no `IFS`, `read`, `${h:=…}`, `unset` or other assignment of it). Nothing may feed ssh's
    stdin: no redirect or heredoc into it, and no pipe that reaches it (into it, through a wrapper,
    or into a loop, group or substitution around it). A double-quoted remote command must have
    nothing the local shell expands (`$VAR`, `$(…)`, backticks would send local data).
-   Also read-only for remote checks: `free`, `nproc`, `lscpu`, `seq`, `systemctl status|is-active|
-   show|cat|list-*`, `journalctl` (not `--vacuum*`, `--rotate`, `--flush`, `--cursor-file`, …),
-   `ip [-br|-4|-6|-s|-d|-j|-p|-o|-c] addr|link|route|neigh [show]`, and `docker exec [-t] [-u …]
+   Also read-only for remote checks: `free`, `nproc`, `lscpu`, `seq`, `systemctl [--failed]
+   [status|is-active|show|cat|list-*|get-default]` (before the verb only value-less options or
+   `--opt=value`: `-p status restart x` restarts x), `journalctl` (no long option that is a prefix
+   of `--vacuum*`, `--rotate`, `--flush`, `--cursor-file`, …: getopt expands `--rot`),
+   `ip [-br|-4|-6|-s|-d|-j|-p|-o|-c] addr|link|route|neigh|rule [show]` (ip expands verb prefixes,
+   so only spellings that are show for that object: `ip a s`, `ip l sh`, never `ip l s`, link set), and `docker exec [-t] [-u …]
    [-w …] <container> <read-only>` with a literal container name (no `-i`: nothing goes to its stdin).
    The shell's own quoting is followed where it changes what runs: a backslash-newline joins the two
    lines (`-de\⏎lete` is `-delete`), `$'…'` is quoted text, and a word starting with `#` comments out
