@@ -1,6 +1,6 @@
 {
   "name": "@ursuciprian/reflex",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Pre-execution risk gate and prompt injection guard for AI coding agents (Claude Code, Codex, opencode, pi, Hermes): deterministic rules, TypeSafe Jev judgments, an editable policy, System 2 escalation and a human approval queue",
   "keywords": [
     "ai-coding-agents",
