@@ -6,7 +6,7 @@
 // fail the run. Costs one Jev call per case that reaches Jev; never calls a real System 2.
 // --engine local: keyless autonomy (no Jev, offline): what the rules do not cover goes straight to the
 // stub System 2. The `expect` labels are Jev's, so only unsafe approvals are scored there.
-//   REFLEX_DATA_DIR=/tmp/x node eval-ladder.mjs [--engine jev|local] [--golden f] [--only substring] [--judge approve-all|markers]
+//   REFLEX_DATA_DIR=/tmp/x node eval-ladder.mjs [--engine jev|local|laya] [--golden f] [--only substring] [--judge approve-all|markers]
 import {mkdirSync, readFileSync, writeFileSync} from "node:fs";
 import {join} from "node:path";
 import {CONFIG, decide, judgeSettings, taint} from "./gate.mjs";
@@ -20,8 +20,10 @@ const cases = golden.cases.filter(c => !arg("--only") || c.command.includes(arg(
 for (const k of ["AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION"]) delete process.env[k];
 process.env.KUBECONFIG = "/dev/null";
 const stub = await stubServer({approveAll: arg("--judge", "approve-all") === "approve-all"});
-const run = `ladder-${Date.now()}`, engine = arg("--engine", "jev"), keyless = engine === "local";
-if (!["jev", "local"].includes(engine)) throw new Error("--engine takes jev or local");
+const run = `ladder-${Date.now()}`, engine = arg("--engine", CONFIG.engine === "laya" ? "laya" : "jev"), keyless = engine === "local";
+if (!["jev", "local", "laya"].includes(engine)) throw new Error("--engine takes jev, local or laya");
+// laya: the server URL and checkpoint come from the environment or config.json, as in the hooks.
+if ((engine === "laya") !== (CONFIG.engine === "laya")) throw new Error("--engine laya goes with REFLEX_ENGINE=laya (and `reflex laya start`), --engine jev|local without it");
 Object.assign(CONFIG, {mode: "enforce", allow: "on", engine, checkpoints: false,
   judge: {...judgeSettings({backend: "openai-compatible", url: stub.url, model: "stub-approve-all", budget: {calls: 1000, usd: 100}}, undefined, engine), enabled: true},
   queue: {...CONFIG.queue, enabled: true, notify: null}});
@@ -62,7 +64,8 @@ console.log(`human interventions ${(100 * humans / results.length).toFixed(1)} p
             `${(100 * stub.seen.length / results.length).toFixed(1)} per 100 commands (stub: ${arg("--judge", "approve-all")}) · unsafe approvals ${unsafe}`);
 // Spend per judgment: the stub reports the tokens of what it was sent (4 characters a token), so this
 // is the size of the case Reflex assembles. Over judge.max_input_tokens on average fails the run.
-const calls = readFileSync(join(CONFIG.data, "judge.jsonl"), "utf8").trim().split("\n").map(l => JSON.parse(l))
+const judged = (() => { try { return readFileSync(join(CONFIG.data, "judge.jsonl"), "utf8").trim(); } catch { return ""; } })();   // none when System 1 settled every case
+const calls = judged.split("\n").filter(Boolean).map(l => JSON.parse(l))
   .filter(r => r.call_id?.startsWith(run));
 const metered = calls.filter(r => !r.cached && r.usage?.input > 0), meanIn = metered.length ? Math.round(metered.reduce((s, r) => s + r.usage.input, 0) / metered.length) : 0;
 const tooBig = meanIn > CONFIG.judge.max_input_tokens;

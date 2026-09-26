@@ -9,6 +9,7 @@ import {compile} from "./policy.mjs";
 import {detectors, guardMode, sourceKind} from "./guard.mjs";
 import {judgeKey, probe, budgetState} from "./judge2.mjs";
 import {breaker, listItems} from "./autonomy.mjs";
+import {health as layaHealth} from "./laya.mjs";
 
 const doctor = process.argv.includes("--doctor"), json = process.argv.includes("--json");
 const errors = [], warnings = [], agents = [];
@@ -37,6 +38,11 @@ if (CONFIG.engine === "jev") {
     spawnSync("security", ["find-generic-password", "-s", CONFIG.keychain], {stdio: "ignore", timeout: 2000}).status === 0 ? "keychain" : "missing";
   if (key === "missing") errors.push("Jev needs TYPESAFE_API_KEY or a Keychain item. Use reflex setup --engine local for offline operation.");
 }
+// engine laya: the local server must answer, or System 1 falls back to the policy exactly as in a Jev outage.
+const laya = CONFIG.engine === "laya" ? await layaHealth() : null;
+if (laya && !laya.ok) errors.push(`Laya server not reachable at ${CONFIG.api} (${laya.error}): reflex laya start. Until it answers, System 1 falls back to the policy, as in a Jev outage.`);
+if (laya) warnings.push("Engine laya is experimental: measured far below Jev on every golden set (docs/GUIDE.md#laya-local-system-1); keep shadow mode, or use Jev to enforce.");
+if (laya?.ok && !laya.loaded.includes(CONFIG.model)) errors.push(`Laya server at ${CONFIG.api} does not hold checkpoint ${CONFIG.model} (resident: ${laya.loaded.join(", ")}).`);
 
 for (const [name, saved] of Object.entries(USER_CONFIG.agents ?? {})) {
   if (!saved || typeof saved.root !== "string" || typeof saved.node !== "string") { errors.push(`${name}: invalid installation record`); continue; }
@@ -134,7 +140,7 @@ if (!configuration && CONFIG.judge.enabled) {
 const items = listItems(), pending = items.filter(i => i.status === "pending");
 const queue = {enabled: CONFIG.queue.enabled, pending: pending.length, total: items.length, oldest_pending: pending.at(-1)?.created ?? null};
 if (pending.length) warnings.push(`${pending.length} item${pending.length === 1 ? "" : "s"} waiting in the approval queue: reflex queue list.`);
-const result = {profile: CONFIG.profile, engine: CONFIG.engine, system1: CONFIG.engine === "jev" ? "Jev + policy" : keyless ? "local rules (keyless: what they do not cover goes to System 2)" : "local rules", mode: CONFIG.mode, guard: guardMode(), allow: CONFIG.allow, config: USER_CONFIG_FILE,
+const result = {profile: CONFIG.profile, engine: CONFIG.engine, system1: CONFIG.engine === "jev" ? "Jev + policy" : laya ? `Laya ${CONFIG.model} (local, ${laya.ok ? "running" : "DOWN"}) + policy` : keyless ? "local rules (keyless: what they do not cover goes to System 2)" : "local rules", mode: CONFIG.mode, guard: guardMode(), allow: CONFIG.allow, config: USER_CONFIG_FILE,
   policy, api_key: key, judge, queue, checkpoints: CONFIG.checkpoints, agents, errors, warnings};
 if (json) console.log(JSON.stringify(result, null, 2));
 else {

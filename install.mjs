@@ -20,7 +20,7 @@ import {execFileSync} from "node:child_process";
 import {homedir} from "node:os";
 import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
-import {USER_CONFIG, USER_CONFIG_FILE, USER_CONFIG_ERROR, judgeSettings} from "./gate.mjs";
+import {ENGINES, USER_CONFIG, USER_CONFIG_FILE, USER_CONFIG_ERROR, judgeSettings} from "./gate.mjs";
 
 const argv = process.argv.slice(2);
 const opt = (n, d) => {
@@ -43,7 +43,7 @@ const KEYCHAIN = opt("--keychain", undefined);   // macOS Keychain item holding 
 const CONTEXT = argv.includes("--context") ? "on" : argv.includes("--no-context") ? "off" : "keep";
 if (argv.includes("--context") && argv.includes("--no-context")) throw new Error("--context and --no-context conflict");
 if (USER_CONFIG_ERROR && !UNINSTALL) throw new Error(USER_CONFIG_ERROR);
-if (!["local", "jev"].includes(ENGINE)) throw new Error("--engine must be local or jev");
+if (!ENGINES.includes(ENGINE)) throw new Error("--engine must be local, jev or laya");
 if (!["off", "shadow", "enforce"].includes(MODE)) throw new Error("--mode must be off, shadow or enforce");
 if (!["off", "shadow", "on"].includes(ALLOW)) throw new Error("--allow must be off, shadow or on");
 if (ALLOW === "on" && MODE !== "enforce") console.error(`note: --allow on only takes effect with --mode enforce; in ${MODE} mode allows are logged as would_allow`);

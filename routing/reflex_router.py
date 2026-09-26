@@ -26,6 +26,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
@@ -37,8 +38,9 @@ except ImportError:  # the selfcheck and the CLI run without litellm
 
 HERE = Path(__file__).resolve().parent
 ENV = os.environ
+CONFIG_DIR = Path(ENV.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "reflex"
 try:
-    USER_CONFIG = json.loads((Path(ENV.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "reflex/config.json").read_text())
+    USER_CONFIG = json.loads((CONFIG_DIR / "config.json").read_text())
     if not isinstance(USER_CONFIG, dict):
         raise ValueError("expected a JSON object")
 except FileNotFoundError:
@@ -47,8 +49,13 @@ except (OSError, ValueError):
     USER_CONFIG = {"engine": "local"}  # Invalid settings cannot enable a hosted call.
 CONFIG = {
     "engine": ENV.get("REFLEX_ENGINE", USER_CONFIG.get("engine", "jev")),
-    "api": ENV.get("REFLEX_API_URL", "https://api.typesafe.ai/v1/systemone"),
-    "model": ENV.get("REFLEX_MODEL", "jev-1.13.0"),
+}
+# engine laya: the local Laya server (setup/laya/server.py), same request shape, no key, nothing leaves the machine.
+LAYA = {"port": 8421, "model": "typed-decisions", **(USER_CONFIG.get("laya") if isinstance(USER_CONFIG.get("laya"), dict) else {})}
+CONFIG = {
+    **CONFIG,
+    "api": ENV.get("REFLEX_API_URL", f"http://127.0.0.1:{LAYA['port']}/v1/systemone" if CONFIG["engine"] == "laya" else "https://api.typesafe.ai/v1/systemone"),
+    "model": ENV.get("REFLEX_MODEL", LAYA["model"] if CONFIG["engine"] == "laya" else "jev-1.13.0"),
     "mode": ENV.get("REFLEX_ROUTING_MODE", "shadow"),
     "policy": ENV.get("REFLEX_ROUTING_POLICY", str(HERE / "policy.json")),
     "questions": ENV.get("REFLEX_ROUTING_QUESTIONS", str(HERE / "questions.json")),
@@ -218,15 +225,26 @@ def api_key():
     raise RuntimeError(f'no API key: set TYPESAFE_API_KEY or keychain item "{CONFIG["keychain"]}"')
 
 
+def laya_auth():
+    """The local token the Laya server requires (laya.mjs writes it beside config.json); never the TypeSafe key."""
+    try:
+        token = (CONFIG_DIR / "laya.token").read_text().strip()
+    except OSError:
+        return {}
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def ask(state, questions, timeout_s):
     """One Jev call -> (answers, usage). Raises on any failure; the caller falls back."""
-    if CONFIG["engine"] != "jev":
+    if CONFIG["engine"] not in ("jev", "laya"):
         raise RuntimeError("hosted classification is disabled")
+    if CONFIG["engine"] == "laya" and urllib.parse.urlsplit(CONFIG["api"]).hostname not in ("127.0.0.1", "::1", "localhost"):
+        raise RuntimeError("engine laya: the server URL must be on 127.0.0.1")
     t0 = time.monotonic()
     body = json.dumps({"state": state, "model": CONFIG["model"], "questions": questions}).encode()
     for attempt in (0, 1):
-        req = urllib.request.Request(CONFIG["api"], body, {"Authorization": f"Bearer {api_key()}",
-                                                           "Content-Type": "application/json"})
+        auth = laya_auth() if CONFIG["engine"] == "laya" else {"Authorization": f"Bearer {api_key()}"}
+        req = urllib.request.Request(CONFIG["api"], body, {**auth, "Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=max(0.1, timeout_s - (time.monotonic() - t0)), context=TLS) as r:
                 payload = json.load(r)
@@ -424,7 +442,7 @@ class ReflexRouter(CustomLogger):
 
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
         mode = self.mode or CONFIG["mode"]
-        if CONFIG["engine"] != "jev" or mode == "off" or call_type not in ROUTED or not isinstance(data.get("model"), str):
+        if CONFIG["engine"] not in ("jev", "laya") or mode == "off" or call_type not in ROUTED or not isinstance(data.get("model"), str):
             return data
         try:
             f, requested = features(data), data["model"]

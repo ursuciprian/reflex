@@ -14,6 +14,8 @@
 //   reflex report [...]                                what the gate has been doing
 //   reflex install [...]                               re-wire agents (install.mjs flags)
 //   reflex uninstall                                   remove every hook, the package and its link
+//   reflex setup --engine laya [--dry-run]             local System 1: a Laya server on 127.0.0.1 (no key)
+//   reflex laya start|stop|status|install-service      the Laya server's lifecycle (laya.mjs)
 //   reflex test | eval                                 offline selfchecks | live golden set
 //   reflex version
 import {spawnSync} from "node:child_process";
@@ -213,6 +215,7 @@ function setup() {
   if (preview) process.exit(preview);
   for (const line of describe(settings)) say(line);
   say(`package: ${TARGET}; command: ${BIN_LINK}`);
+  if (engine === "laya" && run("laya.mjs", ["setup", "--dry-run"])) process.exit(1);
   if (args.includes("--dry-run")) return;
 
   mkdirSync(policyDirectory, {recursive: true, mode: 0o700});
@@ -279,8 +282,14 @@ function setup() {
   const status = run("install.mjs", installArgs, TARGET);
   if (status !== 0) process.exit(status);
 
+  // The Laya server: venv, pinned package, checkpoint, started (a Laya outage behaves like a Jev one).
+  if (engine === "laya" && run("laya.mjs", ["setup"], TARGET)) {
+    say("Laya is not running yet: until it is, System 1 falls back to the policy (reflex laya status)");
+    process.exitCode = 1;
+  }
   say(`installed (${engine} engine, ${mode} mode, allow ${allow})`);
-  say(engine === "local" ? "local rules and instruction matches; no hosted classification or API key needed" : "Jev classification sends redacted context to TypeSafe");
+  say(engine === "local" ? "local rules and instruction matches; no hosted classification or API key needed"
+    : engine === "laya" ? "Laya answers on this machine (127.0.0.1); nothing is sent anywhere" : "Jev classification sends redacted context to TypeSafe");
   say(mode === "shadow" ? "shadow: deterministic rules still block; other decisions are logged only" : mode === "off" ? "off: protection is disabled"
     : judgeOn ? `enforce: ${engine === "local" ? "commands the local rules do not cover" : "uncertain commands"} go to System 2, then ${settings.queue.enabled ? "the approval queue (reflex queue)" : "a human in the agent"}`
     : settings.queue.enabled ? "enforce: uncertain commands are parked in the approval queue (reflex queue)" : "enforce: uncertain commands require human review");
@@ -298,6 +307,7 @@ Next:
 
 function uninstall() {
   const root = existsSync(join(TARGET, "install.mjs")) ? TARGET : ROOT;
+  if (existsSync(join(PREFIX, "laya-venv"))) { run("laya.mjs", ["uninstall-service"], root); run("laya.mjs", ["stop"], root); }
   const status = run("install.mjs", ["--agent", "all", "--uninstall", "--node", node()], root);
   if (status) process.exit(status);
   rmSync(PREFIX, {recursive: true, force: true});
@@ -328,9 +338,10 @@ switch (cmd) {
   case "queue": case "envelope": case "checkpoints": process.exit(run("autonomy.mjs", [cmd, ...args]));
   case "install": process.exit(run("install.mjs", args.includes("--agent") ? args : ["--agent", "all", ...args]));
   case "eval": process.exit(run("eval.mjs", args));
+  case "laya": process.exit(run("laya.mjs", args));
   case "test": process.exit(spawnSync("npm", ["test", "--silent"], {cwd: ROOT, stdio: "inherit"}).status ?? 1);
   case "version": case "--version": case "-v": console.log(version(ROOT)); break;
   default:
-    console.error("usage: reflex setup | status | doctor | check <cmd> | scan <file|-> | run <cmd> | report | queue | envelope | checkpoints | install | uninstall | test | eval | version");
+    console.error("usage: reflex setup | status | doctor | check <cmd> | scan <file|-> | run <cmd> | report | queue | envelope | checkpoints | laya | install | uninstall | test | eval | version");
     process.exit(cmd ? 2 : 0);
 }
