@@ -569,7 +569,9 @@ const writesView = ps => {
   return ps.map((p, i) => {
     const whole = !p.inert || /^[\s({!]*(cd|pushd|popd|for|select|case|while|until|if|export|local|declare|typeset|readonly|read|touch|mkdir)\b|^[\s({!]*\w+=/.test(p.core);
     if (dirs[i] === CD_STEP) return p.targets.map(t => `> ${t}`).join(" ");
-    const words = whole ? p.text.replace(/[<>|&;(){}]/g, " ").split(/\s+/).flatMap(w => [w, w.replace(/^[^=]*=/, "")]) : p.targets;
+    // the arguments of each command in the pipeline (not its name, not a URL) and the redirect targets
+    const words = whole ? [...p.text.split("|").flatMap(s => s.replace(/[<>&;(){}]/g, " ").trim().split(/\s+/).slice(1)), ...p.targets]
+      .flatMap(w => [w, w.replace(/^[^=]*=/, "")]).filter(w => !w.includes("://")) : p.targets;
     const view = whole ? p.text : p.targets.map(t => `> ${t}`).join(" ");
     const at = typeof dirs[i] === "string" ? dirs[i] : null;
     return at ? `${view} ${words.map(w => w.replace(/["'\\]/g, "")).filter(w => w && !/^[-/~$]/.test(w)).map(w => `> ${posix.join(at, w)}`).join(" ")}` : view;
