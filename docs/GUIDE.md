@@ -536,12 +536,13 @@ signal:
   (U+E0000 to U+E007F, *ASCII smuggling*; emoji flags excepted), a phrase split by zero-width
   characters, HTML comments, CSS-hidden elements, `alt` / `title` / `aria-label` attributes,
   markdown comments, the text of `data:` URLs, base64 blobs (also URL-safe or wrapped over lines)
-  that decode to such text, text spelled in a run of variation selectors, and text spaced out
-  letter by letter (`I g n o r e   p r e v i o u s`, read with the single spaces taken out). The phrases are
+  that decode to such text, and text spelled in a run of variation selectors. The phrases are
   matched on the text as a reader takes it in: invisible characters and soft hyphens out,
   look-alike Cyrillic and Greek letters, full-width, mathematical and accented letters read as
   Latin, JSON `\u` escapes and HTML character references decoded. A phrase that needed a disguised
-  letter counts as hidden.
+  letter counts as hidden. They are also matched on text spaced out letter by letter
+  (`I g n o r e   p r e v i o u s`, with any spaces, read with the narrowest gaps taken out); there
+  a phrase counts like a plain one, since a reader sees it, so Jev can clear a quotation.
 - `exfil_link`: a markdown image (or HTML `img`) whose URL has a placeholder or a data word
   (`?q={conversation}`, `[DATA]`, `${SECRET}`), or a link (markdown, HTML `a` or `<https://…>`)
   with a placeholder in a query value; reference-style ones (`![x][1]` … `[1]: url`) by their
@@ -551,8 +552,9 @@ signal:
 **Jev** (engine `jev`): the result is cut into chunks with `context.mjs`'s `chunk()` (at most
 3,000 characters each; at most 24 per result, those with a detector hit first, 8 per request with
 the requests in parallel), and each request asks three questions per chunk (`setup/injection/questions.json`).
-A piece under 1,000 characters goes with the piece before it when both fit in one chunk: a short
-last section judged on its own has no page around it to show who it speaks to.
+A piece under 1,000 characters goes with a neighbour when both fit in one chunk, else with the
+lines before it (overlapping the previous chunk) up to 3,000 characters: a short last section judged
+on its own has no page around it to show who it speaks to.
 
 | Question | Type | Meaning |
 |---|---|---|
@@ -661,7 +663,8 @@ attack, tainted sessions and blocked prompts, as counts.
 the agent; it does not make untrusted content safe, and the gate still judges every command the
 agent runs. The detectors are phrase lists and a handful of structural checks, so an injection
 phrased like ordinary prose passes them (Jev is there for that; the local engine has no answer to
-it), and text spaced out evenly letter by letter, with no wider gap between words, is left to Jev. Jev sees at most 24 chunks of 3,000
+it), and text spaced out evenly letter by letter (the same gap between words), or one letter per
+line, is left to Jev. Jev sees at most 24 chunks of 3,000
 characters per result; past that only the detectors read the rest, and past 4 MB nothing does
 (the result warns). A paraphrase split across two chunks is judged in halves: in the golden set
 each half still reads as an instruction, but a split where neither does would pass. Hidden elements are found by their own `style` or `hidden`
