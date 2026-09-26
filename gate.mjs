@@ -188,6 +188,10 @@ const UNSAFE_FLAGS = new RegExp([
   String.raw`\b[gm]?awk\b[^|;&]*\s(-[a-zA-Z]*[fEilL]|--(file|exec|include|load|source))`, String.raw`\bsed\b[^|;&]*\s(-[a-zA-Z]*f|--file)`,
   String.raw`\byq\b[^|;&]*\s(-[a-zA-Z]*[is]\b|--(inplace|split-exp))`,
 ].join("|"));
+// Every prefix of an ip object that ip.c resolves to it (address comes before addrlabel, route before
+// rule, neighbor before ntable, link before l2tp), and every prefix of list or lst.
+const IP_ADDR = "a|ad|add|addr|addre|addres|address", IP_ROUTE = "r|ro|rou|rout|route", IP_RULE = "ru|rul|rule";
+const IP_NEIGH = "n|ne|nei|neig|neigh|neighb|neighbo|neighbor|neighbou|neighbour", IP_LINK = "l|li|lin|link", IP_LIST = "l|li|lis|list|ls|lst";
 const READ_ONLY_SUB = {
   git: /^(-C\s+\S+\s+)?((status|log|diff|show|blame|ls-files|ls-remote|rev-parse|describe|shortlog|fetch)\b|branch(\s+(-a|-r|-v|-vv|--list|--show-current|--contains\s+\S+|--merged|--no-merged))*\s*$|remote(\s+(-v|show\s+\S+|get-url\s+\S+))?\s*$|reflog(\s+show)?\b(?!.*\b(expire|delete)\b)|config\s+--get|stash\s+(list|show)|worktree\s+list|tag\s+-l)/,
   kubectl: /^(get|describe|logs|top|explain|version|api-resources|config (view|current-context|get-contexts))\b/,
@@ -214,9 +218,13 @@ const READ_ONLY_SUB = {
     ["vacuum-size", "vacuum-files", "vacuum-time", "rotate", "flush", "sync", "relinquish-var", "smart-relinquish-var",
      "setup-keys", "update-catalog", "cursor-file"].some(o => ("--" + o).startsWith(w.split("=")[0])))},
   // options from an allowlist: ip takes any prefix of -batch (-ba, -bat) as a batch file of commands.
-  // ip also takes any prefix of a verb, first match wins: `ip l s` is link set, `ip a a` addr add. So
-  // only spellings that are show/list for that object: `s` is show for addr, route and neigh only.
-  ip: /^((-(br|brief|4|6|s|stats|d|details|j|json|p|pretty|o|oneline|c|color))\s+)*((a|addr|address|r|ro|route|n|neigh|neighbor|neighbour|ru|rule)(\s+(s|l|li|lis)\b.*)?|(l|link|a|addr|address|r|ro|route|n|neigh|neighbor|neighbour|ru|rule)(\s+(sh|sho|show|list|ls|lst)\b.*)?|(r|ro|route|n|neigh|neighbor|neighbour)\s+get\b.*)$/,
+  // ip also takes any prefix of an object or verb, first match wins (iproute2 matches() in ip.c and
+  // do_ipaddr, do_iproute, do_iprule, do_ipneigh, do_iplink): `ip l s` is link set, `ip a a` addr add.
+  // So only spellings that are show/list/get for that object: `s` is show for addr, route, rule and
+  // neigh, not link; `g` is get for route and neigh; any prefix of list or lst is list everywhere.
+  ip: new RegExp(String.raw`^((-(br|brief|4|6|s|stats|d|details|j|json|p|pretty|o|oneline|c|color))\s+)*` +
+    String.raw`((${IP_ADDR}|${IP_ROUTE}|${IP_RULE}|${IP_NEIGH})(\s+(s|sh|sho|show|${IP_LIST})\b.*)?|(${IP_LINK})(\s+(sh|sho|show|${IP_LIST})\b.*)?|` +
+    String.raw`(${IP_ROUTE}|${IP_NEIGH})\s+(g|ge|get)\b.*)$`),
 };
 // `docker exec [-t] [-u user] [-w dir] container cmd`: as read-only as cmd. The container is a
 // literal name, never $C or "$(…)", which could turn into options, a container and another command.
@@ -267,6 +275,10 @@ export function maskQuotes(s, fill = "") {
 // command, which must end the call: words after it would be appended to it on the remote side.
 // Or `ssh [options] host cmd args` with no quotes at all: sshCall takes the words after the host.
 // The call stays on one line: `ssh h⏎uptime` is a login, then a local uptime.
+// GNU timeout with its options (-k1, -s KILL, --kill-after=1, -f, -p, -v), then the duration.
+const TIMEOUT = String.raw`timeout(\s+(-[fpv]+|-[ks]\s*[^\s-]\S*|--(foreground|preserve-status|verbose)|--(kill-after|signal)(=|\s+)[^\s-]\S*))*\s+[^\s-]\S*`;
+const SSH_LEAD = new RegExp(String.raw`^\s*((do|then|else|elif|if|while|until|!|\{)\s+|\w+=\S*\s+|${TIMEOUT}\s+|time\s+|nohup\s+|command\s+|rtk(\s+proxy)?\s+)*$`);
+const RO_PREFIX = new RegExp(String.raw`^((\w+=\S*|rtk(\s+proxy)?|${TIMEOUT}|time|nohup|command)\s+)+`);
 const SSH_CALL = /\bssh((?:[ \t]+[^\s'"`\\;&|<>()]+)+?)(?:[ \t]+(?:'([^']*)'|"((?:[^"\\]|\\[\s\S])*)"))?(?=[ \t]*($|[;&|\n)]))/;
 // Options from an allowlist. Left out: whatever runs a local command or loads local code
 // (ProxyCommand, LocalCommand, KnownHostsCommand, -F config, -I and PKCS11Provider), forwards (-L -R
@@ -316,7 +328,8 @@ const piped = (mask, at) => [...mask.slice(0, at).matchAll(/(^|[^|])\|(?!\|)&?/g
 // in; the call is found in it by its text. A host may mix literal text and loop variables
 // (`web-$i`, `ops@${h}.lan`); the literal part never makes it an option.
 // Without quotes the remote command is the words after the host: plain words only (no $, glob, ~ or
-// quote the local shell would change), and the first is not an option (ssh reads options after the host).
+// quote the local shell would change). ssh reads options after the host until the first other word:
+// those go through the same allowlist, and `--` there is refused.
 function sshCall(c, m, whole) {
   const mask = maskQuotes(c, "_"), bare = m[2] === undefined && m[3] === undefined;
   const q = m[2] === undefined ? '"' : "'", end = m.index + m[0].length - 1;
@@ -326,22 +339,27 @@ function sshCall(c, m, whole) {
   if (mask.slice(m.index, m.index + 3) !== "ssh") return undefined;
   // unquoted, ssh must be the command: in `grep ssh f` it is a word, and in `sort ssh h ls -o out`
   // replacing "ssh h ls -o out" with true would hide what sort writes
-  if (bare && !/^\s*((do|then|else|elif|if|while|until|!|\{)\s+|\w+=\S*\s+|timeout\s+\S+\s+|time\s+|nohup\s+|command\s+|rtk(\s+proxy)?\s+)*$/
-    .test(mask.slice(0, m.index).split(/[;&|\n(]/).at(-1))) return undefined;
+  if (bare && !SSH_LEAD.test(mask.slice(0, m.index).split(/[;&|\n(]/).at(-1))) return undefined;
   if (bare ? mask.slice(m.index, end + 1) !== m[0] : mask[open] !== q || mask[end] !== q) return null;
   if (piped(mask, m.index)) return null;
   const words = m[1].trim().split(/\s+/);
-  let i = 0;
-  for (; i < words.length && words[i].startsWith("-"); i++) {
-    const f = words[i].match(SSH_FLAGS);
-    if (!f || !(f[1] || f[2]) || (!f[2] && f[3])) return null;
-    if (!f[2]) continue;
-    const v = f[3] || words[++i];
-    if (v === undefined || /^-|\/-/.test(v)) return null;
-    const jump = f[2] === "J" ? v : f[2] === "o" ? v.match(/^ProxyJump=(.*)$/i)?.[1] : undefined;
-    if (jump !== undefined ? !SSH_JUMP.test(jump) : f[2] === "o" && !SSH_OPTION.test(v)) return null;
-  }
-  const host = words[i], rest = words.slice(i + 1);
+  // The index of the first word after the options from `i`, or -1 for an option not allowed. ssh
+  // reads options after the host too (`ssh -J a h -J b uptime`), so both runs are checked.
+  const options = i => {
+    for (; i < words.length && words[i].startsWith("-"); i++) {
+      const f = words[i].match(SSH_FLAGS);
+      if (!f || !(f[1] || f[2]) || (!f[2] && f[3])) return -1;
+      if (!f[2]) continue;
+      const v = f[3] || words[++i];
+      if (v === undefined || /^-|\/-/.test(v)) return -1;
+      const jump = f[2] === "J" ? v : f[2] === "o" ? v.match(/^ProxyJump=(.*)$/i)?.[1] : undefined;
+      if (jump !== undefined ? !SSH_JUMP.test(jump) : f[2] === "o" && !SSH_OPTION.test(v)) return -1;
+    }
+    return i;
+  };
+  const i = options(0), after = i < 0 ? -1 : options(i + 1);
+  if (after < 0) return null;
+  const host = words[i], rest = words.slice(after);
   if (host === undefined || words.some((w, k) => k !== i && /[${}*?[\]]|^-.*(\s|\/-)|^-\S*=-/.test(w))) return null;
   const vars = [...host.matchAll(/\$\{(\w+)\}|\$(\w+)/g)].map(x => x[1] ?? x[2]), lit = host.replace(/\$\{\w+\}|\$\w+/g, "x");
   if (!/^[\w.%@:-]+$/.test(lit) || /(^|@)-/.test(lit)) return null;
@@ -404,7 +422,7 @@ export function readOnly(cmd, extra = [], depth = 0, whole = null) {
     if (/^for\s+\w+(\s+in(\s+[^\s]+)*)?$|^case\s+\S+\s+in$/.test(seg) && !/\s(do|done)(\s|$)/.test(seg)) return true;
     seg = seg.replace(/^case\s+\S+\s+in\s+\(?[^\s()]+\)\s*(?=\S)/, "");
     // Prefix assignments must be safe too; wrappers run whatever follows them, so judge what follows.
-    const prefixes = seg.match(/^((\w+=\S*|rtk(\s+proxy)?|timeout\s+\S+|time|nohup|command)\s+)+/)?.[0] ?? "";
+    const prefixes = seg.match(RO_PREFIX)?.[0] ?? "";
     if ((prefixes.match(/\w+=\S*/g) ?? []).some(a => !assignmentOk(a))) return false;
     const [head, ...rest] = seg.slice(prefixes.length).split(/\s+/);
     if (READ_ONLY.has(head)) return true;
@@ -870,7 +888,9 @@ function scriptLines(body) {
   }
   const expand = s => s.replace(/\$\{?(\w+)\}?/g, (v, name) => vars[name] ?? v);
   for (let pass = 0; pass < 3; pass++) for (const k in vars) vars[k] = expand(vars[k]);
-  return {lines: lines.map(expand), skipped: lines.length < all.length};
+  // and each line with the quoted parts of its words joined, as the shell joins them (m''ain)
+  const joined = l => { const j = l.replace(QUOTED_PART, "$2$4"); return j === l ? [l] : [l, j]; };
+  return {lines: lines.map(expand).flatMap(joined), skipped: lines.length < all.length};
 }
 
 // A directory with its own .git between the checkout and cwd (cwd included).
@@ -879,6 +899,8 @@ function nestedCheckout(cwd) {
   return false;
 }
 
+// A quoted part of a word: quotes with no space, operator or expansion inside, next to other word text.
+const QUOTED_PART = /(?<=[^\s;&|<>()])(['"])([^'"\s;&|<>()$`\\]*)\1|(['"])([^'"\s;&|<>()$`\\]*)\3(?=[^\s;&|<>()'"])/g;
 /** Everything decided without Jev, or null when Jev has to judge. */
 export function precheck(command, cwd, env) {
   const rules = load("rules.json");
@@ -888,6 +910,10 @@ export function precheck(command, cwd, env) {
   // --secret-id=prod-db), minus heredoc bodies that are only data.
   const haystack = [stripDataHeredocs(command),`cwd=${cwd ?? ""}`, ...Object.entries(env).map(([k, v]) => `${k}=${v}`)].join(" ");
   const ruled = r => ({outcome: r.outcome, rule: r.rule, id: r.id, source: "rule", policy_version: rules.version});
+  // The shell joins quoted parts of a word (m''ain, 'ma'in, ma"st"er are main and master): a rule
+  // also reads the command with those quotes dropped.
+  const joined = command.replace(QUOTED_PART, "$2$4");
+  if (joined !== command) { const r = precheck(joined, cwd, env); if (r?.source === "rule") return r; }
   // Some rules must see reads too (printing an API key is a read).
   const bare = stripDataHeredocs(command), ctx = haystack.slice(bare.length);
   const early = checkRules(haystack, {rules: rules.rules.filter(r => r.before_read_only)}, bare);
@@ -1729,6 +1755,26 @@ async function selfcheck() {
   for (const c of ["cd ~/.claude && jq . settings.json > /tmp/x", "pushd ~/.config/reflex; jq . config.json > /tmp/x", "cd ~/.claude/hooks && cat x.sh > /tmp/y",
     "(cd ~/.claude && ls) && echo x > notes.txt", "(cd ~/.codex && cat hooks.json) > /tmp/h"])
     ok(pw(c) !== "tamper", `not tamper, a read after cd: ${c}`);
+  // ssh options after the host, timeout options, ip prefixes per iproute2 first match, a remote find
+  for (const c of ["ssh -J a h -J b uptime", "ssh h -J b uptime", "ssh h -J b 'uptime'", "timeout -k1 5 ssh h uptime", "timeout -k 1 5 ssh h uptime",
+    "timeout --signal=KILL 5 ssh h uptime", "ip n g 10.0.0.1 dev eth0", "ip ne s", "ip l l", "ip li ls", "ip r g 1.1.1.1", "ip neighbou show", "ip ru s", "ip addre l"])
+    ok(readOnly(c), `read-only: ${c}`);
+  for (const c of ["ssh h -J -oProxyCommand=x uptime", "ssh h -L 80:x:80 uptime", "ssh h -J b -- uptime", "ssh h -oProxyCommand=x uptime", "timeout -k1 5 rm -rf x",
+    "timeout -s KILL 5 ssh h reboot", "ip l s", "ip l set eth0 down", "ip r sa", "ip nt s", "ip ru a", "ip n f", "ip n d 1.1.1.1 dev eth0", "ip ru g", "ip a g", "ip l g"])
+    ok(!readOnly(c), `not read-only: ${c}`);
+  ok(pw("ssh h find . -name .env") === null && pw(". .env") === "secret-file-read" && pw("ssh h '. .env'") === "secret-file-read" &&
+     pw("ssh h cat .env") === "secret-file-read", "secret-file-read: find's . is a path, . .env is source");
+  // quoted parts of a word are joined; a force push of HEAD or of no ref asks when the branch is unknown
+  for (const c of ["git push --force origin m''ain", `git push -f origin ma""ster`, "git push -f origin 'ma'in", "git push -f origin +'main'"])
+    ok(pw(c) === "force-push-main", `force push main, quotes joined: ${c}`);
+  for (const c of ["git push --force origin HEAD", "git push -f", "git push --force-with-lease", "git push -f -u origin", "git push origin +HEAD"])
+    ok(pw(c) === "force-push-unknown-branch", `force push, branch unknown: ${c}`);
+  ok(checkRules("git push -f origin HEAD cwd=/w git_branch=feat/x", rules)?.id !== "force-push-unknown-branch" && pw("git push origin HEAD") !== "force-push-unknown-branch" &&
+     pw("git push -f origin HEAD:feat/x") === null, "force push: a known branch or an explicit ref is not unknown");
+  // node --check is the fast lane only without a preload or an env file
+  for (const c of ["node --check -r ./p.js x.js", "node --check --import ./p.mjs x.js", "node --check x.js --require=./p.js", "node --check --env-file=.env.test x.js"])
+    ok(!fastPass(c, rules), `not fast lane: ${c}`);
+  ok(fastPass("node --check x.js", rules), "node --check alone is the fast lane");
   // the checkout: committing its files is not changing them; a worktree nested in it is another checkout unless the command climbs out
   const nested = join(HERE, `.selfcheck-nested-${process.pid}`);
   try {
