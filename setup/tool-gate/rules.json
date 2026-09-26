@@ -17,7 +17,7 @@
       "before_read_only": true,
       "rule": "reads a private key, a credentials file, a .env file or Kubernetes secrets",
       "all": [
-        "(?:^|[;&|(\\n\\x60]|\\$\\(|\\b(?:ba|z|k|da)?sh\\s+-c\\s+['\"]|\\beval\\s+['\"]|\\bssh\\s[^;&|\\n]*?\\s['\"])\\s*(?:(?:then|do|else|!|\\{|sudo|env|nohup|time|command|exec|rtk(?:\\s+proxy)?|timeout\\s+\\S+|xargs(?:\\s+-\\S+)*|\\w+=\\S*)\\s+)*(?:(?:cat|bat|b?less|more|head|tail|grep|egrep|fgrep|rg|ag|base64|xxd|strings|od|hexdump|open|source|\\.|nc|ncat|netcat|socat|tar|zip|gzip|jq|yq|awk|sed|mcp\\s+\\S+)\\s(?:[^;&|\\n'\"]|'[^'\\n]*'|\"[^\"\\n]*\")*?(?:['\"][^'\"\\n]*?)?(?:\\.ssh/id_(?![\\w*?-]*\\.pub\\b)|\\.aws/credentials\\b|\\.(?:netrc|git-credentials|pgpass)\\b|(?<=^|[\\s/'\"=@<:])\\.env(?:\\.(?!(?:example|sample|template|dist|defaults)\\b)[\\w-]+)?(?=$|[\\s'\"),;&|\\x60]))|(?:cp|scp|rsync)\\s(?:[^;&|\\n'\"]|'[^'\\n]*'|\"[^\"\\n]*\")*?(?:['\"][^'\"\\n]*?)?(?:\\.ssh/id_(?![\\w*?-]*\\.pub\\b)|\\.aws/credentials\\b|\\.(?:netrc|git-credentials|pgpass)\\b|(?<=^|[\\s/'\"=@<:])\\.env(?:\\.(?!(?:example|sample|template|dist|defaults)\\b)[\\w-]+)?(?=$|[\\s'\"),;&|\\x60]))\\S*\\s+(?!cwd=)[^\\s;&|]|curl\\b[^;&|\\n]*?\\s(?:-[a-zA-Z]*[dFT]|--data[\\w-]*|--form[\\w-]*|--upload-file|--json)(?:[\\s=]+|(?=['\"@]))['\"]?[^\\s'\";&|]*(?:\\.ssh/id_(?![\\w*?-]*\\.pub\\b)|\\.aws/credentials\\b|\\.(?:netrc|git-credentials|pgpass)\\b|(?<=^|[\\s/'\"=@<:])\\.env(?:\\.(?!(?:example|sample|template|dist|defaults)\\b)[\\w-]+)?(?=$|[\\s'\"),;&|\\x60]))|kubectl\\b[^;&|\\n]*\\sget\\s+(?:-\\S+\\s+(?:[^-\\s]\\S*\\s+)?)*(?:[\\w.]+,)*secrets?(?![\\w-]))|<\\s*['\"]?[^\\s;&|'\"]*(?:\\.ssh/id_(?![\\w*?-]*\\.pub\\b)|\\.aws/credentials\\b|\\.(?:netrc|git-credentials|pgpass)\\b|(?<=^|[\\s/'\"=@<:])\\.env(?:\\.(?!(?:example|sample|template|dist|defaults)\\b)[\\w-]+)?(?=$|[\\s'\"),;&|\\x60]))"
+        "(?:^|[;&|(\\n\\x60]|\\$\\(|\\b(?:ba|z|k|da)?sh\\s+-c\\s+['\"]|\\beval\\s+['\"]|\\bssh\\s[^;&|\\n]*?\\s['\"]|\\bssh(?:[ \\t]+[^\\s;&|'\"]+)+?[ \\t])\\s*(?:(?:then|do|else|!|\\{|sudo|env|nohup|time|command|exec|rtk(?:\\s+proxy)?|timeout\\s+\\S+|xargs(?:\\s+-\\S+)*|\\w+=\\S*)\\s+)*(?:(?:cat|bat|b?less|more|head|tail|grep|egrep|fgrep|rg|ag|base64|xxd|strings|od|hexdump|nl|sort|uniq|cut|paste|fold|column|diff|comm|cmp|tac|rev|open|source|\\.|nc|ncat|netcat|socat|tar|zip|gzip|jq|yq|awk|sed|mcp\\s+\\S+)\\s(?:[^;&|\\n'\"]|'[^'\\n]*'|\"[^\"\\n]*\")*?(?:['\"][^'\"\\n]*?)?(?:\\.ssh/id_(?![\\w*?-]*\\.pub\\b)|\\.aws/credentials\\b|\\.(?:netrc|git-credentials|pgpass)\\b|(?<=^|[\\s/'\"=@<:])\\.env(?:\\.(?!(?:example|sample|template|dist|defaults)\\b)[\\w-]+)?(?=$|[\\s'\"),;&|\\x60]))|(?:cp|scp|rsync)\\s(?:[^;&|\\n'\"]|'[^'\\n]*'|\"[^\"\\n]*\")*?(?:['\"][^'\"\\n]*?)?(?:\\.ssh/id_(?![\\w*?-]*\\.pub\\b)|\\.aws/credentials\\b|\\.(?:netrc|git-credentials|pgpass)\\b|(?<=^|[\\s/'\"=@<:])\\.env(?:\\.(?!(?:example|sample|template|dist|defaults)\\b)[\\w-]+)?(?=$|[\\s'\"),;&|\\x60]))\\S*\\s+(?!cwd=)[^\\s;&|]|curl\\b[^;&|\\n]*?\\s(?:-[a-zA-Z]*[dFT]|--data[\\w-]*|--form[\\w-]*|--upload-file|--json)(?:[\\s=]+|(?=['\"@]))['\"]?[^\\s'\";&|]*(?:\\.ssh/id_(?![\\w*?-]*\\.pub\\b)|\\.aws/credentials\\b|\\.(?:netrc|git-credentials|pgpass)\\b|(?<=^|[\\s/'\"=@<:])\\.env(?:\\.(?!(?:example|sample|template|dist|defaults)\\b)[\\w-]+)?(?=$|[\\s'\"),;&|\\x60]))|kubectl\\b[^;&|\\n]*\\sget\\s+(?:-\\S+\\s+(?:[^-\\s]\\S*\\s+)?)*(?:[\\w.]+,)*secrets?(?![\\w-]))|<\\s*['\"]?[^\\s;&|'\"]*(?:\\.ssh/id_(?![\\w*?-]*\\.pub\\b)|\\.aws/credentials\\b|\\.(?:netrc|git-credentials|pgpass)\\b|(?<=^|[\\s/'\"=@<:])\\.env(?:\\.(?!(?:example|sample|template|dist|defaults)\\b)[\\w-]+)?(?=$|[\\s'\"),;&|\\x60]))"
       ]
     },
     {
@@ -102,6 +102,15 @@
       "rule": "changes files in an agent settings or hooks directory",
       "all": [
         "cwd=\\S*(\\.claude/(settings|hooks)|\\.codex/(hooks|rules)|\\.hermes/|opencode/plugins?|\\.(pi|omp)/agent/(extensions|settings))"
+      ]
+    },
+    {
+      "id": "ssh-local-command",
+      "outcome": "ask",
+      "context": false,
+      "rule": "ssh option that runs a local command (ProxyCommand, LocalCommand, Match exec, a jump hop that is an option)",
+      "all": [
+        "\\bssh\\s[^;&|\\n]*?(-o\\s*['\"]?\\s*(proxycommand|localcommand|permitlocalcommand|knownhostscommand|match)\\b|(-J\\s*|proxyjump[=\\s]+)['\"]?([^\\s;&|'\"]*[,/])?-)"
       ]
     },
     {
