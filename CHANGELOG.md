@@ -6,6 +6,8 @@ All notable changes to Reflex are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-26
+
 ### Added
 
 - `reflex replay [claude|codex|opencode|pi|all]`: what the gate would have done with the shell commands
@@ -350,7 +352,8 @@ All notable changes to Reflex are documented here. The format follows
   and 3.12).
 - `LICENSE` (MIT), `SECURITY.md`, `CONTRIBUTING.md`, this changelog and issue templates.
 
-[Unreleased]: https://github.com/ursuciprian/reflex/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/ursuciprian/reflex/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/ursuciprian/reflex/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/ursuciprian/reflex/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ursuciprian/reflex/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ursuciprian/reflex/compare/v0.5.0...v0.6.0
