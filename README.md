@@ -24,6 +24,7 @@ queue, so autonomous coding agents only stop for the commands that need a person
 - [How a command is decided](#how-a-command-is-decided)
 - [Real-world scenarios, with outputs](#real-world-scenarios-with-outputs)
 - [Measured results](#measured-results)
+- [Replay: what it would have done on a real week](#replay-what-it-would-have-done-on-a-real-week)
 - [Compared with other AI coding agent guardrails](#compared-with-other-ai-coding-agent-guardrails)
 - [Supported agents: Claude Code hooks, Codex hooks and more](#supported-agents-claude-code-hooks-codex-hooks-and-more)
 - [Cost and latency](#cost-and-latency)
@@ -601,6 +602,35 @@ Raw `typed-decisions` has no safety failure, but gets there by denying or flaggi
 calibrated Laya checkpoints miss a deny Jev catches. Jev stays the recommendation for every
 decision. The GUIDE has the full table, including `multilingual` and calibrated runs.
 
+## Replay: what it would have done on a real week
+
+Golden sets are small and hand-labelled. To see what Reflex does on real work, `reflex replay`
+runs the shell commands already in your local Claude Code, Codex, opencode or pi transcripts
+through the gate. It executes nothing and writes nothing. Here is one DevOps and GenAI engineer's
+last 7 days, local engine, Reflex v0.8.0:
+
+| | Claude Code | Codex |
+|---|---|---|
+| Shell commands the agent ran | 13,594 | 700 |
+| Passed as read-only or fast lane, no API call | 7,216 (53 %) | 485 (69 %) |
+| Asked by a rule | 585 | 5 |
+| Denied by a rule | 37 | 0 |
+| Left to the engine | 5,756 | 210 |
+| Would reach a human per 100 commands (keyless, supervised) | 46.6 | 30.7 |
+| Estimated cost to send the rest to Jev | about $0.45 | about $0.015 |
+
+The rules that fired most were `tamper` (549, changes near agent or Reflex settings),
+`force-push-main` (22), `secret-read` and `secret-file-read` (28), `rm-root` (11) and
+`secret-exfil` (7). Not every hit was right: the replay showed rules over-matching a branch
+named `...-on-master`, read-only `jq` on settings files and text inside `python3 - <<EOF`
+scripts. That is what replay is for; those rules are being tightened for the next release.
+Run it on your own history before you switch to enforce mode:
+
+```bash
+reflex replay claude --since 7d
+reflex replay codex --since 7d --json
+```
+
 ## Compared with other AI coding agent guardrails
 
 Reflex is a hook, not a sandbox. It decides per command, using what the command is and where it
@@ -656,6 +686,8 @@ trust or verify a native approval dialog; run a harmless command in a fresh agen
 - With Jev in shadow mode, classification runs in a detached background process, so the agent does
   not wait for it.
 - Identical commands in the same context are cached for 24 hours.
+- TypeSafe publishes no price list. Replay estimates Jev spend at $0.04 per million input tokens,
+  which matches a public third-party measurement; set `REFLEX_JEV_USD_PER_MTOK` to your price.
 - The Laya engine costs nothing per call and keeps about 1.4 GB resident on an M5 Max (2.2 GB on
   CPU); on a CPU-only machine it can exceed the gate's 3 s budget and fall back to ask.
 

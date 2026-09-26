@@ -55,9 +55,11 @@ const mask = s => redact(s).replace(/(\s(?:--password|--passwd|--token)(?:=|\s+)
   .replace(/(\blogin\b[^|;&\n]*\s-p\s*)(?!<redacted>)\S+/g, "$1<redacted>")
   .replace(/\becho\s+\S+(\s*\|\s*sudo\s+-S)/g, "echo <redacted>$1");
 
-// Jev's price: README "Cost and latency", about 25,000 judged commands per dollar at ~1k input
-// tokens a call, i.e. $0.04 per million input tokens. The estimate assumes 2k a call (eval.mjs).
-const USD_PER_MTOK = 0.04, EST_TOKENS = 2000;
+// Jev's price: TypeSafe publishes no per-token price page. $0.04 per million input tokens matches a
+// public third-party measurement (abide's README: 1,000 to 1,600 tokens for $0.00004 to $0.00007,
+// 2026-09-18). REFLEX_JEV_USD_PER_MTOK overrides it. The estimate assumes 2k tokens a call (eval.mjs).
+const priceEnv = Number(process.env.REFLEX_JEV_USD_PER_MTOK);
+const USD_PER_MTOK = Number.isFinite(priceEnv) && priceEnv >= 0 && process.env.REFLEX_JEV_USD_PER_MTOK !== "" ? priceEnv : 0.04, EST_TOKENS = 2000;
 const usd = tokens => +(tokens * USD_PER_MTOK / 1e6).toFixed(6);
 const pct = (xs, p) => { const s = [...xs].sort((a, b) => a - b); return s.length ? s[Math.min(s.length - 1, Math.floor(p * s.length))] : null; };
 
