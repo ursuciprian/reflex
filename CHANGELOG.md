@@ -39,6 +39,8 @@ All notable changes to Reflex are documented here. The format follows
 
 ### Security
 
+- `nvidia-smi` counted as read-only whatever its flags; `-pl` (power limit), `-r` / `--gpu-reset`,
+  `-pm`, clock locks, MIG and ECC settings change the GPU and now go through the gate.
 - The read-only list no longer passes `ssh` calls that 0.6.0 let through without a judgment: `-F`
   (a config file can run a `ProxyCommand`), `-I` / `PKCS11Provider` (loads a local library),
   `-o KnownHostsCommand` and `SendEnv`, agent and X11 forwarding (`-A`, `-X`), `-E` (writes a local

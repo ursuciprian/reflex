@@ -150,7 +150,7 @@ export const readText = p => { try { return readFileSync(p, "utf8"); } catch { r
 // so every doubtful construct below returns false rather than trying to understand it.
 const READ_ONLY = new Set(("ls cat head tail less wc grep egrep rg fd find tree pwd echo printf which type " +
   "file stat du df date uname whoami id hostname uptime sw_vers jq yq sort cut tr diff cmp sed awk " +
-  "column realpath readlink dirname basename true false test [ [[ cd sleep ps pgrep lsof nvidia-smi " +
+  "column realpath readlink dirname basename true false test [ [[ cd sleep ps pgrep lsof " +
   "md5 shasum sha256sum xxd od strings nl fold paste comm exit return free nproc lscpu seq").split(" "));
 // Flags that make an otherwise read-only tool run a program or write a file.
 const UNSAFE_FLAGS = new RegExp([
@@ -172,6 +172,8 @@ const READ_ONLY_SUB = {
   npm: /^(view|ls|list|outdated|config get)\b/,
   brew: /^(list|info|search|services list|--prefix)\b/,
   uniq: /^(-\S+\s*)*$/,          // flags only: `uniq in out` writes out
+  // queries only: -pm, -pl, -r, -e, -c, -ac, clock locks, MIG and auto-boost settings change the GPU
+  "nvidia-smi": /^(?!.*(^|\s)(-pm|-pl|-r|-e|-c|-ac|-rac|-lgc|-rgc|-lmc|-rmc|-mig|-am|-cc|-dm|--persistence-mode|--power-limit|--gpu-reset|--ecc-config|--compute-mode|--applications-clocks|--reset-applications-clocks|--lock-gpu-clocks|--reset-gpu-clocks|--lock-memory-clocks|--reset-memory-clocks|--multi-instance-gpu|--auto-boost-default|--auto-boost-permission|--cuda-clocks|--driver-model)(\s|=|$))/,
   // what a remote host is usually asked over ssh (#26)
   systemctl: /^((--\S+|-[a-zA-Z]+)\s+)*(status|is-active|is-enabled|is-failed|is-system-running|show|cat|list-units|list-unit-files|list-timers|list-dependencies)\b/,
   journalctl: /^(?!.*--(vacuum|rotate|flush|sync|relinquish|smart-relinquish|setup-keys|update-catalog|cursor-file))/,
@@ -1267,6 +1269,9 @@ async function selfcheck() {
   ok(!readOnly("gh api -X DELETE repos/a/b") && !readOnly("gh api repos/a/b/issues -f title=x"), "gh api writes");
   ok(readOnly("mytool --version") && !readOnly("mytool --install"), "--version");
   ok(readOnly("ssh -o ConnectTimeout=8 -o BatchMode=yes host 'nvidia-smi; uptime' 2>&1 | tail -3"), "ssh read");
+  ok(readOnly("nvidia-smi") && readOnly("nvidia-smi --query-gpu=name,memory.used --format=csv") && readOnly("nvidia-smi -q -d POWER") &&
+     !readOnly("nvidia-smi -pl 200") && !readOnly("nvidia-smi -r -i 0") && !readOnly("nvidia-smi --gpu-reset -i 0") &&
+     !readOnly("nvidia-smi -pm 1") && !readOnly("nvidia-smi -lgc 1500,1500") && !readOnly("ssh h 'nvidia-smi -pl 150'"), "nvidia-smi: queries only");
   ok(!readOnly("ssh host 'sudo reboot'") && !readOnly("ssh -n host 'rm -rf ~/x'"), "ssh write");
   ok(!readOnly("ssh h 'echo' '; rm -rf /'") && !readOnly("ssh h reboot"), "ssh trailing args / unquoted");
   // #26: an ssh call is read-only only as a read of its remote command, and none of these is one
