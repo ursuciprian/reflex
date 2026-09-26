@@ -562,6 +562,12 @@ function roughPipelines(c) {
   }
   return out;
 }
+// Directories whose relative paths the tamper rule could care about: an agent's settings or hooks
+// directory, a parent of one, a directory named reflex, the checkout, the Reflex data or config
+// directory (or a parent), or one only a variable names. Elsewhere an argument such as
+// ursuciprian/reflex (gh -R) is not a path and is left unresolved.
+const CD_WATCH = /(^|\/)(\.claude(\/(settings|hooks)\b.*)?|\.codex(\/(hooks|rules|config)\b.*)?|\.hermes(\/.*)?|\.config(\/(reflex|opencode)\b.*)?|\.local(\/state(\/.*)?)?|\.(pi|omp)(\/agent(\/.*)?)?|opencode(\/.*)?|reflex(\/.*)?)\/?$|\$|^~\/?$/i;
+const cdWatched = d => CD_WATCH.test(d) || [HERE, CONFIG.data, dirname(USER_CONFIG_FILE)].some(p => (d + "/").startsWith(p + "/") || p.startsWith(d.replace(/\/$/, "") + "/"));
 // A cd, pushd or popd the directory tracking below reads writes nothing itself: its effect is the
 // resolved paths. One it cannot read is kept whole.
 const writesView = ps => {
@@ -573,7 +579,7 @@ const writesView = ps => {
     const words = whole ? [...p.text.split("|").flatMap(s => s.replace(/[<>&;(){}]/g, " ").trim().split(/\s+/).slice(1)), ...p.targets]
       .flatMap(w => [w, w.replace(/^[^=]*=/, "")]).filter(w => !w.includes("://")) : p.targets;
     const view = whole ? p.text : p.targets.map(t => `> ${t}`).join(" ");
-    const at = typeof dirs[i] === "string" ? dirs[i] : null;
+    const at = typeof dirs[i] === "string" && cdWatched(dirs[i]) ? dirs[i] : null;
     return at ? `${view} ${words.map(w => w.replace(/["'\\]/g, "")).filter(w => w && !/^[-/~$]/.test(w)).map(w => `> ${posix.join(at, w)}`).join(" ")}` : view;
   }).join(" ; ");
 };
@@ -1756,7 +1762,9 @@ async function selfcheck() {
     "cd ~/.claude && (cd /tmp && ls) && tee settings.json", "cd ~/.config && cd reflex && tee config.json", "cd ~/.claude > ~/.claude/settings.json"])
     ok(pw(c) === "tamper", `tamper after cd: ${c}`);
   for (const c of ["cd ~/.claude && jq . settings.json > /tmp/x", "pushd ~/.config/reflex; jq . config.json > /tmp/x", "cd ~/.claude/hooks && cat x.sh > /tmp/y",
-    "(cd ~/.claude && ls) && echo x > notes.txt", "(cd ~/.codex && cat hooks.json) > /tmp/h"])
+    "(cd ~/.claude && ls) && echo x > notes.txt", "(cd ~/.codex && cat hooks.json) > /tmp/h",
+    "cd /w/.claude/worktrees/a && gh pr comment 6 --repo ursuciprian/reflex --body-file /tmp/b", "cd /tmp && npx -y -p @ursuciprian/reflex@0.3.0 reflex version",
+    "cd /tmp/x && curl -sL https://example.com/reflex/hooks.md -o pm.md"])
     ok(pw(c) !== "tamper", `not tamper, a read after cd: ${c}`);
   // ssh options after the host, timeout options, ip prefixes per iproute2 first match, a remote find
   for (const c of ["ssh -J a h -J b uptime", "ssh h -J b uptime", "ssh h -J b 'uptime'", "timeout -k1 5 ssh h uptime", "timeout -k 1 5 ssh h uptime",
