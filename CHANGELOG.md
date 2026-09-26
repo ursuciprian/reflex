@@ -51,6 +51,34 @@ All notable changes to Reflex are documented here. The format follows
 - `--output` only counts as a write for `git` and `sort`: `aws … --output json`,
   `journalctl --output=short-iso` and `systemctl --output=json` are reads again. `systemctl -t
   service list-units` (options that take a value) is read-only.
+- False positives from a replay of a week of real agent commands (rules-v13, golden-v6):
+  - `force-push-main` no longer fires on a branch whose name only contains main or master
+    (`git push origin --delete feat/something-on-master`). It now looks for main or master as the
+    ref pushed or deleted (`main`, `:main`, `+main`, `HEAD:main`, `refs/heads/main`, quoted or not)
+    or the current branch (a ref that only a variable or substitution names still counts when main
+    appears anywhere), and it also sees `git -C dir push`, `git -c k=v push`, `git -P push` and
+    backslash-newline continuations, which it missed.
+  - The shell rules (`rm-root`, `prod-destroy`, `force-push-main`, `push-mirror`, `destroy`) skip a
+    command that only reads and writes notes (`touch MEMORY.md && echo '... rm / ...' >> MEMORY.md`,
+    `reflex check 'rm -rf /'`), and the program of an interpreter heredoc when the whole command is
+    a bare `python3 - <<'EOF' ... EOF` (node, ruby, perl and php too) and nothing in the body could
+    run, load, write or delete anything. A wrapper (`ssh`, `docker exec`, `env`), a flag, an
+    unquoted delimiter or anything before or after the heredoc keeps the body in. Such a command
+    goes to the engine instead.
+  - `tamper` reads what a command changes: a pipeline that only reads an agent's settings or the
+    gate's files (`jq . ~/.claude/settings.json > /tmp/s.json`) counts by its redirect targets only.
+    Writes still ask: redirects, `mv`, `cp`, `tee`, `sponge`, `sed -i`, `yq -i`. A GitHub
+    `owner/reflex` slug or URL is not the local gate; `git add` and `git commit` in the checkout do
+    not change its files; a git worktree nested in the checkout is another checkout unless the
+    command climbs out with `..`.
+- More reads that could write or run code are no longer read-only: `sed` `w` and `e` after a line
+  address or as an `s///` flag (`sed -n '1w f'`, `sed '1e cmd'`, `sed 's/a/b/e'`), `awk` `@include`
+  and `@load`, a redirect inside a double-quoted awk program, `find -fprint0` and
+  `rg --hostname-bin`.
+- Redaction covers `docker login -p` (and podman, nerdctl, buildah, skopeo, oras, az),
+  `echo pw | sudo -S`, `... | docker login --password-stdin`, `sudo -S <<< pw`, `--x-password`,
+  `--x-token` and `--x-secret` flags, `redis-cli -a`, `mongosh -p`, `openssl -passin pass:`,
+  `keytool -storepass`, `htpasswd -b` and `smbclient -U user%pw`.
 
 ### Changed
 
