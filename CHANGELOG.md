@@ -6,6 +6,8 @@ All notable changes to Reflex are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-26
+
 ### Changed
 
 - A remote command over `ssh` is read-only (a local pass, no Jev or System 2 call, in both engines)
@@ -237,7 +239,8 @@ All notable changes to Reflex are documented here. The format follows
   and 3.12).
 - `LICENSE` (MIT), `SECURITY.md`, `CONTRIBUTING.md`, this changelog and issue templates.
 
-[Unreleased]: https://github.com/ursuciprian/reflex/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/ursuciprian/reflex/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/ursuciprian/reflex/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ursuciprian/reflex/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ursuciprian/reflex/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ursuciprian/reflex/compare/v0.3.0...v0.4.0
