@@ -24,7 +24,7 @@
 //   node autonomy.mjs envelope set "<text>" [--session id | --cwd dir] [--ttl 8h] | show | list | clear
 //   node autonomy.mjs checkpoints [list|restore <name>] [--cwd dir]
 //   node autonomy.mjs --selfcheck
-import {copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync} from "node:fs";
+import {copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, utimesSync, writeFileSync} from "node:fs";
 import {createHash} from "node:crypto";
 import {spawn, spawnSync} from "node:child_process";
 import {tmpdir} from "node:os";
@@ -298,7 +298,12 @@ export function envelopeFor(call) {
 // Checkpoints. `git stash create` records the tracked files (index and working tree) as a commit
 // without changing either; it refreshes the index's stat cache as it goes, so it runs against a
 // temporary copy of the index. A clean tree is checkpointed as HEAD. Kept: the last 50 per repo.
+// The copy keeps the index's mtime (rounded down to the second): git trusts an entry's stat data only
+// when the entry is older than the index file itself (racy git), so a copy stamped "now" made a
+// same-size edit within the second of the last index write look clean once the clock had passed that
+// second, and the checkpoint silently fell back to HEAD (#21). Older is only more careful.
 const REFS = "refs/reflex/checkpoints/", KEEP = 50;
+let lastRef = 0;   // ref names strictly increase within a process, so two in one millisecond never collide
 const git = (cwd, args, env = {}) => spawnSync("git", ["-C", cwd, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...args], {encoding: "utf8", timeout: 5000, env: {...process.env, GIT_OPTIONAL_LOCKS: "0", ...env}});
 export function checkpoint(cwd) {
   if (!cwd) return null;
@@ -310,7 +315,11 @@ export function checkpoint(cwd) {
   let sha = "";
   try {
     const index = resolve(cwd, indexPath ?? "");
-    if (existsSync(index)) copyFileSync(index, tmp);
+    if (existsSync(index)) {
+      copyFileSync(index, tmp);
+      const st = statSync(index);
+      utimesSync(tmp, st.atime, Math.floor(st.mtimeMs / 1000));
+    }
     sha = git(cwd, ["stash", "create", "reflex checkpoint"], {GIT_INDEX_FILE: tmp}).stdout?.trim() ?? "";
   } finally { rmSync(tmpDir, {recursive: true, force: true}); }
   if (!sha) sha = git(cwd, ["rev-parse", "-q", "--verify", "HEAD"]).stdout?.trim() ?? "";
@@ -319,7 +328,7 @@ export function checkpoint(cwd) {
   const refs = git(cwd, ["for-each-ref", "--sort=-refname", "--format=%(refname) %(tree) %(parent)", REFS]).stdout.trim().split("\n").filter(Boolean);
   const sig = git(cwd, ["log", "-1", "--format=%T %P", sha]).stdout.trim().split(" ").slice(0, 2).join(" ");
   if (refs[0] && refs[0].split(" ").slice(1, 3).join(" ") === sig) return {sha, ref: refs[0].split(" ")[0], same: true, ms: Date.now() - t0};
-  const ref = `${REFS}${Date.now()}-${process.pid}`;
+  const ref = `${REFS}${lastRef = Math.max(Date.now(), lastRef + 1)}-${process.pid}`;
   if (git(cwd, ["update-ref", ref, sha]).status !== 0) return null;
   const old = refs.slice(KEEP - 1).map(l => l.split(" ")[0]);
   if (old.length) spawnSync("git", ["-C", cwd, "update-ref", "--stdin"], {input: old.map(r => `delete ${r}\n`).join(""), timeout: 5000});
@@ -543,6 +552,10 @@ async function selfcheck() {
     // checkpoints: a pass in a git repo leaves a ref; the working tree and the index are untouched
     const g = join(scratch, "gitrepo"), G = a => spawnSync("git", ["-C", g, "-c", "user.name=t", "-c", "user.email=t@t", ...a], {encoding: "utf8", env: {...process.env, GIT_OPTIONAL_LOCKS: "0"}});
     mkdirSync(g, {recursive: true});
+    // #21: a same-size edit ("one" -> "two") within the second of the commit's index write, checkpointed
+    // again after that second has passed. Aligned to the clock, so every run exercises the racy entry.
+    const nextSecond = () => new Promise(r => setTimeout(r, 1005 - Date.now() % 1000));
+    await nextSecond();
     G(["init", "-q"]); writeFileSync(join(g, "a.txt"), "one\n"); G(["add", "a.txt"]); G(["commit", "-q", "-m", "init"]);
     writeFileSync(join(g, "a.txt"), "two\n");
     const idx = () => createHash("sha1").update(readFileSync(join(g, ".git/index"))).digest("hex");
@@ -552,8 +565,9 @@ async function selfcheck() {
     const list = checkpoints(g);
     ok(cp.effective === "pass" && list.length === 1 && list[0].stash && idx() === i0 && G(["status", "--porcelain"]).stdout === s0,
        "checkpoint: created before a pass; working tree and index untouched");
+    await nextSecond();
     await decide({agent: "x", command: "go vet ./...", cwd: g, session_id: "C"}, {asker: jev(SAFE)});
-    ok(checkpoints(g).length === 1, "checkpoint: an unchanged tree is not checkpointed twice");
+    ok(checkpoints(g).length === 1, "checkpoint: an unchanged tree is not checkpointed twice, a second later too (#21)");
     await decide({agent: "x", command: "git status", cwd: g, session_id: "C"}, {asker: jev(SAFE)});
     ok(checkpoints(g).length === 1, "checkpoint: read-only commands take none");
     writeFileSync(join(g, "a.txt"), "three\n");
