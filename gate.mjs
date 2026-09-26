@@ -25,7 +25,7 @@ import {appendFileSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSyn
 import {createHash, randomUUID} from "node:crypto";
 import {execFileSync, spawn, spawnSync} from "node:child_process";
 import {homedir, platform, tmpdir} from "node:os";
-import {dirname, join, resolve} from "node:path";
+import {dirname, join, posix, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 import {compile} from "./policy.mjs";
 import {envelopeFor, ladder, queueAnswer} from "./autonomy.mjs";
@@ -531,8 +531,60 @@ export function pipelines(command) {
 }
 // What a pipeline changes: an inert one, only its redirect targets. A cd, an assignment or a loop
 // header can steer what a later step writes, and touch and mkdir create files, so those are kept whole.
-const writesView = ps => ps.map(p => p.inert && !/^[\s({!]*(cd|pushd|popd|for|select|case|while|until|if|export|local|declare|typeset|readonly|read|touch|mkdir)\b|^[\s({!]*\w+=/.test(p.core)
-  ? p.targets.map(t => `> ${t}`).join(" ") : p.text).join(" ; ");
+// Commands cut at && || ; & | and newlines outside quotes (all of the text when quotes do not
+// balance), each counted as a whole pipeline: for writesView when pipelines() cannot read the command.
+function roughPipelines(c) {
+  const m = maskQuotes(c, "_"), cuts = [...m.matchAll(/&&|\|\||[;&|\n]/g)], out = [];
+  let last = 0;
+  for (const k of [...cuts, {index: c.length, 0: ""}]) {
+    const text = c.slice(last, k.index).trim();
+    if (text) out.push({text, targets: [], core: text, inert: false});
+    last = k.index + k[0].length;
+  }
+  return out;
+}
+// A cd, pushd or popd the directory tracking below reads writes nothing itself: its effect is the
+// resolved paths. One it cannot read is kept whole.
+const writesView = ps => {
+  const dirs = cdDirs(ps);
+  return ps.map((p, i) => {
+    const whole = !p.inert || /^[\s({!]*(cd|pushd|popd|for|select|case|while|until|if|export|local|declare|typeset|readonly|read|touch|mkdir)\b|^[\s({!]*\w+=/.test(p.core);
+    if (dirs[i] === CD_STEP) return p.targets.map(t => `> ${t}`).join(" ");
+    const words = whole ? p.text.replace(/[<>|&;(){}]/g, " ").split(/\s+/).flatMap(w => [w, w.replace(/^[^=]*=/, "")]) : p.targets;
+    const view = whole ? p.text : p.targets.map(t => `> ${t}`).join(" ");
+    const at = typeof dirs[i] === "string" ? dirs[i] : null;
+    return at ? `${view} ${words.map(w => w.replace(/["'\\]/g, "")).filter(w => w && !/^[-/~$]/.test(w)).map(w => `> ${posix.join(at, w)}`).join(" ")}` : view;
+  }).join(" ; ");
+};
+// The directory each pipeline runs in, as far as the command line itself changes it: after
+// `cd ~/.claude &&`, `pushd ~/.config/reflex;` or inside `(cd ~/.codex && …)` a relative path names a
+// file there. null: the directory the command started in. CD_STEP marks a cd the tracking read.
+// ponytail: the command's own cd, pushd, popd, cd - and subshell parentheses; `cd "$D"` resolves to
+// "$D/…" and a cd hidden in a loop or a function is not followed.
+const CD_STEP = Symbol("cd");
+function cdDirs(ps) {
+  let dir = null, old = null;
+  const stack = [], scopes = [], home = s => s.replace(/^(\$HOME|\$\{HOME\})(?=\/|$)/, "~");
+  const go = to => { [old, dir] = [dir, /^[/~$]/.test(to) ? to : posix.join(dir ?? ".", to)]; };
+  return ps.map(p => {
+    const m = maskQuotes(p.text, "_"), count = re => (m.match(re) ?? []).length;
+    for (let k = (m.match(/^[\s!{]*(\(\s*)+/)?.[0].match(/\(/g) ?? []).length; k > 0; k--) scopes.push([dir, old, stack.length]);
+    const cmd = p.core.replace(/^[\s({!]+|[\s)}]+$/g, "").replace(/^(builtin|command)\s+/, "")
+      .match(/^(cd|pushd|popd)((?:\s+-[LPe@+-]*(?=\s))*)(?:\s+--)?(?:\s+(\S+))?$/);
+    let here = dir;
+    if (cmd) {
+      const arg = cmd[3] === undefined ? undefined : home(cmd[3].replace(/["'\\]/g, ""));
+      here = CD_STEP;
+      if (cmd[1] === "popd") [old, dir] = [dir, stack.pop() ?? null];
+      else if (cmd[1] === "pushd") { stack.push(dir); if (arg !== undefined) go(arg); }
+      else if (arg === "-") [dir, old] = [old, dir];
+      else go(arg ?? "~");
+    } else if (/^[\s({!]*(builtin\s+|command\s+)?(cd|pushd|popd)\b/.test(p.core)) here = dir;   // unread: kept whole
+    const closes = count(/\)/g) - count(/\(/g);
+    for (let k = 0; k < closes && scopes.length; k++) { const s = scopes.pop(); [dir, old] = s; stack.length = Math.min(stack.length, s[2]); }
+    return here;
+  });
+}
 // Only inert pipelines writing notes (Markdown, text, logs, CSV) or nothing: there is no shell
 // command in it for a "shell" rule to find, whatever its quoted text says (echo '… rm -rf / …' >> MEMORY.md).
 const NOTES = /^(\/dev\/(null|stdout|stderr)|[^\s;&|<>]*\.(md|markdown|txt|rst|adoc|log|csv|tsv))$/i;
@@ -844,7 +896,9 @@ export function precheck(command, cwd, env) {
   // Tamper is about what the command changes: a pipeline that only reads the gate's files or an
   // agent's settings (jq . ~/.claude/settings.json > /tmp/s.json) counts by its redirect targets alone.
   // Quotes and backslashes are dropped, as the shell drops them: ~/.claude/'settings.json' is the file.
-  const ps = pipelines(command), writes = (ps ? writesView(ps) : bare).replace(/["'\\]/g, "");
+  // When the text hides what runs (a $, a heredoc), the whole command counts, plus the paths a cd
+  // in it points relative ones at (cd "$HOME/.claude" && tee settings.json).
+  const ps = pipelines(command), writes = (ps ? writesView(ps) : `${bare} ; ${writesView(roughPipelines(bare))}`).replace(/["'\\]/g, "");
   // The checkout itself is protected wherever it was cloned, not only under a directory named reflex.
   // A git worktree or clone nested inside it is another checkout, unless the command climbs out (..).
   const inRepo = cwd && (cwd + "/").startsWith(HERE + "/") && !(nestedCheckout(cwd) && !/(^|[\s/'"=:])\.\.([\s/'";&|)]|$)/.test(command));
@@ -1665,6 +1719,16 @@ async function selfcheck() {
     "cd ~/.claude/hooks && rm gate.sh", "F=~/.claude/settings.json; jq . $F > /tmp/x", "ls ~/.claude/hooks | xargs rm", "cd ~/.config; printf x > reflex/config.json",
     "gh api repos/o/reflex/contents/x --jq .content > ~/.config/reflex/config.json", "curl https://x.io/a>~/src/reflex/gate.mjs", "npm install -g @ursuciprian/reflex",
     "REFLEX_MODE=off claude -p hi"]) ok(pw(c) === "tamper", `tamper: ${c}`);
+  // a relative write target after a cd, pushd or subshell cd in the same command is in that directory
+  for (const c of ["cd ~/.claude && jq '.a=1' settings.json > s.tmp && mv s.tmp settings.json", "pushd ~/.config/reflex; echo x > config.json",
+    "(cd ~/.codex && tee hooks.json)", `cd "$HOME/.claude" && echo "$X" > settings.json`, "cd ~ && cd .claude/hooks && rm gate.sh",
+    "cd ~/.claude; cd /tmp; cd -; echo x > settings.json", "pushd ~/.codex && pushd /tmp && popd && tee config.toml", "cd -P ~/.claude && cp /tmp/s settings.json",
+    "cd ~/.claude 2>/dev/null && tee settings.json </tmp/x", "builtin cd ~/.codex; dd if=/tmp/x of=config.toml", "cd ~/.claude && (cd hooks && rm a.sh)",
+    "cd ~/.claude && (cd /tmp && ls) && tee settings.json", "cd ~/.config && cd reflex && tee config.json", "cd ~/.claude > ~/.claude/settings.json"])
+    ok(pw(c) === "tamper", `tamper after cd: ${c}`);
+  for (const c of ["cd ~/.claude && jq . settings.json > /tmp/x", "pushd ~/.config/reflex; jq . config.json > /tmp/x", "cd ~/.claude/hooks && cat x.sh > /tmp/y",
+    "(cd ~/.claude && ls) && echo x > notes.txt", "(cd ~/.codex && cat hooks.json) > /tmp/h"])
+    ok(pw(c) !== "tamper", `not tamper, a read after cd: ${c}`);
   // the checkout: committing its files is not changing them; a worktree nested in it is another checkout unless the command climbs out
   const nested = join(HERE, `.selfcheck-nested-${process.pid}`);
   try {
