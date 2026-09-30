@@ -29,7 +29,7 @@ const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
 const MODULES = ["hook.mjs", "failsafe.mjs", "plugin.mjs", "gate.mjs", "config.mjs", "shell.mjs", "scripts.mjs", "readonly.mjs", "rules.mjs",
   "tamper.mjs", "jev.mjs", "guard.mjs", "instructions.mjs", "policy.mjs", "providers.mjs",
   "autonomy.mjs", "fastlane.mjs", "team.mjs", "infra.mjs", "freeze.mjs", "notify.mjs", "context.mjs", "judge2.mjs", "laya.mjs",
-  "mcp.mjs", "audit.mjs", "status.mjs", "replay.mjs", "report.mjs", "suggest.mjs", "tools.mjs"];
+  "mcp.mjs", "audit.mjs", "status.mjs", "replay.mjs", "report.mjs", "suggest.mjs", "tools.mjs", "workspace.mjs"];
 // The setup files read at runtime; the golden sets, fixtures and plan fixtures stay out.
 const DATA = ["setup/redact.json", ...["rules", "policy", "questions", "escalation", "subgoals", "mcp", "protected"].map(f => `setup/tool-gate/${f}.json`),
   ...["policy", "detectors", "questions"].map(f => `setup/injection/${f}.json`)];
@@ -47,7 +47,7 @@ const FORBIDDEN = [
   [/security find-generic-password|["']security["']/],
   [/TYPESAFE_API_KEY/], [/OPENROUTER_API_KEY/], [/CLOUDFLARE_API_TOKEN/], [/AI_GATEWAY_API_KEY/],
   [/pip install|bin\/pip|-m", "venv"|laya-venv|laya\[serve\]/], [/huggingface|HF_HUB|HF_HOME/i],
-  [/curl /, ["suggest.mjs"], "probes a fast-lane suggestion must never pass (command substitution, a .env upload)"],
+  [/curl /, ["suggest.mjs", "workspace.mjs"], "probes a fast-lane suggestion must never pass; workspace.mjs classifies a curl GET as a confined network read"],
   [/npx /], [/npm install -g|npm i -g/], [/child_process.*install/], [/@reflex:setup-only/],
 ];
 

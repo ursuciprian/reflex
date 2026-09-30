@@ -160,7 +160,11 @@ export const CONFIG = {
   notify: notifyTarget(USER_CONFIG.notify, "config.json notify"),
   // MCP tool calls the rules do not cover (tools.mjs): "shadow" logs them (Jev judges them when
   // enforcing with a key), "ask" asks in every mode. config.json only.
-  mcp: {unknown: USER_CONFIG.mcp?.unknown ?? "shadow"},
+  mcp: {unknown: USER_CONFIG.mcp?.unknown ?? "shadow", infra: USER_CONFIG.mcp?.infra ?? true},
+  // The workspace judge (workspace.mjs): a System 1 pass for commands whose whole effect is confined
+  // to the current git working tree and reversible (a checkpoint is taken first). On by default in
+  // every profile; REFLEX_WORKSPACE=off or config.json "workspace": false turns it off.
+  workspace: onOff(ENV.REFLEX_WORKSPACE, USER_CONFIG.workspace ?? true),
 };
 // The one host the provider's key may go to (authorization()): where its endpoint was configured.
 CONFIG.keyHost = hostOf(CONFIG.api);
@@ -183,13 +187,16 @@ export function configurationError() {
     : CONFIG.engine === "jev" && PROVIDER.error ? PROVIDER.error
     : !["off", "shadow", "enforce"].includes(CONFIG.mode) ? "mode must be off, shadow or enforce"
     : !["off", "shadow", "on"].includes(CONFIG.allow) ? "allow must be off, shadow or on"
-    : ![undefined, "simple", "legacy"].includes(ENV.REFLEX_READONLY ?? USER_CONFIG.readonly) ? "readonly must be simple or legacy" : layaError() ?? ladderError() ?? infraError(USER_CONFIG.infra) ?? toolError());
+    : ![undefined, "simple", "legacy"].includes(ENV.REFLEX_READONLY ?? USER_CONFIG.readonly) ? "readonly must be simple or legacy"
+    : USER_CONFIG.workspace !== undefined && typeof USER_CONFIG.workspace !== "boolean" ? "workspace must be true or false"
+    : ![undefined, "on", "off"].includes(ENV.REFLEX_WORKSPACE) ? "REFLEX_WORKSPACE must be on or off" : layaError() ?? ladderError() ?? infraError(USER_CONFIG.infra) ?? toolError());
 }
 // Invalid tool gate settings ask, like any invalid configuration.
 function toolError() {
   const m = USER_CONFIG.mcp, p = USER_CONFIG.protected;
-  if (m !== undefined && (!m || typeof m !== "object" || Array.isArray(m) || Object.keys(m).some(k => k !== "unknown") || !["shadow", "ask", undefined].includes(m.unknown)))
-    return 'mcp takes only "unknown": "shadow" or "ask"';
+  if (m !== undefined && (!m || typeof m !== "object" || Array.isArray(m) || Object.keys(m).some(k => !["unknown", "infra"].includes(k)) ||
+      !["shadow", "ask", undefined].includes(m.unknown) || (m.infra !== undefined && typeof m.infra !== "boolean")))
+    return 'mcp takes only "unknown": "shadow" | "ask" and "infra": true | false';
   if (p !== undefined && (!Array.isArray(p) || p.some(g => typeof g !== "string" || !g.trim() || g.length > 200)))
     return "protected must be a list of globs";
   return null;
