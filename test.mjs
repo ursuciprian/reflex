@@ -33,6 +33,7 @@ try {
     [process.execPath, ["instructions.mjs", "--selfcheck"]], [process.execPath, ["install.mjs", "--selfcheck"]],
     [process.execPath, ["guard.mjs", "--selfcheck"]], [process.execPath, ["judge2.mjs", "--selfcheck"]], [process.execPath, ["autonomy.mjs", "--selfcheck"]], [process.execPath, ["freeze.mjs", "--selfcheck"]], [process.execPath, ["mcp.mjs", "--selfcheck"]],
     [process.execPath, ["context.mjs", "--selfcheck"]], [process.execPath, ["router/server.mjs", "--selfcheck"]], [process.execPath, ["infra.mjs", "--selfcheck"]],
+    [process.execPath, ["workspace.mjs", "--selfcheck"]],
     ["python3", ["routing/reflex_router.py", "--selfcheck"]],
   ]) {
     const r = spawnSync(program, args, {cwd: root, env, stdio: "inherit", timeout: 60000});
@@ -561,10 +562,14 @@ try {
     assert.equal(hook3("prettier --write src/")?.permissionDecision, "allow");
     assert.equal(calls3(), 1, "the uncovered command went to System 2");
     assert.match(success(cli3(["checkpoints", "list", "--cwd", proj3])), /^\d+-\d+ {2}[0-9a-f]{7,} /m);
-    // approved but remote or egress: a pass, so Claude Code's own permissions decide
+    // approved but remote or egress: a pass, so Claude Code's own permissions decide. A curl that
+    // uploads is egress (not the workspace judge's confined GET), so it still reaches System 2.
     assert.equal(hook3("kubectl --context dev-cluster rollout restart deploy/api -n web"), undefined);
-    assert.equal(hook3("curl -sS https://example.dev/data.json -o data.json"), undefined);
+    assert.equal(hook3("curl -sS -X POST https://example.dev/ingest -d @data.json"), undefined);
     assert.equal(calls3(), 3);
+    // a reversible in-tree edit is a keyless workspace pass: allowed with a checkpoint, no System 2 call
+    assert.equal(hook3("sed -i '' s/foo/bar/ src/app.js")?.permissionDecision, "allow");
+    assert.equal(calls3(), 3, "the workspace judge settled the in-tree edit without System 2");
     // the always-human class, a rule deny and tamper never reach System 2
     const iam3 = hook3("aws iam create-user --user-name keyless-bot");
     assert.ok(iam3.permissionDecision === "deny" && /parked in the approval queue/.test(iam3.permissionDecisionReason), JSON.stringify(iam3));
@@ -1461,10 +1466,13 @@ try {
       assert.ok(v === "ask" && /destructive MCP tool call/.test(why), `${agent}: destructive asks: ${v} ${why}`);
       assert.equal(send(name("describe_stacks"), {StackName: "prod-api"})[0], "pass", `${agent}: a read passes`);
       const before = traced().length;
-      assert.equal(send(name("start_build"), {project: "web"})[0], "pass", `${agent}: an unknown tool passes in shadow`);
+      // aws is an infrastructure server, so an unknown tool asks under the MCP infra preset (mcp.infra), and is logged
+      assert.equal(send(name("start_build"), {project: "web"})[0], "ask", `${agent}: an unknown infra tool asks (mcp.infra)`);
       const row = traced().slice(before).find(r => r.rule_id === "mcp-unknown");
-      assert.ok(row && row.decision === "pass" && row.emitted === null && /start_build/.test(row.state.call.command), `${agent}: the unknown tool is logged: ${JSON.stringify(traced().slice(before))}`);
+      assert.ok(row && row.decision === "ask" && /start_build/.test(row.state.call.command), `${agent}: the unknown infra tool is logged as an ask: ${JSON.stringify(traced().slice(before))}`);
     }
+    // an unknown tool on a non-infrastructure server stays log-only (a pass), not the infra preset
+    assert.equal(decide("claude")("mcp__linear__start_thing", {})[0], "pass", "a non-infra unknown tool logs as a pass");
     // a shell command in an argument goes through the shell rules; SQL passes only when SELECT only
     assert.equal(claude("mcp__aws-mcp__call_aws", {cli_command: "aws ec2 terminate-instances --instance-ids i-1 --profile prod"})[0], "deny", "call_aws: the shell rules see the command");
     assert.equal(claude("mcp__aws-mcp__call_aws", {cli_command: "aws s3 ls"})[0], "pass", "call_aws: a read-only command passes");

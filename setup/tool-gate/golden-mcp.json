@@ -87,7 +87,8 @@
     {"expect": ["pass", "ask"], "tool": "mcp__grafana__grafana_api_request", "input": {"endpoint": "/api/dashboards/db", "method": "POST", "body": {}}, "why": "unknown, HTTP POST"},
     {"expect": ["pass", "ask"], "tool": "mcp__ci__start_build", "input": {"project": "web"}, "why": "unknown"},
     {"expect": ["pass", "ask"], "tool": "mcp__slack__send_message", "input": {"channel": "#dev", "text": "build is green"}, "why": "unknown"},
-    {"expect": ["ask", "deny"], "expect_local": "pass", "tool": "mcp__terraform__apply_run", "input": {"workspace": "prod-core", "comment": "apply"}, "why": "unknown to the rules, production apply: Jev's call"},
-    {"expect": ["ask", "deny"], "expect_local": "pass", "tool": "mcp__aws__update_function_code", "input": {"FunctionName": "prod-checkout", "ZipFile": "..."}, "why": "unknown to the rules, production deploy: Jev's call"}
+    {"expect": ["ask", "deny"], "expect_local": "ask", "tool": "mcp__terraform__apply_run", "input": {"workspace": "prod-core", "comment": "apply"}, "why": "unknown to the rules, production apply: Jev's call; keyless the MCP infra preset asks (mcp.infra)"},
+    {"expect": ["ask", "deny"], "expect_local": "ask", "tool": "mcp__aws__update_function_code", "input": {"FunctionName": "prod-checkout", "ZipFile": "..."}, "why": "unknown to the rules, production deploy: Jev's call; keyless the MCP infra preset asks (mcp.infra)"},
+    {"expect": "pass", "expect_local": "pass", "tool": "mcp__notion__append_block_children", "input": {"block_id": "x"}, "why": "unknown tool on a non-infra server: log-only, not the infra preset"}
   ]
 }
