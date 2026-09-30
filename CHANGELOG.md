@@ -6,6 +6,11 @@ All notable changes to Reflex are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Human-last decisioning: Reflex asks you only when it matters, so a model decides and you are the last rung. A new keyless **workspace judge** (`workspace.mjs`) passes a command when its whole effect is provably confined to the current git working tree and reversible: `sed -i`, inline `python3 -c` / `python3 - <<EOF` / `node -e` under a strict stdlib and read-only-API allowlist (no subprocess, network, exec, eval, or writes outside the tree), `mkdir`/`touch`/`cp`/`mv`/`tee`, a `curl`/`wget` GET that writes nothing outside the tree, and `npm`/`pnpm`/`yarn install` with no declared install lifecycle scripts and no URL, git or file spec. Every write target must resolve inside the tree, with symlinks and `..` followed and `.git`, `.reflex`, the Reflex checkout and protected paths excluded. A checkpoint of the tree is taken first (`refs/reflex/checkpoints/`), so the change can be rolled back. It only ever passes, so it can add no MISS; anything it does not recognise falls through unchanged. On by default in every profile; a workspace pass is a plain pass in the supervised profile and an allow that skips the agent's prompt in the autonomous profile (`REFLEX_ALLOW=on`, plan mode and unsandboxed retries still hold). `REFLEX_WORKSPACE=off` or `config.json` `"workspace": false` turns it off. Offline golden set and fail-open review in `node workspace.mjs --selfcheck`, run by `npm test`.
+- MCP infrastructure preset: for a server whose name matches cloud, clusters, infrastructure-as-code or a database (`aws`, `kubernetes`/`k8s`, `terraform`, `tfc`, `gcp`, `azure`, `postgres`, `mysql`, `database`, `github`, `gitlab` and more), an unknown tool that is not read-like is judged by the engine when one is available and asks keyless instead of being logged only. Other servers keep log-only for unknown tools. `config.json` `"mcp": {"infra": false}` turns it off.
+
 ## [0.17.0] - 2026-09-30
 
 ### Added

@@ -144,6 +144,25 @@ Reflex does not gate.
 
 See: [compared with other AI coding agent guardrails](../README.md#compared-with-other-ai-coding-agent-guardrails).
 
+## How do I reduce permission prompts without giving up prod safety?
+
+Reflex is human-last: it asks you only when it matters. A System One model decides most commands
+(Jev, or Laya locally, or the local rules); when it is unsure, System 2 (a stronger model) decides;
+you are the last rung. Three levers cut prompts for autonomous coding agents:
+
+- The keyless **workspace judge** passes local, reversible edits whose whole effect stays inside the
+  current git working tree (`sed -i`, `python3 -c`/`node -e` under a strict read-only allowlist,
+  `mkdir`/`cp`/`mv`/`tee`, a `curl`/`wget` GET, `npm install` with no install scripts), with a
+  checkpoint taken first. It only ever passes, so it never weakens safety.
+- **Jev** passes most of what the rules leave open (about 84 % of one heavy user's engine-left
+  commands), so few reach a human.
+- In the autonomous profile, **System 2** takes the uncertain band, and the async **approval queue**
+  lets the agent keep working while a parked command waits for you.
+
+`reflex learn` and `reflex suggest` add fast-lane entries from what you already approve, so the same
+shapes stop asking over time. See
+[Human-last: how Reflex decides without you](GUIDE.md#human-last-how-reflex-decides-without-you).
+
 ## Can I use Reflex with --dangerously-skip-permissions?
 
 Yes: with prompts turned off, Reflex's rule denies still apply. In the autonomous profile, a

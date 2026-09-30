@@ -39,6 +39,14 @@ What it adds to the agents' built-in permission rules:
 - **Fail-closed hooks.** In enforce mode a hook that crashes while loading or deciding answers ask
   (Claude Code) or deny (Codex) instead of letting the command run unchecked.
 
+**Human-last: it asks you only when it matters.** A System One model decides most commands (Jev
+through TypeSafe, OpenRouter, Cloudflare or Vercel, or Laya locally, or the local rules), and when
+it is unsure a stronger model (System 2) decides; you are the last rung, not the first. Keyless, a
+reversibility-aware workspace judge passes edits and scripts whose whole effect stays inside the
+current git working tree, with a checkpoint taken first. This is how Reflex reduces permission
+prompts for autonomous coding agents without giving up prod safety. See
+[Human-last: how Reflex decides without you](docs/GUIDE.md#human-last-how-reflex-decides-without-you).
+
 It starts keyless, with local rules in shadow mode, and it also scans what the agent reads for
 prompt injection. It gates shell commands, not file edits or MCP calls, and it does not replace a
 sandbox or least-privilege credentials.

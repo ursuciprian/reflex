@@ -205,6 +205,10 @@ hook (see the table in the README). Each adapter turns the agent's event into th
 3. **Fast lane** (`rules.json` → `pass`): known-safe steps: builds, tests, `mkdir`, `git add/commit`,
    pushing a non-main branch. A command passes when every segment is read-only or matches a fast-lane
    pattern. → **pass**, logged.
+3a. **Workspace judge** (`workspace.mjs`, on by default): a command whose whole effect is provably
+   confined to the current git working tree and reversible passes, with a checkpoint taken first. It
+   only ever passes; anything it does not recognise falls through. See
+   [Human-last: how Reflex decides without you](#human-last-how-reflex-decides-without-you).
 4. **Jev**: the command (secrets redacted), its working directory, the environment context and
    the text the agent wrote right before this command and its last five commands (from the session
    transcript; if the command is not in the transcript yet, no intent is sent rather than an older one) are sent to
@@ -1994,6 +1998,56 @@ A profile is a preset written to `config.json` (`profile`, `judge`, `queue`, `ch
 override one session; `reflex run` turns all three off, since a person is at that terminal.
 `autonomy.mjs` holds the ladder, the queue, envelopes and checkpoints; `judge2.mjs` System 2;
 `setup/tool-gate/escalation.json` the always-human class and System 2's prompt.
+
+### Human-last: how Reflex decides without you
+
+The goal is that a model decides, and you are the last rung, not the first. A command falls down a
+ladder and stops at the first rung that can answer it safely:
+
+1. **Deterministic rules and read-only detection.** A read passes; a rule deny blocks; a rule ask
+   (tamper, secret reads, destructive deletes) is a human's, always.
+2. **The workspace judge (keyless, the biggest lever).** Many of the commands the rules leave open
+   are local, reversible edits inside the repository: `sed -i` on a tracked file, a `python3 -c` or
+   `node -e` script that only reads and writes in the tree, `mkdir`/`cp`/`mv`/`tee`, a `curl`/`wget`
+   GET, `npm install` with no install scripts. A new keyless judge (`workspace.mjs`) passes a command
+   when its whole effect is **provably confined to the current git working tree and reversible**: every
+   write target resolves inside the tree (symlinks and `..` followed, `.git`, `.reflex`, the Reflex
+   checkout and protected paths excluded), there is no network egress that carries data out, no
+   process, service or system change, no secrets, and inline interpreter code uses only a strict
+   allowlist of stdlib modules and read-only APIs (no subprocess, network, exec, eval, or writes
+   outside the tree). A checkpoint of the tree is taken first (`refs/reflex/checkpoints/`, reused from
+   the autonomous profile), so the change can always be rolled back. It only ever passes, so it can
+   never add a MISS; anything it does not recognise falls through unchanged. It is on by default in
+   every profile (`REFLEX_WORKSPACE=off` or `config.json` `"workspace": false` turns it off). In the
+   supervised profile a workspace pass is a plain pass (your agent's own permissions decide); in the
+   autonomous profile, with `REFLEX_ALLOW=on`, it is an allow that skips the agent's prompt (but plan
+   mode and an unsandboxed retry still hold their prompts).
+3. **A System One model.** With a key or provider configured, Jev decides (TypeSafe, OpenRouter,
+   Cloudflare or Vercel); else, if a Laya server is running and trusted for the question family, Laya;
+   else the local rules. Jev passes most of what the rules leave open (about 84 % of the author's
+   engine-left commands in a 500-command sample), so few reach a human.
+4. **System 2 for the uncertain band.** What System One is unsure about (a would-be `ask`) goes to a
+   stronger model (the `claude` CLI already installed, or an API backend), when available and within
+   budget. It approves, denies, or hands up to a human.
+5. **The human, only when it matters.** The always-human class (production, IAM, secrets, destructive
+   deletes, money, rule asks, tainted egress), a freeze, the runaway guard, both System One and System
+   2 uncertain, or no decider available and the command is not reversible. With the queue on, that is
+   an async deny that names a queue item; you answer later with `reflex queue approve`.
+
+Measured on the author's last 7 days of Claude Code and Codex sessions (14,187 commands): keyless
+supervised humans per 100 fell from 54.5 to 52.8 with the workspace judge; with Jev it is about 17;
+with Jev plus System 2 taking the uncertain band it is about 12, and what remains is almost all the
+tamper class (editing the Reflex gate and agent settings), which is inherent to developing Reflex
+itself and stays a human's by design.
+
+### Infrastructure MCP servers
+
+For an MCP server whose name matches cloud, clusters, infrastructure-as-code or a database (`aws`,
+`kubernetes`/`k8s`, `terraform`, `tfc`, `gcp`, `azure`, `postgres`, `mysql`, `database`, `github`,
+`gitlab` and the like), an unknown tool that is not read-like is judged by the engine when one is
+available (Jev with a key), and keyless with no decider it **asks** rather than being logged only.
+Other servers keep log-only for unknown tools, as before. `config.json` `"mcp": {"infra": false}`
+turns the preset off; `"mcp": {"unknown": "ask"}` still asks for every server's unknown tools.
 
 ### Keyless autonomy
 
